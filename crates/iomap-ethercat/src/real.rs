@@ -286,6 +286,10 @@ impl RealEthercat {
 
         let thread = thread::Builder::new()
             .name(thread_name)
+            // SPIKE: debug builds blow the default 2 MiB stack with ethercrab's
+            // large async state machines (release is fine). Bump it so the
+            // unoptimised scan/spike runtime can walk the bus. Not for PR.
+            .stack_size(32 * 1024 * 1024)
             .spawn(move || {
                 smol_main(
                     &nic,
@@ -626,6 +630,61 @@ fn smol_main(
                 serial = format!("{:#010x}", id.serial),
                 "bus census (PRE-OP)"
             );
+        }
+
+        // SPIKE A (NOT for PR): make-or-break test for ESI-driven manual PDI
+        // mapping. Manually size the process-data SyncManagers per the
+        // ESI/module layout (SM3 inputs = DI 2B + AI 8B = 10B; SM2 outputs = AI
+        // cfg 2B + AO 10B + DO 2B = 14B), drive the device to SAFE-OP via the AL
+        // Control register, then FPRD the SM3 input region. If the coupler fills
+        // 0x1700 with live module data (toggle a DI and watch `di` change), the
+        // WellBUS coupler DOES stream module data under master-configured SMs ->
+        // the manual-PDI feature is viable. If it stays 0/static -> not viable.
+        //
+        // SM config register = 0x0800 + 8*idx (SM2=0x0810, SM3=0x0818); 8 bytes:
+        // [phys_lo,phys_hi, len_lo,len_hi, control, status, enable_lo,enable_hi].
+        // Control bytes are taken verbatim from the ESI (SM2 Outputs=0x64,
+        // SM3 Inputs=0x20); enable=0x0001. All raw [u8;N] — no ethercrab privates.
+        for sd in group.iter(&maindevice) {
+            let sm2: [u8; 8] = [0x00, 0x11, 0x0e, 0x00, 0x64, 0x00, 0x01, 0x00]; // @0x1100, 14B
+            let sm3: [u8; 8] = [0x00, 0x17, 0x0a, 0x00, 0x20, 0x00, 0x01, 0x00]; // @0x1700, 10B
+            let r2 = sd.register_write(0x0810u16, sm2).await;
+            let r3 = sd.register_write(0x0818u16, sm3).await;
+            tracing::info!(sm2_ok = r2.is_ok(), sm3_ok = r3.is_ok(), "spikeA: SM2=14B/SM3=10B set");
+
+            // Request SAFE-OP (AL Control state nibble = 0x4).
+            let _ = sd.register_write(0x0120u16, 0x0004u16).await;
+            for _ in 0..30u8 {
+                let st: u16 = sd.register_read(0x0130u16).await.unwrap_or(0xffff);
+                let code: u16 = sd.register_read(0x0134u16).await.unwrap_or(0xffff);
+                tracing::info!(
+                    al_status = format!("{st:#06x}"),
+                    al_code = format!("{code:#06x}"),
+                    "spikeA: AL state"
+                );
+                if st & 0x10 != 0 || (st & 0x0f) == 0x04 {
+                    break;
+                }
+                smol::Timer::after(Duration::from_millis(100)).await;
+            }
+
+            // Read the SM3 input region a few times (toggle a DI at the bench).
+            for k in 0..12u8 {
+                match sd.register_read::<[u8; 10]>(0x1700u16).await {
+                    Ok(b) => tracing::info!(
+                        k,
+                        di = format!("{:#06x}", u16::from_le_bytes([b[0], b[1]])),
+                        ai1 = i16::from_le_bytes([b[2], b[3]]),
+                        ai2 = i16::from_le_bytes([b[4], b[5]]),
+                        ai3 = i16::from_le_bytes([b[6], b[7]]),
+                        ai4 = i16::from_le_bytes([b[8], b[9]]),
+                        raw = format!("{b:02x?}"),
+                        "spikeA: SM3 input"
+                    ),
+                    Err(e) => tracing::warn!(k, ?e, "spikeA: SM3 read failed"),
+                }
+                smol::Timer::after(Duration::from_millis(300)).await;
+            }
         }
 
         // Per-SubDevice startup SDO writes (PRE-OP, mailboxes are up).
