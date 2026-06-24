@@ -646,11 +646,57 @@ fn smol_main(
         // Control bytes are taken verbatim from the ESI (SM2 Outputs=0x64,
         // SM3 Inputs=0x20); enable=0x0001. All raw [u8;N] — no ethercrab privates.
         for sd in group.iter(&maindevice) {
+            // Per-analog-module range/type InitCmds (ESI PS-transition writes),
+            // slot-shifted 0x8000 + slot*0x10, sub 1. F050 slot order is
+            // [ID16N(0), AD4V-D(1), DA4VC-D(2), OD16N(3)]; digital modules have
+            // none. Data bytes verbatim from the ESI (AD4V-D=B610, DA4VC-D=AC10).
+            match sd.sdo_write(0x8010u16, 1u8, [0xb6u8, 0x10]).await {
+                Ok(_) => tracing::info!("spikeA: AD4V-D 0x8010:01=B610 ok"),
+                Err(e) => tracing::warn!(?e, "spikeA: AD4V-D 0x8010 write failed"),
+            }
+            match sd.sdo_write(0x8020u16, 1u8, [0xacu8, 0x10]).await {
+                Ok(_) => tracing::info!("spikeA: DA4VC-D 0x8020:01=AC10 ok"),
+                Err(e) => tracing::warn!(?e, "spikeA: DA4VC-D 0x8020 write failed"),
+            }
+
             let sm2: [u8; 8] = [0x00, 0x11, 0x0e, 0x00, 0x64, 0x00, 0x01, 0x00]; // @0x1100, 14B
             let sm3: [u8; 8] = [0x00, 0x17, 0x0a, 0x00, 0x20, 0x00, 0x01, 0x00]; // @0x1700, 10B
             let r2 = sd.register_write(0x0810u16, sm2).await;
             let r3 = sd.register_write(0x0818u16, sm3).await;
             tracing::info!(sm2_ok = r2.is_ok(), sm3_ok = r3.is_ok(), "spikeA: SM2=14B/SM3=10B set");
+
+            // FMMU0: map SM3 inputs (phys 0x1700, 10B) -> logical 0x0, read-only.
+            // FMMU register = 0x0600 + 16*idx. 16-byte layout (ETG1000.4 Tbl 56):
+            // [log_start u32, len u16, log_start_bit, log_end_bit, phys u16,
+            //  phys_start_bit, rd|wr enable byte, enable byte, 3 spare].
+            let fmmu0: [u8; 16] = [
+                0x00, 0x00, 0x00, 0x00, // logical start 0x0
+                0x0a, 0x00, // length 10
+                0x00, // logical start bit 0
+                0x07, // logical end bit 7 (byte-aligned)
+                0x00, 0x17, // physical start 0x1700
+                0x00, // physical start bit 0
+                0x01, // read_enable=1, write_enable=0
+                0x01, // enable=1
+                0x00, 0x00, 0x00, // spare
+            ];
+            let rf = sd.register_write(0x0600u16, fmmu0).await;
+            tracing::info!(fmmu0_ok = rf.is_ok(), "spikeA: FMMU0 inputs->logical0 set");
+
+            // FMMU1: map SM2 outputs (phys 0x1100, 14B) -> logical 0x20, write.
+            let fmmu1: [u8; 16] = [
+                0x20, 0x00, 0x00, 0x00, // logical start 0x20
+                0x0e, 0x00, // length 14
+                0x00, // logical start bit 0
+                0x07, // logical end bit 7
+                0x00, 0x11, // physical start 0x1100
+                0x00, // physical start bit 0
+                0x02, // read_enable=0, write_enable=1
+                0x01, // enable=1
+                0x00, 0x00, 0x00, // spare
+            ];
+            let rf1 = sd.register_write(0x0610u16, fmmu1).await;
+            tracing::info!(fmmu1_ok = rf1.is_ok(), "spikeA: FMMU1 outputs->logical0x20 set");
 
             // Request SAFE-OP (AL Control state nibble = 0x4).
             let _ = sd.register_write(0x0120u16, 0x0004u16).await;
@@ -669,7 +715,7 @@ fn smol_main(
             }
 
             // Read the SM3 input region a few times (toggle a DI at the bench).
-            for k in 0..12u8 {
+            for k in 0..15u8 {
                 match sd.register_read::<[u8; 10]>(0x1700u16).await {
                     Ok(b) => tracing::info!(
                         k,
