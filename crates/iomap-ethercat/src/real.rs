@@ -632,73 +632,41 @@ fn smol_main(
             );
         }
 
-        // SPIKE A (NOT for PR): make-or-break test for ESI-driven manual PDI
-        // mapping. Manually size the process-data SyncManagers per the
-        // ESI/module layout (SM3 inputs = DI 2B + AI 8B = 10B; SM2 outputs = AI
-        // cfg 2B + AO 10B + DO 2B = 14B), drive the device to SAFE-OP via the AL
-        // Control register, then FPRD the SM3 input region. If the coupler fills
-        // 0x1700 with live module data (toggle a DI and watch `di` change), the
-        // WellBUS coupler DOES stream module data under master-configured SMs ->
-        // the manual-PDI feature is viable. If it stays 0/static -> not viable.
-        //
-        // SM config register = 0x0800 + 8*idx (SM2=0x0810, SM3=0x0818); 8 bytes:
-        // [phys_lo,phys_hi, len_lo,len_hi, control, status, enable_lo,enable_hi].
-        // Control bytes are taken verbatim from the ESI (SM2 Outputs=0x64,
-        // SM3 Inputs=0x20); enable=0x0001. All raw [u8;N] — no ethercrab privates.
+        // SPIKE B (NOT for PR): test whether the Spike-A SafeOp refusal (0x0001)
+        // was the SM2 OUTPUT watchdog tripping (we'd enabled SM2 but ran no
+        // cyclic LRW to feed it). Here we DISABLE SM2 entirely (kills the output
+        // watchdog), configure only the INPUT side (SM3=10B + FMMU0), send the
+        // analog range InitCmds, then request SAFE-OP and FPRD the input region.
+        //   * reaches SafeOp + sensible data -> watchdog was the blocker; the
+        //     INPUT side works via manual master config (next: outputs + LRW).
+        //   * still 0x0001                   -> the read-only PDO assignment (2B)
+        //     vs our SM3=10B is the real blocker -> needs the CODESYS capture.
         for sd in group.iter(&maindevice) {
-            // Per-analog-module range/type InitCmds (ESI PS-transition writes),
-            // slot-shifted 0x8000 + slot*0x10, sub 1. F050 slot order is
-            // [ID16N(0), AD4V-D(1), DA4VC-D(2), OD16N(3)]; digital modules have
-            // none. Data bytes verbatim from the ESI (AD4V-D=B610, DA4VC-D=AC10).
-            match sd.sdo_write(0x8010u16, 1u8, [0xb6u8, 0x10]).await {
-                Ok(_) => tracing::info!("spikeA: AD4V-D 0x8010:01=B610 ok"),
-                Err(e) => tracing::warn!(?e, "spikeA: AD4V-D 0x8010 write failed"),
-            }
-            match sd.sdo_write(0x8020u16, 1u8, [0xacu8, 0x10]).await {
-                Ok(_) => tracing::info!("spikeA: DA4VC-D 0x8020:01=AC10 ok"),
-                Err(e) => tracing::warn!(?e, "spikeA: DA4VC-D 0x8020 write failed"),
-            }
+            // Analog-module range InitCmds (AD4V-D slot1 0x8010=B610, DA4VC-D slot2 0x8020=AC10).
+            let _ = sd.sdo_write(0x8010u16, 1u8, [0xb6u8, 0x10]).await;
+            let _ = sd.sdo_write(0x8020u16, 1u8, [0xacu8, 0x10]).await;
 
-            let sm2: [u8; 8] = [0x00, 0x11, 0x0e, 0x00, 0x64, 0x00, 0x01, 0x00]; // @0x1100, 14B
-            let sm3: [u8; 8] = [0x00, 0x17, 0x0a, 0x00, 0x20, 0x00, 0x01, 0x00]; // @0x1700, 10B
-            let r2 = sd.register_write(0x0810u16, sm2).await;
+            // DISABLE SM2 (output) — enable byte = 0, so its watchdog can't trip
+            // while we run no cyclic LRW. (phys 0x1100, len 0, ctrl 0x64, en 0)
+            let sm2_off: [u8; 8] = [0x00, 0x11, 0x00, 0x00, 0x64, 0x00, 0x00, 0x00];
+            let r2 = sd.register_write(0x0810u16, sm2_off).await;
+            // SM3 (input) = 10 bytes @ 0x1700, ctrl 0x20, enabled.
+            let sm3: [u8; 8] = [0x00, 0x17, 0x0a, 0x00, 0x20, 0x00, 0x01, 0x00];
             let r3 = sd.register_write(0x0818u16, sm3).await;
-            tracing::info!(sm2_ok = r2.is_ok(), sm3_ok = r3.is_ok(), "spikeA: SM2=14B/SM3=10B set");
-
-            // FMMU0: map SM3 inputs (phys 0x1700, 10B) -> logical 0x0, read-only.
-            // FMMU register = 0x0600 + 16*idx. 16-byte layout (ETG1000.4 Tbl 56):
-            // [log_start u32, len u16, log_start_bit, log_end_bit, phys u16,
-            //  phys_start_bit, rd|wr enable byte, enable byte, 3 spare].
+            // FMMU0: SM3 inputs (0x1700, 10B) -> logical 0, read-only.
             let fmmu0: [u8; 16] = [
-                0x00, 0x00, 0x00, 0x00, // logical start 0x0
-                0x0a, 0x00, // length 10
-                0x00, // logical start bit 0
-                0x07, // logical end bit 7 (byte-aligned)
-                0x00, 0x17, // physical start 0x1700
-                0x00, // physical start bit 0
-                0x01, // read_enable=1, write_enable=0
-                0x01, // enable=1
-                0x00, 0x00, 0x00, // spare
+                0x00, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x07, 0x00, 0x17, 0x00, 0x01, 0x01, 0x00,
+                0x00, 0x00,
             ];
             let rf = sd.register_write(0x0600u16, fmmu0).await;
-            tracing::info!(fmmu0_ok = rf.is_ok(), "spikeA: FMMU0 inputs->logical0 set");
+            tracing::info!(
+                sm2_off = r2.is_ok(),
+                sm3 = r3.is_ok(),
+                fmmu0 = rf.is_ok(),
+                "spikeB: SM2 disabled, SM3=10B + FMMU0 set"
+            );
 
-            // FMMU1: map SM2 outputs (phys 0x1100, 14B) -> logical 0x20, write.
-            let fmmu1: [u8; 16] = [
-                0x20, 0x00, 0x00, 0x00, // logical start 0x20
-                0x0e, 0x00, // length 14
-                0x00, // logical start bit 0
-                0x07, // logical end bit 7
-                0x00, 0x11, // physical start 0x1100
-                0x00, // physical start bit 0
-                0x02, // read_enable=0, write_enable=1
-                0x01, // enable=1
-                0x00, 0x00, 0x00, // spare
-            ];
-            let rf1 = sd.register_write(0x0610u16, fmmu1).await;
-            tracing::info!(fmmu1_ok = rf1.is_ok(), "spikeA: FMMU1 outputs->logical0x20 set");
-
-            // Request SAFE-OP (AL Control state nibble = 0x4).
+            // Request SAFE-OP and watch AL state.
             let _ = sd.register_write(0x0120u16, 0x0004u16).await;
             for _ in 0..30u8 {
                 let st: u16 = sd.register_read(0x0130u16).await.unwrap_or(0xffff);
@@ -706,7 +674,7 @@ fn smol_main(
                 tracing::info!(
                     al_status = format!("{st:#06x}"),
                     al_code = format!("{code:#06x}"),
-                    "spikeA: AL state"
+                    "spikeB: AL state"
                 );
                 if st & 0x10 != 0 || (st & 0x0f) == 0x04 {
                     break;
@@ -714,8 +682,8 @@ fn smol_main(
                 smol::Timer::after(Duration::from_millis(100)).await;
             }
 
-            // Read the SM3 input region a few times (toggle a DI at the bench).
-            for k in 0..15u8 {
+            // FPRD the SM3 input region (DI byte0-1, AI ch1-4 INT16 byte2-9).
+            for k in 0..20u8 {
                 match sd.register_read::<[u8; 10]>(0x1700u16).await {
                     Ok(b) => tracing::info!(
                         k,
@@ -725,9 +693,9 @@ fn smol_main(
                         ai3 = i16::from_le_bytes([b[6], b[7]]),
                         ai4 = i16::from_le_bytes([b[8], b[9]]),
                         raw = format!("{b:02x?}"),
-                        "spikeA: SM3 input"
+                        "spikeB: SM3 input"
                     ),
-                    Err(e) => tracing::warn!(k, ?e, "spikeA: SM3 read failed"),
+                    Err(e) => tracing::warn!(k, ?e, "spikeB: SM3 read failed"),
                 }
                 smol::Timer::after(Duration::from_millis(300)).await;
             }
