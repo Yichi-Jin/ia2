@@ -34,18 +34,20 @@ fi
 echo "SRV=$SRV"
 ```
 
-If nothing answers, no server is running. Start one: `ia2-server --bind 127.0.0.1:3001 &` (installed) or `cargo run -p server` (checkout), then `SRV=http://127.0.0.1:3001`. Don't proceed without a reachable `/api/health`.
+If nothing answers, no server is running. Start one: `ia2-server --bind 127.0.0.1:3001 &` (installed) or `cargo run -p server` (checkout), then `SRV=http://127.0.0.1:3001`. Don't proceed without a reachable server. Once `SRV` is set, the CLI-native liveness check is `cs api GET /health --server "$SRV"` (exit 0, prints uptime + scan count) — the same `/health` the curl probes, but through `cs`.
 
 > Tip: some sessions persist the URL in `/tmp/ia2_srv`. Check there first: `SRV=$(cat /tmp/ia2_srv 2>/dev/null)` then validate it with a health probe before trusting it.
 
 ## 3. See what's open
 
 ```bash
-cs project list --server "$SRV"
+cs ls projects --server "$SRV"
 ```
 - **Zero projects** → you'll `cs project create` or `cs project open` as the first real step.
 - **One project** → you can omit `--project` on later commands (the active fallback is correct).
 - **Two or more** → you **must** pass `--project NAME` on every command. Note which one the user's IDE window is showing (its URL `?project=`), and target that one, or confirm with the user.
+
+Orient any time with bare `cs ls` — it prints the resource kinds (`pous`, `devices`, `edges`, `hmi`, `library`, `projects`, `device-catalog`), the self-discovery entry point for the quartet (`ls` / `get` / `set` / `rm`).
 
 ## 4. If you're about to do multi-step work
 
@@ -59,6 +61,6 @@ cs agent run --label "<what you're about to do>" --server "$SRV" -- bash -c '...
 
 You're ready to work when all of these are true:
 - [ ] `CS` points at a real binary
-- [ ] `SRV` answers `/api/health` with `"status":"ok"`
+- [ ] `cs api GET /health --server "$SRV"` exits 0 (`"status":"ok"`)
 - [ ] You know how many projects are open and which to target
 - [ ] Multi-step work is wrapped in `cs agent run`

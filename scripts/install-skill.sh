@@ -77,6 +77,20 @@ cp -R "$SKILL_SRC" "$SKILL_DST"
 "$BIN_DIR/cs" --help >/dev/null 2>&1 || die "cs failed to run after install."
 ok "$("$BIN_DIR/cs" --version 2>/dev/null || echo 'cs') installed and runnable"
 
+# ---- FB-library registry ------------------------------------------------
+# The server enables `cs library import` only when it can find a library
+# dir. A server started from an arbitrary CWD can't see the repo's
+# ./library, so vendor a copy to the installed-layout fallback path the
+# server probes (~/.local/share/ia2/library).
+LIB_SRC="$REPO_ROOT/library"
+LIB_DST="$HOME/.local/share/ia2/library"
+if [ -d "$LIB_SRC" ]; then
+  mkdir -p "$(dirname "$LIB_DST")"
+  rm -rf "$LIB_DST"
+  cp -R "$LIB_SRC" "$LIB_DST"
+  ok "FB library registry → $LIB_DST"
+fi
+
 # ---- next steps ---------------------------------------------------------
 on_path=""; case ":${PATH}:" in *":$BIN_DIR:"*) on_path="yes";; esac
 

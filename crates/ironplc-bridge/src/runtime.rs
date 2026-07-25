@@ -39,7 +39,19 @@ use ts_rs::TS;
 pub struct VarValue {
     pub name: String,
     pub type_name: String,
+    /// Display-formatted value (IDE-facing): `12.5`, `16#1637`,
+    /// `TRUE`, `'text'`.
     pub value: String,
+    /// Raw 64-bit VM slot the display string was formatted from.
+    /// Decode with `monitor::typed_value` (REAL = IEEE-754 bits in the
+    /// low 32, LREAL = full 64). STRING values don't live in the slot —
+    /// their bits are 0 and `value` is authoritative.
+    ///
+    /// NOTE for JS consumers: serialized as a JSON number, exact only
+    /// up to 2^53 — decode bits in Rust (northbound/alarms do), not in
+    /// the browser.
+    #[ts(type = "number")]
+    pub bits: u64,
 }
 
 #[derive(Debug, Clone, Serialize, TS)]
@@ -1883,6 +1895,7 @@ fn build_snapshot(
                 name,
                 type_name: info.type_name.clone(),
                 value: format_value(raw, info, string_layouts[u].get(&i).copied(), data_region),
+                bits: raw,
             });
         }
     }

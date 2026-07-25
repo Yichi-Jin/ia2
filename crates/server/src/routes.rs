@@ -23,9 +23,7 @@ use axum::{
 };
 use futures_util::stream::Stream;
 use futures_util::{SinkExt, StreamExt as FuturesStreamExt};
-use ironplc_bridge::{
-    CheckDiagnostic, DeviceSpec, ProgramHandle, RuntimeMode, VarSnapshot, VariableInfo,
-};
+use ironplc_bridge::{CheckDiagnostic, DeviceSpec, VariableInfo};
 use project::{
     default_projects_dir, load_last_opened, save_last_opened, Device, Edge, EthercatBringup, IoMap,
     MigrationReport, Pou, PouFile, PouLanguage, PouType, ProgramInstance, ProjectListing,
@@ -501,6 +499,8 @@ pub async fn close_project(
         *state.last_snapshot.lock() = None;
         *state.last_error.lock() = None;
         *state.running_info.lock() = None;
+        state.historian.clear();
+        *state.alarms.lock() = ironplc_bridge::monitor::AlarmEngine::default();
     }
     state.emit_mutation(target, topic::PROJECT_META, MutationDetail::ProjectClosed);
     Ok(Json(RunResponse { ok: true }))
@@ -1287,7 +1287,7 @@ pub async fn logs_edge_route(
 }
 
 /// Pull per-device connect status + discovered EtherCAT topology from
-/// the edge runtime over ssh. Backs `cs edge scan` / the IDE's discovery
+/// the edge runtime over ssh. Backs `cs get edges/<n>/scan` / the IDE's discovery
 /// pane so PDO maps can be authored against the real bus.
 pub async fn discover_edge_route(
     State(state): State<AppState>,
@@ -1304,7 +1304,7 @@ pub async fn discover_edge_route(
 }
 
 /// Edge interfaces / serial ports / arch (for authoring device configs
-/// against real edge facts). Backs `cs edge system`.
+/// against real edge facts). Backs `cs get edges/<n>/system`.
 pub async fn system_edge_route(
     State(state): State<AppState>,
     project: ProjectName,
@@ -1372,15 +1372,27 @@ pub async fn deploy_edge_route(
         Ok((edge, store.root().to_path_buf()))
     })?;
     let runtime_binary = find_runtime_binary();
-    deploy_to_edge(
+    match deploy_to_edge(
         &edge,
         &project_dir,
         runtime_binary.as_deref(),
         state.web_dist.as_deref(),
     )
     .await
-    .map(Json)
-    .map_err(|e| ApiError::Internal(e.to_string()))
+    {
+        Ok(report) => Ok(Json(report)),
+        // A remote script failure is a deploy OUTCOME, not an infra
+        // fault: return it as ok:false with the full log so `cs deploy`
+        // can print the story and exit 1 (its documented remote-failure
+        // code). 5xx stays reserved for local/transport faults.
+        Err(crate::edges::DeployError::Remote(code, log)) => Ok(Json(DeployReport {
+            ok: false,
+            version: String::new(),
+            log: format!("remote deploy script exited with status {code}\n{log}"),
+            warning: None,
+        })),
+        Err(e) => Err(ApiError::Internal(e.to_string())),
+    }
 }
 
 pub async fn attach_edge_route(
@@ -1550,6 +1562,54 @@ pub async fn put_northbound(
 ) -> Result<Json<RunResponse>, ApiError> {
     with_project(&state, &project, |store| {
         store.write_northbound(&config).map_err(Into::into)
+    })?;
+    Ok(Json(RunResponse { ok: true }))
+}
+
+// ============================================================
+//  Alarms (alarms.toml — declarative alarm definitions)
+// ============================================================
+
+pub async fn get_alarms(
+    State(state): State<AppState>,
+    project: ProjectName,
+) -> Result<Json<project::AlarmConfig>, ApiError> {
+    with_project(&state, &project, |store| {
+        store.read_alarms().map_err(Into::into)
+    })
+    .map(Json)
+}
+
+/// Replace alarms.toml. Rejects duplicate ids and numeric conditions
+/// without a limit — the engine would otherwise treat a missing limit
+/// as 0.0 and "work" misleadingly. Definitions apply on the NEXT run
+/// (the engine is rebuilt by /api/run).
+pub async fn put_alarms(
+    State(state): State<AppState>,
+    project: ProjectName,
+    Json(config): Json<project::AlarmConfig>,
+) -> Result<Json<RunResponse>, ApiError> {
+    let mut seen = std::collections::HashSet::new();
+    for def in &config.alarms {
+        if !seen.insert(def.id.as_str()) {
+            return Err(ApiError::BadRequest(format!(
+                "duplicate alarm id '{}'",
+                def.id
+            )));
+        }
+        let needs_limit = !matches!(
+            def.condition,
+            project::AlarmCondition::IsTrue | project::AlarmCondition::IsFalse
+        );
+        if needs_limit && def.limit.is_none() {
+            return Err(ApiError::BadRequest(format!(
+                "alarm '{}': condition {:?} needs a `limit`",
+                def.id, def.condition
+            )));
+        }
+    }
+    with_project(&state, &project, |store| {
+        store.write_alarms(&config).map_err(Into::into)
     })?;
     Ok(Json(RunResponse { ok: true }))
 }
@@ -1967,7 +2027,7 @@ pub async fn run(
     };
     let req_program = req.program.clone();
     let req_file_path = req.file_path.clone();
-    let (units, device_specs, mappings) =
+    let (units, device_specs, mappings, alarm_defs) =
         tokio::task::spawn_blocking(move || -> Result<_, ApiError> {
             let store = &store;
             let req = RunRequest {
@@ -2023,6 +2083,7 @@ pub async fn run(
             };
             let devices = store.list_devices()?;
             let iomap = store.read_iomap()?;
+            let alarms = store.read_alarms().map(|c| c.alarms).unwrap_or_default();
             let specs = devices
                 .into_iter()
                 .map(|d| DeviceSpec {
@@ -2030,7 +2091,7 @@ pub async fn run(
                     config: d.config,
                 })
                 .collect::<Vec<_>>();
-            Ok((units, specs, iomap.mappings))
+            Ok((units, specs, iomap.mappings, alarms))
         })
         .await
         .map_err(|e| ApiError::Internal(format!("compile task failed: {e}")))??;
@@ -2042,6 +2103,10 @@ pub async fn run(
         }
     }
 
+    // Rebuild the alarm engine from this project's alarms.toml — the
+    // run picks up definition edits without a server restart.
+    *state.alarms.lock() = ironplc_bridge::monitor::AlarmEngine::new(alarm_defs);
+
     // IDE-side server runs are ephemeral — they're for the user
     // poking values, not for persisted plant state. We leave
     // `state_path = None`; only the headless `ia2-runtime` edge
@@ -2050,6 +2115,8 @@ pub async fn run(
     let mut rx = handle.subscribe();
     let event_tx = state.event_tx.clone();
     let last_snapshot_cache = state.last_snapshot.clone();
+    let historian = state.historian.clone();
+    let alarm_engine = state.alarms.clone();
     // Fresh run wipes the prior error; if this run faults, the forwarder
     // below refills it when the snapshot stream closes.
     *state.last_error.lock() = None;
@@ -2068,6 +2135,10 @@ pub async fn run(
             tokio::select! {
                 res = rx.recv() => match res {
                     Ok(snap) => {
+                        historian.note_snapshot(&snap);
+                        alarm_engine
+                            .lock()
+                            .note_snapshot(&snap, ironplc_bridge::monitor::wall_now_us());
                         *last_snapshot_cache.lock() =
                             Some(snap.clone());
                         let _ = event_tx.send(AppEvent::Snapshot(snap));
@@ -2198,309 +2269,6 @@ pub async fn events(
     });
     let stream = FuturesStreamExt::chain(tokio_stream::iter(initial), live);
     Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
-}
-
-// ============================================================
-//  Runtime — synchronous queries + variable writes
-// ============================================================
-
-/// Most recent VarSnapshot from the running bridge, or `null` when
-/// nothing has been snapshotted in the current session (no run, or
-/// project was just closed). Lets agents poll one-shot without
-/// subscribing to /api/events SSE.
-pub async fn runtime_snapshot(State(state): State<AppState>) -> Json<Option<VarSnapshot>> {
-    Json(state.last_snapshot.lock().clone())
-}
-
-#[derive(Debug, Serialize, TS)]
-#[ts(export)]
-pub struct RuntimeStatus {
-    pub running: bool,
-    pub project: Option<String>,
-    /// Program instances declared in tasks.toml (what's actually scheduled).
-    pub program_instances: Vec<String>,
-    pub devices: Vec<String>,
-    /// Scan count from the most recent snapshot; 0 before the first one.
-    pub scan_count: u64,
-    /// Timestamp_us of the most recent snapshot, or 0.
-    pub last_snapshot_us: u64,
-    pub last_error: Option<String>,
-    /// What kind of run is active (isolated vs scheduled) and which
-    /// PROGRAM(s) it covers. Populated from `AppState.running_info`
-    /// which the /api/run handler writes when it starts a program;
-    /// cleared on /api/stop and on close-project. `None` here just
-    /// means nothing is currently running.
-    pub running_info: Option<RunningInfo>,
-    /// Current scan-loop mode (`running` / `paused` / `step{remaining}`).
-    /// `None` when nothing's running.
-    pub mode: Option<RuntimeMode>,
-    /// Currently-forced variables in `name=value` pairs, sorted by name.
-    /// Empty when no force is active. The shape matches the in-memory
-    /// HashMap snapshot from `ProgramHandle::forces()`.
-    pub forces: Vec<ForceEntry>,
-}
-
-#[derive(Debug, Serialize, TS)]
-#[ts(export)]
-pub struct ForceEntry {
-    pub name: String,
-    pub value: i32,
-}
-
-/// One-shot overview of the runtime — designed for agents who want
-/// "what's going on right now" without composing /health + /api/project
-/// + the SSE stream.
-///
-/// Multi-project note: status is scoped to whichever project the
-/// caller named in `X-IA2-Project` (falling back to active). The
-/// `running_info` field reports the globally-running program even if
-/// it doesn't belong to the queried project; the IDE renders this as
-/// "running: <project>/<program>" so the user can see when their
-/// window is observing a sibling project's run.
-pub async fn runtime_status(
-    State(state): State<AppState>,
-    project: ProjectName,
-) -> Json<RuntimeStatus> {
-    let running = state.program.lock().is_some();
-    // Project-scoped fields: pulled from whichever project the
-    // header (or active fallback) names. None if no project matched.
-    let (project_name, programs, devices) = {
-        let guard = state.projects.lock();
-        let store = match project.as_deref() {
-            Some(name) => guard.get(name),
-            None => guard.active(),
-        };
-        match store {
-            Some(store) => {
-                let tasks = store.read_tasks().ok().flatten().unwrap_or_default();
-                let programs = tasks.programs.iter().map(|p| p.instance.clone()).collect();
-                let devices = store
-                    .list_devices()
-                    .map(|ds| ds.iter().map(|d| d.name.clone()).collect())
-                    .unwrap_or_default();
-                (Some(store.name().to_string()), programs, devices)
-            }
-            None => (None, vec![], vec![]),
-        }
-    };
-    let snap = state.last_snapshot.lock().clone();
-    let last_error = state.last_error.lock().clone();
-    let running_info = state.running_info.lock().clone();
-    // Mode + forces come from the live ProgramHandle, when there is
-    // one. Clone the handle out of the mutex briefly to avoid holding
-    // the sync lock across the calls.
-    let (mode, forces) = {
-        let guard = state.program.lock();
-        match guard.as_ref() {
-            Some(rp) => {
-                let forces = rp
-                    .handle
-                    .forces()
-                    .into_iter()
-                    .map(|(name, value)| ForceEntry { name, value })
-                    .collect();
-                (Some(rp.handle.mode()), forces)
-            }
-            None => (None, vec![]),
-        }
-    };
-    Json(RuntimeStatus {
-        running,
-        project: project_name,
-        program_instances: programs,
-        devices,
-        scan_count: snap.as_ref().map(|s| s.scan_count).unwrap_or(0),
-        last_snapshot_us: snap.as_ref().map(|s| s.timestamp_us).unwrap_or(0),
-        last_error,
-        running_info,
-        mode,
-        forces,
-    })
-}
-
-#[derive(Debug, Deserialize, TS)]
-#[ts(export)]
-pub struct WriteVariableRequest {
-    /// Raw i32 value to write — the VM's variable-write primitive is
-    /// `write_variable(VarIndex, i32)`, so callers map their domain type
-    /// to an i32 (BOOL → 0/1, USINT/UINT → numeric, etc.).
-    pub value: i32,
-    /// Momentary hold: after `pulse_ms` the SERVER writes 0 back. The
-    /// reset guarantee lives here — not in a page timer — so a closed
-    /// tab or suspended tablet can't leave a momentary command latched
-    /// (the HMI pulse action's contract). Overlapping pulses on one
-    /// variable are latest-write-wins.
-    #[serde(default)]
-    pub pulse_ms: Option<u32>,
-}
-
-#[derive(Debug, Serialize, TS)]
-#[ts(export)]
-pub struct WriteVariableResponse {
-    pub name: String,
-    pub value: i32,
-}
-
-/// Poke a variable while the program is running. Applied between scan
-/// rounds (so the next round's logic sees the new value). 404 if the
-/// name doesn't resolve to any declared variable; 409 if no program is
-/// running.
-pub async fn write_runtime_variable(
-    State(state): State<AppState>,
-    _project: ProjectName,
-    AxumPath(name): AxumPath<String>,
-    Json(req): Json<WriteVariableRequest>,
-) -> Result<Json<WriteVariableResponse>, ApiError> {
-    // The runtime is global (one PROGRAM at a time, hardware constraint);
-    // the `X-IA2-Project` header is accepted for symmetry but not used
-    // to select a program — clients can poll runtime_status to see which
-    // project's program is actually running. Clone the handle out of the
-    // mutex so we don't hold a sync lock across the .await below — see
-    // the bridge::ProgramHandle docs.
-    let handle: ProgramHandle = live_program(&state)?;
-    let value = handle.write_variable(&name, req.value).await?;
-    if let Some(ms) = req.pulse_ms {
-        let h = handle.clone();
-        let n = name.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(ms as u64)).await;
-            if let Err(e) = h.write_variable(&n, 0).await {
-                // The program may have stopped in the window — that also
-                // clears the variable, so a failed reset here is benign;
-                // log it so a live-program failure is still visible.
-                tracing::warn!(variable = %n, %e, "pulse reset write failed");
-            }
-        });
-    }
-    Ok(Json(WriteVariableResponse { name, value }))
-}
-
-// ============================================================
-//  Debug control trio: pause / resume / step + force / unforce
-//
-//  All four endpoints share the same "look up the live handle, 409
-//  if nothing running" pattern as `write_runtime_variable`. Mode
-//  toggles are synchronous on the bridge side (just a mutex write);
-//  force commands round-trip through the cmd channel so the scan
-//  loop can validate the variable name before the ack comes back.
-// ============================================================
-
-#[derive(Debug, Deserialize, TS)]
-#[ts(export)]
-pub struct StepRequest {
-    /// How many scan cycles to run before re-pausing. Defaults to 1
-    /// when missing — "step" without a count is the common case.
-    #[serde(default = "default_step_cycles")]
-    pub cycles: u32,
-}
-
-fn default_step_cycles() -> u32 {
-    1
-}
-
-#[derive(Debug, Deserialize, TS)]
-#[ts(export)]
-pub struct ForceRequest {
-    pub value: i32,
-}
-
-#[derive(Debug, Serialize, TS)]
-#[ts(export)]
-pub struct ModeResponse {
-    pub mode: RuntimeMode,
-}
-
-/// Look up the live program handle or return 409. Used by every
-/// debug-control endpoint below. The handle is global (one PROGRAM
-/// runs at a time, hardware constraint), so this helper doesn't take
-/// a project name — callers that want to know *which* project owns
-/// the running program use `/api/runtime/status.running_info`.
-fn live_program(state: &AppState) -> Result<ProgramHandle, ApiError> {
-    state
-        .program
-        .lock()
-        .as_ref()
-        .map(|rp| rp.handle.clone())
-        .ok_or(ApiError::Conflict("no program running".into()))
-}
-
-pub async fn runtime_pause(State(state): State<AppState>) -> Result<Json<ModeResponse>, ApiError> {
-    let handle = live_program(&state)?;
-    handle.pause();
-    Ok(Json(ModeResponse {
-        mode: handle.mode(),
-    }))
-}
-
-pub async fn runtime_resume(State(state): State<AppState>) -> Result<Json<ModeResponse>, ApiError> {
-    let handle = live_program(&state)?;
-    handle.resume();
-    Ok(Json(ModeResponse {
-        mode: handle.mode(),
-    }))
-}
-
-pub async fn runtime_step(
-    State(state): State<AppState>,
-    body: Option<Json<StepRequest>>,
-) -> Result<Json<ModeResponse>, ApiError> {
-    let handle = live_program(&state)?;
-    let cycles = body.map(|Json(r)| r.cycles).unwrap_or(1);
-    handle.step(cycles);
-    Ok(Json(ModeResponse {
-        mode: handle.mode(),
-    }))
-}
-
-#[derive(Debug, Serialize, TS)]
-#[ts(export)]
-pub struct ForceResponse {
-    pub name: String,
-    pub value: i32,
-}
-
-/// Pin a variable's value. The scan loop applies it on every cycle
-/// until `unforce_runtime_variable` is called. 404 if the variable
-/// isn't declared in this POU; 409 if nothing's running.
-pub async fn force_runtime_variable(
-    State(state): State<AppState>,
-    _project: ProjectName,
-    AxumPath(name): AxumPath<String>,
-    Json(req): Json<ForceRequest>,
-) -> Result<Json<ForceResponse>, ApiError> {
-    let handle = live_program(&state)?;
-    let value = handle.force_variable(&name, req.value).await?;
-    Ok(Json(ForceResponse { name, value }))
-}
-
-/// Release a forced variable. No-op (200) if the variable wasn't
-/// forced — convenient for idempotent agent retries.
-pub async fn unforce_runtime_variable(
-    State(state): State<AppState>,
-    _project: ProjectName,
-    AxumPath(name): AxumPath<String>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let handle = live_program(&state)?;
-    handle.unforce_variable(&name).await?;
-    Ok(Json(serde_json::json!({ "name": name, "forced": false })))
-}
-
-/// List currently-forced variables. Returns `[]` when nothing's
-/// running (rather than 409) — easier for clients to render.
-pub async fn list_runtime_forces(State(state): State<AppState>) -> Json<Vec<ForceEntry>> {
-    let forces = state
-        .program
-        .lock()
-        .as_ref()
-        .map(|rp| {
-            rp.handle
-                .forces()
-                .into_iter()
-                .map(|(name, value)| ForceEntry { name, value })
-                .collect()
-        })
-        .unwrap_or_default();
-    Json(forces)
 }
 
 // ============================================================

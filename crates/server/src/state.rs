@@ -226,6 +226,15 @@ pub struct AppState {
     /// can serve the standalone HMI panel there; `None` (dev servers
     /// behind vite) deploys without the panel assets.
     pub web_dist: Option<std::path::PathBuf>,
+    /// In-memory historian fed by the run forwarder (1 Hz sampling,
+    /// ~2 h window). IDE-side runs are ephemeral, so no persistence —
+    /// the edge runtime is the one that persists history to disk.
+    /// Survives stop (post-run investigation); cleared on close.
+    pub historian: Arc<ironplc_bridge::monitor::Historian>,
+    /// Alarm engine rebuilt from `alarms.toml` on every /api/run;
+    /// evaluated by the run forwarder on each snapshot. Survives stop
+    /// so "what fired" outlives the run; cleared on close-project.
+    pub alarms: Arc<Mutex<ironplc_bridge::monitor::AlarmEngine>>,
 }
 
 /// Pairs the active `ProgramHandle` with the name of the project it
@@ -275,6 +284,8 @@ impl AppState {
             agent: Arc::new(Mutex::new(AgentActivityState::default())),
             library_dir,
             web_dist,
+            historian: Arc::new(ironplc_bridge::monitor::Historian::in_memory()),
+            alarms: Arc::new(Mutex::new(ironplc_bridge::monitor::AlarmEngine::default())),
         }
     }
 

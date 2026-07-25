@@ -78,6 +78,19 @@ prompts — the IDE runs `ssh -o BatchMode=yes`).
      `current` symlink, and `systemctl restart ia2`s
    - Streams the remote script's output back into the pane
 
+   Deploy REFUSES to lie about the outcome:
+   - a broken tar stream or a local tar failure fails the deploy (no
+     silently-truncated uploads);
+   - a failed `systemctl restart` fails the deploy (`ok: false` + the
+     log) — files staged but old code still running is a FAILURE, not a
+     success with a footnote;
+   - a missing `VERSION=` line from the remote script fails the deploy
+     (script drift = state unknown);
+   - install_dir vs systemd-unit drift stays a deploy-level `warning`
+     field in the report (structured, plus a WARNING line in the log) —
+     the files land, but the service will not see them until you
+     reconcile `install_dir` with the unit's `INSTALL_DIR`.
+
 4. **Attach for live debugging**. Click `Attach`. The IDE opens an
    `ssh -N -L 127.0.0.1:<random>:127.0.0.1:<edge_runtime_port>` tunnel
    and switches the MonitorPane / VariablesPanel SSE source over to it.
@@ -203,8 +216,12 @@ one carrying your SSH / management traffic.
 - **No EtherCAT hardware on the dev machine**: leave `nic = "_sim"`. The
   IDE will let you configure PDOs and the bridge will respond in sim
   mode. On the edge, configure the real NIC.
-- **Retained / persistent variables** aren't yet preserved across
-  deploys. Each new `current` starts fresh.
+- **Retained / persistent variables** ARE preserved across deploys:
+  `VAR RETAIN` state lives in a `state/` directory that sits BESIDE the
+  versioned `current` symlink (`$INSTALL_DIR/state/`), so a symlink swap
+  never touches it (schema-2 lossless 64-bit slots; see
+  `crates/ironplc-bridge/src/retain.rs` and the flush interval in the
+  bridge). Deleting `$INSTALL_DIR/state/` is the manual cold-start.
 - **Hot patch / online change** (Codesys-style in-place code update) is
   not implemented. Deploy is stop → swap → start. Plan downtime.
 - **Real-time**: stock Linux gives soft-RT only; scan jitter is in the
@@ -217,7 +234,8 @@ one carrying your SSH / management traffic.
   electronic gearing, has been run on real hardware.
 - **ESI modular couplers**: offline ESI parsing and channel assembly *are*
   shipped. Set `bringup = { mode = "esi_modular", esi_path = "esi/coupler.xml" }`,
-  then `cs device esi-assemble <device> --idents …` builds the channel list
+  then `cs api POST /api/devices/<device>/esi-assemble` (body
+  `{"detected":[…]}`) builds the channel list
   from the coupler's ESI plus its reported modules (tracking byte/bit offsets)
   and replaces the device's channels. What remains hardware-gated is the
   real-bus cyclic bring-up for these couplers (master-programmed

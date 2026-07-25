@@ -5,12 +5,14 @@ Run before you tell the user "done". Catches the things that look fine in your t
 ## Correctness
 
 - [ ] **`cs project check ~/Documents/IA2/<name>` passes.** A clean compile of the whole project, not just the one POU you edited. Edits to shared variables or iomap can break a different POU.
-- [ ] **Every iomap entry resolves.** If you added bindings, confirm each `device`/`channel`/`variable` exists (`cs device get`, `cs symbols`). Unresolved bindings warn-skip silently at run time — they won't error, they just won't do anything.
+- [ ] **Every iomap entry resolves.** If you added bindings, confirm each `device`/`channel`/`variable` exists (`cs get devices/<n>`, `cs symbols`). Unresolved bindings warn-skip silently at run time — they won't error, they just won't do anything.
 - [ ] **No 2+ PROGRAMs sharing a `VAR_GLOBAL`.** Several scheduled PROGRAMs run fine (round-robin, one container each); that single combination is the only one rejected, and `cs project check` catches it. See `references/01-mental-model.md` fact 2.
+- [ ] **Scenarios pass, if the project has any.** If a `scenarios/` directory exists, `cs sim run scenarios/<x>.toml` each one and report pass/fail — exit 0 = every expectation held; exit 1 names the failing step and the last observed value. This is the strongest "it actually behaves" evidence you can hand over. See `references/09-sim-alarms.md`.
 
 ## Runtime state
 
 - [ ] **No leftover forces.** `cs runtime status --json` → `forces` array empty. If you forced anything during debugging, `cs runtime unforce` it. A stuck force is invisible and infuriating.
+- [ ] **Alarms triaged.** `cs get runtime/alarms` — `cs runtime ack <id>` the ones *you* deliberately caused (a trip you induced while testing), and **report anything else still standing** rather than silently acking it. An alarm you didn't expect is a finding, not noise to clear.
 - [ ] **Program is in the state the user expects.** If they asked you to leave it running, confirm `cs runtime status` shows `running: true` and the right project/program. If they asked you to set it up but not run it, `cs stop`.
 - [ ] **No accidental cross-project stop.** If you ran a program in project B while the user was watching project A's program, you stopped theirs. Tell them.
 

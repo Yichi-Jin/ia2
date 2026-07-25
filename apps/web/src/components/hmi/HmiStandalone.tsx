@@ -32,6 +32,8 @@ import { useThemeToggle } from "@/lib/dark-mode"
 import { cn } from "@/lib/utils"
 import { encodeForWrite } from "@/lib/write-encoding"
 import { liveFeedStore, useConnected } from "@/state/live-feed"
+import type { AlarmState } from "@/types/generated/AlarmState"
+import type { HistoryResponse } from "@/types/generated/HistoryResponse"
 import type { HmiListEntry } from "@/types/generated/HmiListEntry"
 
 async function jget<T>(url: string): Promise<T> {
@@ -88,9 +90,11 @@ export function HmiStandalone() {
 
   // Shell-level /status poll: the header must distinguish running /
   // paused / fault / comms-lost on its own — the alarmbar is per-screen
-  // and a screen may not include one.
+  // and a screen may not include one. The same poll carries the standing
+  // alarm count for the compact header chip.
   const [edgeState, setEdgeState] = useState<HmiRuntimeState | null>(null)
   const [failedPolls, setFailedPolls] = useState(0)
+  const [alarmsStanding, setAlarmsStanding] = useState(0)
   useEffect(() => {
     let cancelled = false
     const tick = async () => {
@@ -99,6 +103,7 @@ export function HmiStandalone() {
         if (cancelled) return
         setProject(s.project ?? "")
         setEdgeState(edgeRuntimeState(s))
+        setAlarmsStanding(s.alarms_standing ?? 0)
         setFailedPolls(0)
       } catch {
         if (!cancelled) setFailedPolls((n) => n + 1)
@@ -156,6 +161,22 @@ export function HmiStandalone() {
       // paused / device-down apart from a healthy green run.
       runtimeState: async () =>
         edgeRuntimeState(await jget<EdgeStatus>("/status")),
+      // Runtime-side surfaces on this same origin (root-relative), same
+      // shapes as the IDE's /api/runtime/* endpoints.
+      history: (vars, stepMs) =>
+        jget<HistoryResponse>(
+          `/history?vars=${encodeURIComponent(vars.join(","))}&from_us=0&to_us=0&step_ms=${stepMs}`,
+        ),
+      alarms: () => jget<AlarmState[]>("/alarms"),
+      ackAlarm: async (id) => {
+        const res = await fetch(`/alarms/${encodeURIComponent(id)}/ack`, {
+          method: "POST",
+        })
+        if (!res.ok) {
+          throw new Error(`${res.status}: ${await res.text()}`)
+        }
+        return (await res.json()) as AlarmState
+      },
     }),
     [navigate],
   )
@@ -197,6 +218,20 @@ export function HmiStandalone() {
           )}
         </div>
         <div className="flex items-center gap-2">
+          {alarmsStanding > 0 && (
+            <button
+              type="button"
+              onClick={() =>
+                document
+                  .querySelector('[data-hmi-type="alarmlist"]')
+                  ?.scrollIntoView({ behavior: "smooth", block: "center" })
+              }
+              title="Standing alarms — jump to the alarm list if this screen has one"
+              className="rounded bg-warn/15 px-1.5 py-0.5 font-mono text-[9px] uppercase tracking-wider text-warn"
+            >
+              {alarmsStanding} {alarmsStanding === 1 ? "alarm" : "alarms"}
+            </button>
+          )}
           {showBadge && (
             <span
               className={cn(

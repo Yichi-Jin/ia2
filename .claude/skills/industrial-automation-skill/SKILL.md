@@ -1,55 +1,63 @@
 ---
 name: industrial-automation-skill
-description: Use when the user is doing PLC programming or industrial-automation engineering work via the IA2 stack — IEC 61131-3 source (ST / LD / FBD / SFC), device wiring over Modbus TCP/RTU, EtherCAT, OPC UA or CANopen, runtime debugging (force / pause / step), or deploying programs to edge controllers. The CLI binary is `cs`. Trigger words include "ia2", "cs CLI", "ironplc", "iec 61131", "structured text", ".st file", "ladder logic", "function block", "modbus", "rtu", "ethercat", "opc ua", "opcua", "canopen", "socketcan", "sdo", "pdo", "node id", "scan loop", "VAR RETAIN", "tasks.toml", "iomap", "PLC", "edge runtime", "PROGRAM", "FUNCTION_BLOCK", "TON / TOF / R_TRIG". Do NOT trigger this skill for general embedded firmware, generic web backends, or unrelated industrial protocols (BACnet, PROFINET — out of scope today; northbound MQTT is covered only as IA2's own publisher).
+description: Use when the user is doing PLC programming or industrial-automation engineering work via the IA2 stack — IEC 61131-3 source (ST / LD / FBD / SFC), device wiring over Modbus TCP/RTU, EtherCAT, OPC UA or CANopen, runtime debugging (force / pause / step), alarms and history, scenario simulation (`cs sim`), or deploying programs to edge controllers. The CLI binary is `cs`. Trigger words include "ia2", "cs CLI", "ironplc", "iec 61131", "structured text", ".st file", "ladder logic", "function block", "modbus", "rtu", "ethercat", "opc ua", "opcua", "canopen", "socketcan", "sdo", "pdo", "node id", "scan loop", "VAR RETAIN", "tasks.toml", "iomap", "alarms.toml", "PLC", "edge runtime", "PROGRAM", "FUNCTION_BLOCK", "TON / TOF / R_TRIG". Do NOT trigger this skill for general embedded firmware, generic web backends, or unrelated industrial protocols (BACnet, PROFINET — out of scope today; northbound MQTT is covered only as IA2's own publisher).
 ---
 
 # Industrial Automation (IA2) — Agent Skill
 
-You are the agent layer of an IEC 61131-3 PLC engineering toolchain called **IA2**. Your job: drive the system through its CLI (`cs`) and HTTP API to author PLC programs, configure devices, validate, run, and debug — while the human watches the IDE window and the takeover banner shows what you're doing.
+You are the agent layer of an IEC 61131-3 PLC engineering toolchain called **IA2**. Your job: drive the system through its CLI (`cs`) and HTTP API to author PLC programs, configure devices, validate, **simulate**, run, and debug — while the human watches the IDE window and the takeover banner shows what you're doing.
 
-The CLI is **designed for you**, not for human shells. Most flags exist so you don't have to guess shapes; **nearly every command — reads included — announces a heartbeat** so the IDE shows an agent is in control (only the static-analysis commands `check`/`transpile`/`explain`/`symbols` and `project check`/`info` stay silent).
+The CLI is bash-sized and **designed for you**. Five meta-primitives cover every resource — `cs ls`, `cs get <path>`, `cs set <path> --from f|-`, `cs rm <path>`, and the raw escape hatch `cs api METHOD /api/...` — plus a short list of domain verbs (`check`, `run`, `runtime …`, `sim run`, `deploy`, `hmi op/generate`, `agent run`). Resource paths mirror the on-disk project layout, so what you see in `git ls-files` is what you address (`cs get pous/main.st`, `cs set devices/plc1 --from -`, `cs get iomap`). Start any unfamiliar server with `cs ls` — it lists every resource kind. Full surface: `references/02-cli-reference.md`.
+
+Contracts you can rely on (and must preserve when reporting):
+
+- **Exit codes**: 0 success · 1 problems in YOUR content (diagnostics, failed probe/deploy/sim) · 2 bad request — the server's reason (e.g. ``missing field `application` ``) prints VERBATIM on stderr; read it before retrying · ≥3 infrastructure.
+- **Heartbeat**: only MUTATING commands light the IDE's takeover overlay; reads (`ls`/`get`/`check`/`probe`/`runtime status`/`snapshot`) stay silent.
+- **`--project NAME` is global** and applies to every request — no command silently drops it.
 
 ## How to use this skill
 
 1. **First contact in a session** — run through `checklists/first-contact.md`. Three things to settle before any work:
    - **Is the toolchain installed?** `cs` + `ia2-server` are Rust binaries this skill drives. If the skill was installed standalone (via `npx skills`) and `cs` isn't on `PATH`, build them once: `git clone --recursive https://github.com/supcon-international/ia2 && cd ia2 && ./scripts/install-skill.sh` (needs the Rust toolchain — rustup.rs).
-   - **Where is the server?** `cs` defaults to `http://127.0.0.1:3001`; if nothing answers `/api/health`, start one: `ia2-server --bind 127.0.0.1:3001 &` (or discover a non-default port via `lsof` — see `checklists/first-contact.md`).
-   - **Which projects are open?** `cs project list`; pass `--project NAME` if more than one.
+   - **Where is the server?** `cs` defaults to `http://127.0.0.1:3001`; if nothing answers `cs api GET /health`, start one: `ia2-server --bind 127.0.0.1:3001 &` (or discover a non-default port — see the checklist).
+   - **Which projects are open?** `cs ls projects`; pass `--project NAME` if more than one.
 2. **For any multi-step work, wrap it in a session.** This is not optional. See `references/03-agent-sessions.md`:
    ```
    cs agent run --label "what I'm doing" --server "$SRV" -- bash -c '
-     cs --project foo pou save bar ...
-     cs --project foo run --program bar ...
-     ...
+     cs --project foo set pous/bar.st --from - <<EOF ... EOF
+     cs --project foo run
    '
    ```
-   Without the wrapper, the IDE's takeover banner flickers between every command — exhausting for the human. With it, the banner stays steady with your `--label` text.
-3. **Match the user's intent to a workflow recipe** in `references/04-workflows.md` — recipes cover: new project from scratch, add a POU, configure devices + iomap + tasks, validate + run, debug session, deploy to edge. Operator screens (HMI) have their own reference — `references/08-hmi.md`: generate a baseline with `cs hmi generate`, then reshape it element-by-element with `cs hmi op` so the canvas renders each batch live. Pattern-match before improvising.
-4. **Before claiming "done", run `checklists/handoff.md`** — verifies the project compiles cleanly, runtime status is sane, and any forced variables are released.
+   Without the wrapper, the IDE's takeover banner flickers between every mutating command. With it, the banner stays steady with your `--label` text.
+3. **Prove logic before hardware.** The canonical loop is `cs check` → `cs project check` → **`cs sim run <scenario>`** → deploy. Write a scenario for anything you generate that has behaviour worth asserting (fills, interlocks, alarm raising) — `references/09-sim-alarms.md`. Author `alarms.toml` alongside the logic: a program that can misbehave silently is half-delivered.
+4. **Match the user's intent to a workflow recipe** in `references/04-workflows.md` — new project, add a POU, devices + iomap + tasks, validate + run, sim, debug, alarms/history, deploy. Operator screens: `references/08-hmi.md` (`cs hmi generate` baseline → `cs hmi op` incremental edits, rendered live). Pattern-match before improvising.
+5. **Before claiming "done", run `checklists/handoff.md`** — compile clean, sim green (when a scenario exists), forces released, standing alarms explained, runtime state reported.
 
 ## The one-paragraph version
 
-IA2 is a single Rust server (axum) that hosts N IEC 61131-3 projects (TOML on disk), compiles each via the vendored `ironplc` compiler, runs the bytecode in an in-process scan loop, and drives real Modbus TCP / Modbus RTU / EtherCAT / OPC UA / CANopen field connections through the `iomap-*` adapters. One process, many projects (`X-IA2-Project` header), one running program at a time (hardware constraint). The web UI runs in the browser (vite dev, or served by the server via `--static-dir`), URL-scoped via `?project=name`. The `cs` CLI is a thin axum client: every command is one HTTP call. The target project is selected by the `--project` flag (sent as the `X-IA2-Project` header); the separate `IA2_AGENT_SESSION` env var carries the agent *session id* for heartbeat attribution — **not** the project.
+IA2 is a single Rust server (axum) that hosts N IEC 61131-3 projects (TOML on disk), compiles each via the vendored `ironplc` compiler, runs the bytecode in an in-process scan loop, and drives real Modbus TCP / Modbus RTU / EtherCAT / OPC UA / CANopen field connections through the `iomap-*` adapters. One process, many projects (`X-IA2-Project` header), one running program at a time (hardware constraint). The shared monitor layer gives BOTH the IDE server and the deployed edge runtime the same debug surface (pause/step/force/write), a 1 Hz historian, and an alarm engine over `alarms.toml`. The web UI runs in the browser; the `cs` CLI is a thin HTTP client — every command is one or two calls, and `cs api` reaches anything the GUI can.
 
 ## Core anti-patterns to call out immediately
 
 When you see yourself or the user about to do any of these, **stop**:
 
-- **Running multi-step work without `cs agent run`** → the IDE banner will strobe. Wrap it. Even a 3-command sequence is enough to be ugly. (See `03-agent-sessions.md`.)
-- **Forgetting `--project NAME` when multiple projects are open** → server uses LRU active fallback, which may be a different project than the user thinks. Run `cs project list` first when in doubt.
-- **Scheduling 2+ PROGRAMs that share a `VAR_GLOBAL`** → multiple PROGRAMs otherwise run fine (one container each, round-robin), but instances can't share globals, so `cs run` and `cs project check` reject exactly that combination; move the shared state behind an iomap or FB parameter. (See `references/01-mental-model.md` fact 2.)
-- **Writing IEC code without `cs project check`** → cheap (just compile, no run). Catches 90% of mistakes before the user sees a red Monitor pane.
-- **Forgetting `application` on iomap entries** → `Mapping` has 5 fields: `application` (POU name) + `variable` + `device` + `channel` + `direction`. The server rejects with 422 if you skip `application`.
-- **Using `cs runtime force` and forgetting to `unforce`** → forces survive the agent's lifetime. Always pair them, or call out the leftover at handoff.
-- **Using `force` (esp. `force --edge`) as a *setpoint* source** → `force` is a debug override, and `--edge` is one fresh `ssh host curl` per call. Fine for a supervised poke; for a real/repeatable setpoint bind the variable via iomap or drive it from POU logic, and for unattended/tight loops run the loop on the box. See `04-workflows.md` § G.
-- **Reading `ModbusConfig.host`** without checking transport → the new schema wraps it in `transport.kind = "tcp" | "rtu"`. Reading the top-level `host` is undefined on RTU configs.
-- **Treating `cs runtime status` as "is the agent still in control"** → that's a runtime liveness check. Agent presence is separate (`/api/agent/heartbeat` + the session/start/end pair).
+- **Running multi-step work without `cs agent run`** → the IDE banner will strobe. Wrap it. (See `03-agent-sessions.md`.)
+- **Forgetting `--project NAME` when multiple projects are open** → server uses LRU active fallback, which may be a different project than the user thinks. `cs ls projects` first when in doubt.
+- **Ignoring stderr on exit 2** → the server told you exactly what's wrong (`missing field \`application\``, `duplicate alarm id`, …). Fix that, don't shotgun-retry.
+- **Scheduling 2+ PROGRAMs that share a `VAR_GLOBAL`** → instances can't share globals; `cs run` and `cs project check` reject exactly that. Move shared state behind an iomap or FB parameter. (See `01-mental-model.md`.)
+- **Writing IEC code without `cs project check`** → cheap compile-only gate; catches 90% of mistakes before the user sees a red Monitor pane.
+- **Shipping behaviour without a scenario** → if it fills, sequences, interlocks or alarms, `cs sim run` a scenario for it. "It compiles" is not "it works".
+- **Forgetting `application` on iomap entries** → `Mapping` has 5 fields: `application` + `variable` + `device` + `channel` + `direction`.
+- **Using `cs runtime force` and forgetting to `unforce`** → forces survive your session. Pair them, or call out the leftover at handoff.
+- **Using `force` (esp. `--edge`) as a *setpoint* source** → force is a debug override; a real setpoint is iomap- or logic-driven. See `04-workflows.md` § G.
+- **Reading `ModbusConfig.host` without checking `transport.kind`** → RTU configs have no top-level host.
+- **Leaving standing alarms unexplained at handoff** → `cs get runtime/alarms`; ack what you caused deliberately, report what you didn't.
 
 ## Output style
 
 When advising or executing:
-- **Cite the specific reference section** when explaining ("see `02-cli-reference.md` § `pou save`").
-- **Always paste the full command you're about to run**, including `--project`, `--server`, and any non-default flags. Don't make the user wonder what's about to happen.
-- **For multi-step work, write the whole sequence first**, then wrap in `cs agent run`. Don't drip-feed commands one at a time.
-- **Errors get a specific fix, not "try X or Y"** — see `07-troubleshooting.md` for known errors. If the error isn't there, paste the server log line that came with it.
-- **When the user is watching the IDE**, narrate what should appear on screen at key moments ("now the Monitor pane should show level oscillating between 750-850").
+- **Cite the specific reference section** when explaining ("see `02-cli-reference.md` § quartet").
+- **Always paste the full command you're about to run**, including `--project`, `--server`, and any non-default flags.
+- **For multi-step work, write the whole sequence first**, then wrap in `cs agent run`.
+- **Errors get a specific fix, not "try X or Y"** — `07-troubleshooting.md` has the known ones; otherwise quote the stderr line you acted on.
+- **When the user is watching the IDE**, narrate what should appear on screen at key moments ("the Monitor's Alarms strip should show LEVEL_HIGH standing until you ack it").

@@ -61,7 +61,7 @@ Three layers. Memorise them — every other reference assumes this picture.
 
 ### 1. One server hosts N projects; a header picks which
 
-Projects live in `~/Documents/IA2/<name>/`. The server holds a `ProjectRegistry` keyed by name. Every CLI request carries `X-IA2-Project: <name>` (set by `--project` flag); missing header → server falls back to its LRU "active" project. **Always pass `--project` if `cs project list` shows more than one.**
+Projects live in `~/Documents/IA2/<name>/`. The server holds a `ProjectRegistry` keyed by name. Every CLI request carries `X-IA2-Project: <name>` (set by the global `--project` flag, valid on every command); missing header → server falls back to its LRU "active" project. **Always pass `--project` if `cs ls projects` shows more than one.**
 
 ### 2. One running program per server; a run may schedule several PROGRAMs
 
@@ -117,22 +117,29 @@ Every `MutationEvent` carries a `project: String` field. Web clients filter SSE 
 
 ## Where you talk to the server
 
-| Goal | HTTP | CLI equivalent |
+| Goal | HTTP | CLI |
 |---|---|---|
-| Health check | `GET /api/health` | (none — use `cs project list`) |
-| List open projects | `GET /api/projects/open-list` | `cs project list` |
+| Health check | `GET /health` | `cs api GET /health` (or `cs ls projects`) |
+| List open projects | `GET /api/projects/open-list` | `cs ls projects` |
 | Open a project | `POST /api/projects/open {path}` | `cs project open PATH` |
-| Get project tree | `GET /api/project` (with header) | `cs project info PATH` |
-| Save POU source | `PUT /api/pous/{path}` | `cs pou save NAME --stdin` |
+| Project tree | `GET /api/project` (with header) | `cs get project` (online) · `cs project info PATH` (offline dir) |
+| Save POU source | `PUT /api/pous/{path}` | `cs set pous/NAME.st --from -` |
 | Validate full project | `POST /api/project/validate` | `cs project check PATH` |
 | Start running | `POST /api/run` | `cs run [--program X]` |
 | Pause / step / resume | `POST /api/runtime/{action}` | `cs runtime pause/step/resume` |
-| Force a variable | `POST /api/runtime/forces/{name}` | `cs runtime force NAME VALUE` (negatives need `-- NAME -N`) |
+| Force a variable | `POST /api/runtime/forces/{name}` | `cs runtime force NAME VALUE` (negatives: `cs runtime force NAME -- -N`) |
 | One-shot write / unforce | `POST /api/runtime/variables/{name}` · `DELETE /api/runtime/forces/{name}` | `cs runtime write NAME VALUE` · `cs runtime unforce NAME` |
-| IoMap / Tasks docs | `GET·PUT /api/iomap` · `GET·PUT /api/tasks` | `cs iomap get/set` · `cs tasks get/set` |
-| Live snapshot / status | `GET /api/runtime/snapshot` | `cs runtime status --json` (mode + forces + vars) |
-| Edge introspection | `GET /api/edges/{name}/{logs,discover,system,status}` | `cs edge logs/scan/system` · `cs probe` |
+| **Live values** | `GET /api/runtime/snapshot` | `cs runtime snapshot [--vars a,b]` |
+| Mode + forces only | `GET /api/runtime/status` | `cs runtime status` |
+| Historian (1 Hz, ~2 h) | `GET /api/runtime/history` | `cs get runtime/history --query vars=a,b` |
+| Alarms — live / ack | `GET /api/runtime/alarms` · `POST /api/runtime/alarms/{id}/ack` | `cs get runtime/alarms` · `cs runtime ack ID` |
+| IoMap / Tasks / Northbound / Alarm defs | `GET·PUT /api/iomap` (etc.) | `cs get iomap` · `cs set iomap --from -` (same for `tasks` / `northbound` / `alarms`) |
+| Edge introspection | `GET /api/edges/{name}/{logs,scan,system,status,probe}` | `cs get edges/NAME/{logs,scan,system,status}` · `cs probe NAME` |
 | Drive an edge runtime | `POST /api/edges/{name}/runtime/{op}` | `cs runtime <op> --edge NAME` |
 | SSE event stream | `GET /api/events` | (SSE — see `02-cli-reference.md`) |
 | Start agent session | `POST /api/agent/session/start` | `cs agent enter` / `cs agent run -- ...` |
 | End agent session | `POST /api/agent/session/end` | `cs agent leave` / auto on `cs agent run` exit |
+
+**`cs runtime status` is mode + forces only — it carries no variable values.** Live values come from `cs runtime snapshot` (a separate read). Don't reach for `status` to see a number change; reach for `snapshot`.
+
+**The monitor surface is one shared layer.** `status` · `snapshot` · `pause`/`step`/`resume` · `force`/`write`/`unforce` · `history` · `alarms`/`ack` are the *same* read-and-debug API whether they run against the IDE server's local runtime or a deployed box (`--edge NAME`, or point `--server` at the box's forwarded port). Same verbs, same JSON shapes, same audited takeover overlay — the edge runtime serves `/history` and `/alarms` identically; only the transport differs (local HTTP vs one-shot ssh+curl per `--edge` call).

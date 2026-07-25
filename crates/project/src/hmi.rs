@@ -179,6 +179,13 @@ pub enum HmiNodeKind {
     /// Renders the run's fault (`last_error`) + per-device health. One per
     /// screen is the convention; generate puts it at the top.
     Alarmbar {},
+    /// Alarm summary table over the runtime's alarm engine (`alarms.toml`
+    /// definitions): standing alarms first, with per-row acknowledge.
+    /// `max_rows` caps the visible list (0 = renderer default).
+    Alarmlist {
+        #[serde(default)]
+        max_rows: u32,
+    },
     /// Momentary control surface — pair with an `action.tap`. Optional
     /// `bind.on`: the renderer lights the button while the bound value
     /// is truthy (indicator rules), so a toggle shows the state it
@@ -697,6 +704,7 @@ fn kind_name(kind: &HmiNodeKind) -> &'static str {
         HmiNodeKind::Symbol { .. } => "symbol",
         HmiNodeKind::Trend { .. } => "trend",
         HmiNodeKind::Alarmbar {} => "alarmbar",
+        HmiNodeKind::Alarmlist { .. } => "alarmlist",
         HmiNodeKind::Button { .. } => "button",
         HmiNodeKind::Input { .. } => "input",
         HmiNodeKind::Nav { .. } => "nav",

@@ -4,7 +4,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use ironplc_bridge::CheckDiagnostic;
 use project::PouLanguage;
 
@@ -231,7 +231,7 @@ pub(crate) fn cmd_transpile(file: &Path, with_map: bool) -> Result<i32> {
 pub(crate) fn cmd_explain(code: &str) -> Result<i32> {
     match ironplc_bridge::lookup_problem_doc(code) {
         Some((rst, title)) => {
-            // Print the title line first so a quick `cs explain P4007`
+            // Print the title line first so a quick `cs check P4007`
             // tells you what the code is for without scanning the body.
             // The full RST follows verbatim — agents and humans can
             // both read it. (rST format is text-friendly so we don't
@@ -305,8 +305,9 @@ fn language_for_path(path: &Path) -> Result<PouLanguage> {
     } else if name.ends_with(".st") {
         Ok(PouLanguage::St)
     } else {
-        bail!(
+        // Usage-shaped: fix the invocation, not the source (exit 2).
+        Err(crate::http::UsageError::wrap(anyhow::anyhow!(
             "can't infer language from filename {name:?} — expected .st, .ld.json, .fbd.json, or .sfc.json"
-        )
+        )))
     }
 }

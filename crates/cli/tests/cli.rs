@@ -4,61 +4,52 @@
 //! subprocess, then check stdout / stderr / exit code. This is the
 //! same view an agent gets — if these tests pass, the agent-facing
 //! contract is intact.
+//!
+//! The online surface (quartet, api, error contract) is tested against
+//! a minimal in-process HTTP mock (`MockServer`), so these tests need
+//! no running ia2-server.
 
 use std::fs;
+use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::path::PathBuf;
 
 use assert_cmd::Command;
 use predicates::str::contains;
 
-/// Path to a small valid LD POU bundled as a test fixture.
+fn fixture(name: &str) -> PathBuf {
+    let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    p.push("tests/fixtures");
+    p.push(name);
+    p
+}
+
 fn good_ld() -> PathBuf {
-    let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    p.push("tests/fixtures/good.ld.json");
-    p
+    fixture("good.ld.json")
 }
-
-/// Path to a small LD POU that references an undeclared variable —
-/// exercises the diagnostic / ld_location wiring end-to-end.
 fn bad_ld() -> PathBuf {
-    let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    p.push("tests/fixtures/bad.ld.json");
-    p
+    fixture("bad.ld.json")
 }
-
-/// Path to a small valid FBD POU: R_TRIG → CTU pipeline.
 fn good_fbd() -> PathBuf {
-    let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    p.push("tests/fixtures/good.fbd.json");
-    p
+    fixture("good.fbd.json")
 }
-
-/// Path to an FBD POU with one undeclared variable on a block input
-/// pin — exercises the fbd_location wiring.
 fn bad_fbd() -> PathBuf {
-    let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    p.push("tests/fixtures/bad.fbd.json");
-    p
+    fixture("bad.fbd.json")
 }
-
-/// Path to a valid SFC POU: idle → filling → draining → idle.
 fn good_sfc() -> PathBuf {
-    let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    p.push("tests/fixtures/good.sfc.json");
-    p
+    fixture("good.sfc.json")
 }
-
-/// Path to an SFC POU whose `running` step's N action references an
-/// undeclared variable `ghost` — exercises the sfc_location wiring.
 fn bad_sfc() -> PathBuf {
-    let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    p.push("tests/fixtures/bad.sfc.json");
-    p
+    fixture("bad.sfc.json")
 }
 
 fn cs() -> Command {
     Command::cargo_bin("cs").expect("compiled cs binary should exist")
 }
+
+// ================================================================
+//  Offline analysis: check / transpile / symbols (unchanged surface)
+// ================================================================
 
 #[test]
 fn check_clean_file_exits_zero() {
@@ -72,9 +63,6 @@ fn check_clean_file_exits_zero() {
 #[test]
 fn check_dirty_file_exits_one_and_reports_diagnostic() {
     let out = cs().arg("check").arg(bad_ld()).assert().code(1);
-    // Human-readable mode: stderr carries the diagnostic + summary,
-    // stdout stays empty so pipelines that capture stdout don't see
-    // garbage when a file is dirty.
     let assert = out.get_output();
     let stderr = String::from_utf8_lossy(&assert.stderr);
     assert!(
@@ -96,13 +84,10 @@ fn check_json_mode_emits_structured_payload() {
         .assert()
         .code(1);
     let stdout = String::from_utf8_lossy(&out.get_output().stdout);
-    // Parse it back as JSON — round-trip is the real contract.
     let v: serde_json::Value =
         serde_json::from_str(&stdout).expect("--json output must be valid JSON");
     assert_eq!(v["ok"], false);
     let diag = &v["files"][0]["diagnostics"][0];
-    // Critical: the ld_location is structured, not a string. Agents
-    // can pattern-match on `kind` without parsing free-form text.
     assert_eq!(diag["ld_location"]["kind"], "coil");
     assert_eq!(diag["ld_location"]["rung_id"], "loose");
     assert_eq!(diag["ld_location"]["coil_index"], 0);
@@ -117,19 +102,17 @@ fn check_multiple_files_aggregates_results() {
         .assert()
         .code(1) // any-error policy
         .stdout(contains("\"ok\": false"))
-        .stdout(contains("\"diagnostics\": []")) // good file is clean
-        .stdout(contains("nope")); // bad file's diagnostic
+        .stdout(contains("\"diagnostics\": []"))
+        .stdout(contains("nope"));
 }
 
 #[test]
-fn explain_known_code_prints_doc_exits_zero() {
-    // P4007 is one of ironplc's most common errors — the embedded
-    // RST page mentions "variable" repeatedly.
-    let out = cs().arg("explain").arg("P4007").assert().success();
+fn check_problem_code_prints_doc_exits_zero() {
+    // `cs check P4007` — a problem code is a valid check target; the
+    // full RST explanation prints on stdout.
+    let out = cs().arg("check").arg("P4007").assert().success();
     let stdout = String::from_utf8_lossy(&out.get_output().stdout);
-    // First line is the "code — title" summary.
     assert!(stdout.starts_with("P4007"), "got:\n{stdout}");
-    // Body should include the RST title block AND prose about variables.
     assert!(
         stdout.to_lowercase().contains("variable"),
         "expected RST body to mention 'variable'; got:\n{stdout}"
@@ -137,9 +120,9 @@ fn explain_known_code_prints_doc_exits_zero() {
 }
 
 #[test]
-fn explain_unknown_code_exits_one() {
-    cs().arg("explain")
-        .arg("XX-NOT-A-CODE")
+fn check_unknown_problem_code_exits_one() {
+    cs().arg("check")
+        .arg("P99999")
         .assert()
         .code(1)
         .stderr(contains("no documentation"));
@@ -147,8 +130,6 @@ fn explain_unknown_code_exits_one() {
 
 #[test]
 fn check_explain_appends_problem_doc_to_human_output() {
-    // Bad LD fixture references undeclared variable `nope` → P4007.
-    // With `--explain`, the full RST body must follow the diagnostic.
     let out = cs()
         .arg("check")
         .arg(bad_ld())
@@ -156,14 +137,11 @@ fn check_explain_appends_problem_doc_to_human_output() {
         .assert()
         .code(1);
     let stderr = String::from_utf8_lossy(&out.get_output().stderr);
-    // The diagnostic line itself.
     assert!(stderr.contains("P4007"), "got:\n{stderr}");
-    // Context line under the diagnostic.
     assert!(
         stderr.contains("variable=nope") || stderr.contains("nope"),
         "expected context line mentioning the offending var; got:\n{stderr}"
     );
-    // Explanation prose (from the embedded RST).
     assert!(
         stderr.to_lowercase().contains("example"),
         "explanation should include the RST 'Example' section; got:\n{stderr}"
@@ -181,9 +159,6 @@ fn check_json_includes_context_related_explanation() {
     let stdout = String::from_utf8_lossy(&out.get_output().stdout);
     let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     let diag = &v["files"][0]["diagnostics"][0];
-    // Three new agent-facing fields. context/related are serialised
-    // with `skip_serializing_if = "Vec::is_empty"`, so an empty array
-    // doesn't appear on the wire — we treat absent OR array as fine.
     if !diag["context"].is_null() {
         assert!(diag["context"].is_array());
     }
@@ -197,7 +172,6 @@ fn check_json_includes_context_related_explanation() {
         expl.to_lowercase().contains("variable"),
         "explanation should describe the error: {expl}"
     );
-    // For P4007 we definitely expect a context entry naming `nope`.
     let ctx = diag["context"]
         .as_array()
         .expect("P4007 always carries a `variable=…` context line");
@@ -206,6 +180,17 @@ fn check_json_includes_context_related_explanation() {
             .any(|c| c.as_str().unwrap_or("").contains("nope")),
         "expected `variable=nope` in context, got: {ctx:?}"
     );
+}
+
+#[test]
+fn check_unknown_extension_is_usage_error() {
+    let tmp = tempfile::NamedTempFile::with_suffix(".plc").unwrap();
+    cs().arg("check")
+        .arg(tmp.path())
+        .assert()
+        // exit 2: fix your invocation, not your source.
+        .code(2)
+        .stderr(contains("can't infer language"));
 }
 
 #[test]
@@ -219,9 +204,6 @@ fn symbols_lists_variables_and_fb_instances() {
     let stdout = String::from_utf8_lossy(&out.get_output().stdout);
     let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     let arr = v.as_array().unwrap();
-    // good.fbd.json declares: tick (input BOOL), rst (input BOOL),
-    // done (output BOOL), plus blocks `rt: R_TRIG` and `cu: CTU` →
-    // those instances surface as fb_instance symbols too.
     let names: Vec<&str> = arr.iter().map(|s| s["name"].as_str().unwrap()).collect();
     assert!(names.contains(&"tick"));
     assert!(names.contains(&"rst"));
@@ -263,27 +245,11 @@ fn symbols_filter_with_no_match_exits_one() {
 }
 
 #[test]
-fn check_unknown_extension_is_usage_error() {
-    let tmp = tempfile::NamedTempFile::with_suffix(".plc").unwrap();
-    cs().arg("check")
-        .arg(tmp.path())
-        .assert()
-        // anyhow wraps the can't-infer-language error, surfaced via
-        // exit code 3 (infra) — language inference is a precondition,
-        // not a user-source error. The agent reads stderr to learn what
-        // went wrong; exit code 3 says "fix your invocation, don't fix
-        // your source".
-        .code(3)
-        .stderr(contains("can't infer language"));
-}
-
-#[test]
 fn transpile_ld_emits_st_on_stdout() {
     let out = cs().arg("transpile").arg(good_ld()).assert().success();
     let stdout = String::from_utf8_lossy(&out.get_output().stdout);
     assert!(stdout.contains("PROGRAM good"), "got:\n{stdout}");
     assert!(stdout.contains("VAR_INPUT"));
-    // FB calls must hoist before the coil assignment
     assert!(
         stdout.contains("armTimer(IN := start_btn"),
         "FB call should be present; got:\n{stdout}"
@@ -302,8 +268,6 @@ fn transpile_with_map_includes_source_map() {
     let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     assert!(v["st"].is_string(), "st field must be a string");
     assert!(v["source_map"].is_array(), "source_map must be an array");
-    // The map should contain at least one Variable entry and one
-    // Rung/Coil entry — proves it isn't just nulls.
     let map = v["source_map"].as_array().unwrap();
     let has_variable = map.iter().any(|e| !e.is_null() && e["kind"] == "variable");
     let has_rung_or_coil = map
@@ -314,31 +278,12 @@ fn transpile_with_map_includes_source_map() {
 
 #[test]
 fn transpile_st_file_echoes_source() {
-    // ST is its own intermediate; `transpile` should be a no-op echo.
     let tmp_dir = tempfile::tempdir().unwrap();
     let st = tmp_dir.path().join("foo.st");
     fs::write(&st, "PROGRAM foo\n  VAR x : BOOL; END_VAR\nEND_PROGRAM\n").unwrap();
     let out = cs().arg("transpile").arg(&st).assert().success();
     let stdout = String::from_utf8_lossy(&out.get_output().stdout);
     assert!(stdout.contains("PROGRAM foo"));
-}
-
-#[test]
-fn project_info_lists_pous_and_devices() {
-    let proj = setup_demo_project();
-    let out = cs()
-        .arg("project")
-        .arg("info")
-        .arg(proj.path())
-        .arg("--json")
-        .assert()
-        .success();
-    let stdout = String::from_utf8_lossy(&out.get_output().stdout);
-    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    assert_eq!(v["name"], "smoke");
-    let pous = v["pous"].as_array().unwrap();
-    assert_eq!(pous.len(), 1);
-    assert_eq!(pous[0], "main");
 }
 
 #[test]
@@ -361,9 +306,6 @@ fn fbd_check_dirty_file_reports_fbd_location() {
     let stdout = String::from_utf8_lossy(&out.get_output().stdout);
     let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     let diag = &v["files"][0]["diagnostics"][0];
-    // The ghost variable is on block b0's IN pin; ironplc reports the
-    // error on the line of the FB call, so fbd_location should be
-    // `Block { block_id: "b0" }` — NOT ld_location.
     assert!(diag["ld_location"].is_null());
     assert_eq!(diag["fbd_location"]["kind"], "block");
     assert_eq!(diag["fbd_location"]["block_id"], "b0");
@@ -373,16 +315,12 @@ fn fbd_check_dirty_file_reports_fbd_location() {
 fn fbd_transpile_emits_topo_sorted_calls() {
     let out = cs().arg("transpile").arg(good_fbd()).assert().success();
     let stdout = String::from_utf8_lossy(&out.get_output().stdout);
-    // VAR section declares both FB instances
     assert!(stdout.contains("rt : R_TRIG;"), "got:\n{stdout}");
     assert!(stdout.contains("cu : CTU;"), "got:\n{stdout}");
-    // CTU references R_TRIG via dot access on the source instance
     assert!(stdout.contains("cu(CU := rt.Q"), "got:\n{stdout}");
-    // Topo order: edge before counter
     let edge = stdout.find("rt(CLK").unwrap();
     let counter = stdout.find("cu(CU").unwrap();
     assert!(edge < counter, "edge block must execute before counter");
-    // Output binding lands at the end
     assert!(stdout.contains("done := cu.Q;"), "got:\n{stdout}");
 }
 
@@ -406,9 +344,6 @@ fn sfc_check_dirty_file_reports_sfc_location() {
     let stdout = String::from_utf8_lossy(&out.get_output().stdout);
     let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     let diag = &v["files"][0]["diagnostics"][0];
-    // The `ghost` reference is inside the `running` step's action[0]
-    // body; ironplc reports the error on that emitted action line, so
-    // sfc_location should be Action(running, 0) — NOT ld/fbd.
     assert!(diag["ld_location"].is_null());
     assert!(diag["fbd_location"].is_null());
     assert_eq!(diag["sfc_location"]["kind"], "action");
@@ -420,18 +355,15 @@ fn sfc_check_dirty_file_reports_sfc_location() {
 fn sfc_transpile_emits_step_dispatch_and_transition_cascade() {
     let out = cs().arg("transpile").arg(good_sfc()).assert().success();
     let stdout = String::from_utf8_lossy(&out.get_output().stdout);
-    // SFC bookkeeping variables
     assert!(
         stdout.contains("__sfc_step : STRING[31] := 'idle';"),
         "got:\n{stdout}"
     );
-    // Per-step IF dispatch
     assert!(
         stdout.contains("IF __sfc_step = 'filling' THEN"),
         "got:\n{stdout}"
     );
     assert!(stdout.contains("inlet := TRUE;"), "got:\n{stdout}");
-    // Transition cascade — IF/ELSIF chain in author order
     assert!(
         stdout.contains("IF __sfc_step = 'idle' AND (start_btn) THEN"),
         "got:\n{stdout}"
@@ -440,11 +372,32 @@ fn sfc_transpile_emits_step_dispatch_and_transition_cascade() {
         stdout.contains("ELSIF __sfc_step = 'filling' AND (tank_full) THEN"),
         "got:\n{stdout}"
     );
-    // Prev snapshot sits between actions and transitions
     let actions_pos = stdout.find("(* === SFC actions === *)").unwrap();
     let snap_pos = stdout.find("__sfc_prev := __sfc_step;").unwrap();
     let trans_pos = stdout.find("(* === SFC transitions === *)").unwrap();
     assert!(actions_pos < snap_pos && snap_pos < trans_pos);
+}
+
+// ================================================================
+//  Offline project tools
+// ================================================================
+
+#[test]
+fn project_info_lists_pous_and_devices() {
+    let proj = setup_demo_project();
+    let out = cs()
+        .arg("project")
+        .arg("info")
+        .arg(proj.path())
+        .arg("--json")
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout);
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(v["name"], "smoke");
+    let pous = v["pous"].as_array().unwrap();
+    assert_eq!(pous.len(), 1);
+    assert_eq!(pous[0], "main");
 }
 
 #[test]
@@ -456,6 +409,281 @@ fn project_check_clean_exits_zero() {
         .assert()
         .success()
         .stderr(contains("compiles cleanly"));
+}
+
+// ================================================================
+//  The quartet + api + error contract, against a mock server
+// ================================================================
+
+/// Minimal canned-response HTTP server: each entry is
+/// (method, path-prefix, status, body). Handles up to `max` requests
+/// then stops. Records every request line + headers for assertions.
+struct MockServer {
+    addr: String,
+    handle: Option<std::thread::JoinHandle<Vec<String>>>,
+}
+
+impl MockServer {
+    fn start(routes: Vec<(&'static str, &'static str, u16, String)>, max: usize) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = format!("http://{}", listener.local_addr().unwrap());
+        let handle = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            for _ in 0..max {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 1024];
+                // Read until end of headers.
+                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut tmp) {
+                        Ok(0) => break,
+                        Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                        Err(_) => break,
+                    }
+                }
+                let head_end = buf
+                    .windows(4)
+                    .position(|w| w == b"\r\n\r\n")
+                    .map(|p| p + 4)
+                    .unwrap_or(buf.len());
+                let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
+                // Drain the body if Content-Length says there is one.
+                let content_len = head
+                    .lines()
+                    .find_map(|l| {
+                        l.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                    })
+                    .unwrap_or(0);
+                let mut body = buf[head_end..].to_vec();
+                while body.len() < content_len {
+                    match stream.read(&mut tmp) {
+                        Ok(0) => break,
+                        Ok(n) => body.extend_from_slice(&tmp[..n]),
+                        Err(_) => break,
+                    }
+                }
+                seen.push(head.clone());
+
+                let request_line = head.lines().next().unwrap_or_default().to_string();
+                let mut parts = request_line.split(' ');
+                let method = parts.next().unwrap_or_default();
+                let path = parts.next().unwrap_or_default();
+                let (status, resp_body) = routes
+                    .iter()
+                    .find(|(m, p, _, _)| *m == method && path.starts_with(p))
+                    .map(|(_, _, s, b)| (*s, b.clone()))
+                    .unwrap_or((404, "{\"error\":\"mock: no route\"}".to_string()));
+                let reason = match status {
+                    200 => "OK",
+                    404 => "Not Found",
+                    422 => "Unprocessable Entity",
+                    500 => "Internal Server Error",
+                    _ => "X",
+                };
+                let resp = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{resp_body}",
+                    resp_body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+            seen
+        });
+        MockServer {
+            addr,
+            handle: Some(handle),
+        }
+    }
+
+    /// Stop accepting and return every request head seen so far.
+    fn finish(mut self) -> Vec<String> {
+        // Poke the listener so the accept loop can exit if it's still
+        // waiting on an accept that will never come.
+        let _ = std::net::TcpStream::connect(self.addr.trim_start_matches("http://"));
+        self.handle.take().unwrap().join().unwrap()
+    }
+}
+
+#[test]
+fn server_4xx_body_reaches_stderr_and_exits_two() {
+    let mock = MockServer::start(
+        vec![(
+            "PUT",
+            "/api/iomap",
+            422,
+            "missing field `application` — every mapping names its PROGRAM".to_string(),
+        )],
+        2, // announce heartbeat + PUT
+    );
+    cs().arg("--server")
+        .arg(&mock.addr)
+        .arg("set")
+        .arg("iomap")
+        .arg("--from")
+        .arg("-")
+        .write_stdin("{\"mappings\":[]}")
+        .assert()
+        .code(2)
+        .stderr(contains("missing field `application`"));
+    mock.finish();
+}
+
+#[test]
+fn server_5xx_exits_three() {
+    let mock = MockServer::start(vec![("GET", "/api/iomap", 500, "boom".to_string())], 1);
+    cs().arg("--server")
+        .arg(&mock.addr)
+        .arg("get")
+        .arg("iomap")
+        .assert()
+        .code(3)
+        .stderr(contains("boom"));
+    mock.finish();
+}
+
+#[test]
+fn connection_refused_exits_three() {
+    // Nothing listens on this port (bind then drop to reserve-and-free).
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = format!("http://{}", l.local_addr().unwrap());
+    drop(l);
+    cs().arg("--server")
+        .arg(&addr)
+        .arg("get")
+        .arg("iomap")
+        .assert()
+        .code(3)
+        .stderr(contains("is the server running?"));
+}
+
+#[test]
+fn get_pou_prints_raw_source() {
+    let src = "PROGRAM main\n  VAR x : BOOL; END_VAR\nEND_PROGRAM\n";
+    let body = serde_json::json!({ "path": "main", "source": src, "declarations": [] });
+    let mock = MockServer::start(vec![("GET", "/api/pous/main", 200, body.to_string())], 1);
+    let out = cs()
+        .arg("--server")
+        .arg(&mock.addr)
+        .arg("get")
+        .arg("pous/main.st")
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout);
+    assert_eq!(stdout, src, "raw source must round-trip byte-for-byte");
+    mock.finish();
+}
+
+#[test]
+fn project_flag_adds_header_on_every_request() {
+    let mock = MockServer::start(
+        vec![("PUT", "/api/tasks", 200, "{\"ok\":true}".to_string())],
+        2, // announce heartbeat + PUT
+    );
+    cs().arg("--server")
+        .arg(&mock.addr)
+        .arg("--project")
+        .arg("lineB")
+        .arg("set")
+        .arg("tasks")
+        .arg("--from")
+        .arg("-")
+        .write_stdin("{\"tasks\":[]}")
+        .assert()
+        .success();
+    let seen = mock.finish();
+    assert!(
+        seen.iter()
+            .any(|h| h.to_ascii_lowercase().contains("x-ia2-project: lineb")),
+        "X-IA2-Project header missing; requests seen:\n{seen:?}"
+    );
+}
+
+#[test]
+fn set_pou_creates_then_puts_when_missing() {
+    // GET → 404 (doesn't exist), POST create → 200, PUT source → 200.
+    let mock = MockServer::start(
+        vec![
+            ("GET", "/api/pous/newpou", 404, "no such pou".to_string()),
+            (
+                "POST",
+                "/api/pous",
+                200,
+                "{\"path\":\"newpou\"}".to_string(),
+            ),
+            ("PUT", "/api/pous/newpou", 200, "{\"ok\":true}".to_string()),
+        ],
+        4, // announce heartbeat + GET + POST + PUT
+    );
+    cs().arg("--server")
+        .arg(&mock.addr)
+        .arg("set")
+        .arg("pous/newpou.st")
+        .arg("--from")
+        .arg("-")
+        .write_stdin("PROGRAM newpou\nEND_PROGRAM\n")
+        .assert()
+        .success()
+        .stderr(contains("✓ set pous/newpou.st"));
+    let seen: Vec<String> = mock
+        .finish()
+        .into_iter()
+        .filter(|h| !h.contains("/api/agent/heartbeat"))
+        .collect();
+    assert_eq!(seen.len(), 3, "expected GET, POST, PUT; saw:\n{seen:?}");
+    assert!(seen[0].starts_with("GET /api/pous/newpou"));
+    assert!(seen[1].starts_with("POST /api/pous"));
+    assert!(seen[2].starts_with("PUT /api/pous/newpou"));
+}
+
+#[test]
+fn api_escape_hatch_posts_anywhere() {
+    let mock = MockServer::start(
+        vec![(
+            "POST",
+            "/api/edges/pi/attach",
+            200,
+            "{\"attached\":true}".to_string(),
+        )],
+        2, // announce heartbeat + POST
+    );
+    cs().arg("--server")
+        .arg(&mock.addr)
+        .arg("api")
+        .arg("POST")
+        .arg("/api/edges/pi/attach")
+        .assert()
+        .success()
+        .stdout(contains("\"attached\": true"));
+    mock.finish();
+}
+
+#[test]
+fn ls_with_unknown_kind_is_usage_error() {
+    cs().arg("ls")
+        .arg("gadgets")
+        .assert()
+        .code(2)
+        .stderr(contains("known resource kinds"));
+}
+
+#[test]
+fn ls_root_prints_kind_overview_without_server() {
+    // The overview itself is static; the open-projects suffix is
+    // best-effort and silently skipped when no server answers.
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = format!("http://{}", l.local_addr().unwrap());
+    drop(l);
+    cs().arg("--server")
+        .arg(&addr)
+        .arg("ls")
+        .assert()
+        .success()
+        .stdout(contains("pous"))
+        .stdout(contains("devices"))
+        .stdout(contains("iomap"));
 }
 
 /// Build a minimum viable project on a tempdir — one POU, no devices,

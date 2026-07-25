@@ -24,6 +24,9 @@ anyhow = { workspace = true }
 # dependency closure; the CLI is already mostly synchronous and we
 # only need request-response semantics.
 ureq = { version = "2", default-features = false, features = ["json"] }
+# Scenario files for `cs sim run` are TOML — same format as the rest
+# of the project's config surface.
+toml = { workspace = true }
 
 ironplc-bridge = { path = "../ironplc-bridge" }
 project = { path = "../project" }

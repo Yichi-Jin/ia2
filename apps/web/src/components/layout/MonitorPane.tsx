@@ -2,9 +2,20 @@ import { Lock, Pause, Pin, Play, StepForward, Unlock } from "lucide-react"
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 
 import { Sparkline } from "@/components/charts/Sparkline"
-import { TrendChart } from "@/components/charts/TrendChart"
+import { TrendChart, type TrendSeries } from "@/components/charts/TrendChart"
+import {
+  alarmStanding,
+  fmtAlarmClock,
+  fmtAlarmValue,
+  severityTone,
+  standingCount,
+  type AlarmTone,
+} from "@/lib/alarms"
 import { cn } from "@/lib/utils"
 import {
+  ackRuntimeAlarm,
+  fetchRuntimeAlarms,
+  fetchRuntimeHistory,
   fetchRuntimeStatus,
   forceVariable,
   pauseRuntime,
@@ -16,16 +27,26 @@ import {
 import {
   classifyType,
   colorFor,
+  historyToSamples,
   isBoolType,
   parseVarValue,
   prettyTime,
   pushHistory,
+  pushTimedHistory,
+  seedTimedBuffer,
   stripHexPrefix,
+  windowSlice,
+  type TimedSample,
   type VarCategory,
 } from "@/lib/var-history"
 import { useRuntime, type RunningInfo } from "@/state/runtime"
 import { useLastSnapshot } from "@/state/live-feed"
+import type { AlarmState } from "@/types/generated/AlarmState"
 import type { VarValue } from "@/types/generated/VarValue"
+
+/** Window the pinned trend shows (seconds). History backfill seeds this
+ *  much on pin so a reload no longer starts the trace from empty. */
+const MONITOR_TREND_WINDOW_S = 300
 
 export function MonitorPane() {
   const { isRunning, currentPou, running, attached } = useRuntime()
@@ -68,7 +89,12 @@ export function MonitorPane() {
   }, [isRunning])
 
   // History buffers (mutated in place; re-rendered via a tick counter).
+  // `historyRef` is the untimed count-capped buffer the per-row
+  // sparklines read; `timedRef` holds a timestamped buffer per PINNED
+  // variable (seeded from stored history, fed by the live feed) that the
+  // pinned TrendChart reads — only pinned vars carry the heavier buffer.
   const historyRef = useRef<Map<string, number[]>>(new Map())
+  const timedRef = useRef<Map<string, TimedSample[]>>(new Map())
   const typeRef = useRef<Map<string, string>>(new Map())
   const [, setTick] = useState(0)
   const [pinned, setPinned] = useState<Set<string>>(new Set())
@@ -77,14 +103,19 @@ export function MonitorPane() {
   // relevant to the new one.
   useEffect(() => {
     historyRef.current.clear()
+    timedRef.current.clear()
     typeRef.current.clear()
     setPinned(new Set())
     setTick((t) => t + 1)
   }, [currentPou?.path])
 
-  // Ingest every snapshot into the per-variable history.
+  // Ingest every snapshot into the per-variable history. Timed buffers
+  // ride the snapshot's own time base (scan-relative micros → seconds)
+  // so seeded history lands on the same axis and the merge dedupes.
   useEffect(() => {
     if (!lastSnapshot) return
+    const tsec = Number(lastSnapshot.timestamp_us) / 1e6
+    const timeOk = lastSnapshot.timestamp_us > 0n
     for (const v of lastSnapshot.vars) {
       typeRef.current.set(v.name, v.type_name)
       let arr = historyRef.current.get(v.name)
@@ -92,10 +123,52 @@ export function MonitorPane() {
         arr = []
         historyRef.current.set(v.name, arr)
       }
-      pushHistory(arr, parseVarValue(v))
+      const n = parseVarValue(v)
+      pushHistory(arr, n)
+      // timedRef only holds pinned vars (created by the seed effect).
+      if (timeOk) {
+        const tbuf = timedRef.current.get(v.name)
+        if (tbuf) pushTimedHistory(tbuf, tsec, n, MONITOR_TREND_WINDOW_S)
+      }
     }
     setTick((t) => t + 1)
   }, [lastSnapshot])
+
+  // Backfill: seed a timed buffer from stored history the moment a
+  // variable is pinned, and drop buffers for vars no longer pinned.
+  const seedTrend = useCallback(async (name: string) => {
+    try {
+      const resp = await fetchRuntimeHistory([name], { stepMs: 1000 })
+      const s = resp.series.find((x) => x.name === name)
+      if (!s) return
+      const existing = timedRef.current.get(name) ?? []
+      timedRef.current.set(
+        name,
+        seedTimedBuffer(
+          existing,
+          historyToSamples(s.points),
+          MONITOR_TREND_WINDOW_S,
+        ),
+      )
+      setTick((t) => t + 1)
+    } catch {
+      /* history is best-effort; the live feed still fills forward */
+    }
+  }, [])
+
+  useEffect(() => {
+    for (const name of pinned) {
+      if (!timedRef.current.has(name)) {
+        // Claim the slot synchronously so live samples start landing and
+        // a StrictMode double-invoke doesn't double-fetch.
+        timedRef.current.set(name, [])
+        void seedTrend(name)
+      }
+    }
+    for (const name of [...timedRef.current.keys()]) {
+      if (!pinned.has(name)) timedRef.current.delete(name)
+    }
+  }, [pinned, seedTrend])
 
   const togglePin = (name: string) => {
     setPinned((prev) => {
@@ -106,14 +179,20 @@ export function MonitorPane() {
     })
   }
 
-  // Build series for the pinned trend chart.
+  // Build series for the pinned trend chart from the timed buffers.
   const pinnedList = useMemo(() => Array.from(pinned), [pinned])
-  const pinnedSeries = pinnedList.map((name, idx) => ({
-    name,
-    values: historyRef.current.get(name) ?? [],
-    color: colorFor(idx),
-    binary: isBoolType(typeRef.current.get(name) ?? ""),
-  }))
+  const pinnedSeries: TrendSeries[] = pinnedList.map((name, idx) => {
+    const buf = windowSlice(
+      timedRef.current.get(name) ?? [],
+      MONITOR_TREND_WINDOW_S,
+    )
+    return {
+      name,
+      points: buf.map((s) => ({ t: s.t, v: s.v, lo: s.lo, hi: s.hi })),
+      color: colorFor(idx),
+      binary: isBoolType(typeRef.current.get(name) ?? ""),
+    }
+  })
   const colorByName: Record<string, string> = Object.fromEntries(
     pinnedList.map((name, idx) => [name, colorFor(idx)]),
   )
@@ -196,9 +275,11 @@ export function MonitorPane() {
 
       {pinnedSeries.length > 0 && (
         <div className="border-b border-border bg-background/40 px-3 py-2">
-          <TrendChart series={pinnedSeries} />
+          <TrendChart series={pinnedSeries} windowS={MONITOR_TREND_WINDOW_S} />
         </div>
       )}
+
+      {isRunning && <AlarmsSection />}
 
       <div className="flex-1 overflow-auto">
         {!lastSnapshot ? (
@@ -704,4 +785,163 @@ function renderValue(cat: VarCategory, v: VarValue): string {
     default:
       return v.value
   }
+}
+
+// ============================================================
+//   Alarms — a calm summary that only takes on colour when
+//   something is standing (ISA-101). Polls GET /api/runtime/alarms
+//   every 2 s while the Monitor is running; the backend pre-sorts
+//   standing-first. Acid green is never used here (agent chrome only).
+// ============================================================
+
+const ALARM_TONE_CLS: Record<AlarmTone, { chip: string; text: string }> = {
+  muted: {
+    chip: "bg-muted/60 text-muted-foreground",
+    text: "text-muted-foreground",
+  },
+  warn: { chip: "bg-warn/15 text-warn", text: "text-foreground" },
+  alert: {
+    chip: "bg-destructive/15 text-destructive",
+    text: "text-foreground",
+  },
+}
+
+function AlarmsSection() {
+  const [alarms, setAlarms] = useState<AlarmState[]>([])
+  useEffect(() => {
+    let cancelled = false
+    const tick = async () => {
+      try {
+        const a = await fetchRuntimeAlarms()
+        if (!cancelled) setAlarms(a)
+      } catch {
+        /* keep last list; runtime may be mid-restart */
+      }
+    }
+    void tick()
+    const id = setInterval(tick, 2000)
+    return () => {
+      cancelled = true
+      clearInterval(id)
+    }
+  }, [])
+
+  const standing = standingCount(alarms)
+  const hasCritical = alarms.some(
+    (a) => alarmStanding(a) && severityTone(a.severity, true) === "alert",
+  )
+
+  const ack = useCallback(async (id: string) => {
+    // Optimistic: flip acked now; the 2 s poll reconciles the truth.
+    setAlarms((prev) =>
+      prev.map((a) => (a.id === id ? { ...a, acked: true } : a)),
+    )
+    try {
+      await ackRuntimeAlarm(id)
+    } catch {
+      /* next poll re-syncs */
+    }
+  }, [])
+
+  return (
+    <div className="shrink-0 border-b border-border bg-background/40">
+      <div className="flex h-6 items-center justify-between px-3 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+        <span>Alarms</span>
+        {standing > 0 && (
+          <span
+            className={cn(
+              "rounded px-1.5 py-0.5 font-mono normal-case tracking-normal",
+              hasCritical
+                ? "bg-destructive/15 text-destructive"
+                : "bg-warn/15 text-warn",
+            )}
+          >
+            {standing} standing
+          </span>
+        )}
+      </div>
+      {alarms.length === 0 ? (
+        <div className="px-3 pb-1.5 text-[11px] text-muted-foreground/60">
+          No active alarms.
+        </div>
+      ) : (
+        <ul className="max-h-40 divide-y divide-border/50 overflow-auto pb-1">
+          {alarms.map((a) => (
+            <AlarmRow key={a.id} a={a} onAck={ack} />
+          ))}
+        </ul>
+      )}
+    </div>
+  )
+}
+
+function AlarmRow({
+  a,
+  onAck,
+}: {
+  a: AlarmState
+  onAck: (id: string) => void
+}) {
+  const standing = alarmStanding(a)
+  const tone = ALARM_TONE_CLS[severityTone(a.severity, standing)]
+  return (
+    <li
+      className={cn(
+        "flex items-center gap-2 px-3 py-0.5 text-[11px]",
+        !standing && "opacity-60",
+      )}
+    >
+      <span
+        className={cn(
+          "shrink-0 rounded px-1 py-px font-mono text-[9px] uppercase tracking-wider",
+          tone.chip,
+        )}
+      >
+        {a.severity}
+      </span>
+      <span
+        className={cn("min-w-0 flex-1 truncate", tone.text)}
+        title={`${a.variable} — ${a.message}`}
+      >
+        {a.message}
+      </span>
+      <span
+        className="shrink-0 font-mono text-[9px] tabular-nums text-muted-foreground"
+        title="raised at"
+      >
+        {fmtAlarmClock(a.raised_at_us)}
+      </span>
+      <span
+        className="hidden shrink-0 font-mono text-[9px] tabular-nums text-muted-foreground sm:inline"
+        title="value at raise"
+      >
+        {fmtAlarmValue(a.value_at_raise)}
+      </span>
+      {a.count > 1 && (
+        <span
+          className="shrink-0 font-mono text-[9px] tabular-nums text-muted-foreground/70"
+          title="times raised"
+        >
+          ×{a.count}
+        </span>
+      )}
+      {!a.acked ? (
+        <button
+          type="button"
+          onClick={() => onAck(a.id)}
+          className="shrink-0 rounded border border-border bg-card px-1.5 py-px font-mono text-[9px] uppercase tracking-wider text-muted-foreground hover:text-foreground"
+          title="Acknowledge"
+        >
+          ack
+        </button>
+      ) : (
+        <span
+          className="shrink-0 font-mono text-[9px] uppercase tracking-wider text-muted-foreground/40"
+          title="acknowledged"
+        >
+          ackd
+        </span>
+      )}
+    </li>
+  )
 }

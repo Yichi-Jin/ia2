@@ -294,6 +294,12 @@ struct AppState {
     /// Read-only view of the deployed project — backs the /api/hmi
     /// routes so operator panels can load screens off the edge box.
     store: Arc<ProjectStore>,
+    /// Persisted historian (JSONL segments under the state dir) —
+    /// backs GET /history.
+    historian: Arc<ironplc_bridge::monitor::Historian>,
+    /// Alarm engine over the deployed alarms.toml — backs GET /alarms,
+    /// POST /alarms/{id}/ack, GET /alarms-journal.
+    alarms: Arc<Mutex<ironplc_bridge::monitor::AlarmEngine>>,
 }
 
 #[tokio::main]
@@ -392,9 +398,35 @@ async fn main() -> Result<()> {
     let handle: ProgramHandle =
         ironplc_bridge::spawn_units(units, device_specs, iomap.mappings, state_path);
 
+    // Historian: persisted JSONL segments under the state dir so an
+    // edge restart (or redeploy — state/ sits beside `current`) keeps
+    // recent history for post-event investigation. Zero config.
+    let historian = Arc::new(ironplc_bridge::monitor::Historian::new(
+        ironplc_bridge::monitor::history::DEFAULT_SAMPLE_INTERVAL_US,
+        ironplc_bridge::monitor::history::DEFAULT_CAPACITY,
+        Some(args.state_dir.join("history")),
+    ));
+
+    // Alarm engine from the deployed project's alarms.toml.
+    let alarms = match store.read_alarms() {
+        Ok(cfg) => {
+            if !cfg.alarms.is_empty() {
+                tracing::info!(alarms = cfg.alarms.len(), "alarm definitions loaded");
+            }
+            Arc::new(Mutex::new(ironplc_bridge::monitor::AlarmEngine::new(
+                cfg.alarms,
+            )))
+        }
+        Err(e) => {
+            tracing::warn!(%e, "alarms.toml unreadable; alarms disabled");
+            Arc::new(Mutex::new(ironplc_bridge::monitor::AlarmEngine::default()))
+        }
+    };
+
     // Fan out the bridge's snapshots into a runtime-owned broadcast channel,
     // so we can keep the latest snapshot in shared state for /status and so
     // SSE clients can come and go without affecting the bridge subscriber.
+    // The same tap feeds the historian and the alarm engine.
     let (snapshot_tx, _) = broadcast::channel::<VarSnapshot>(128);
     let latest: Arc<Mutex<Option<VarSnapshot>>> = Arc::new(Mutex::new(None));
     let shutdown = Arc::new(tokio::sync::Notify::new());
@@ -402,9 +434,16 @@ async fn main() -> Result<()> {
     {
         let snapshot_tx = snapshot_tx.clone();
         let latest = latest.clone();
+        let historian = historian.clone();
+        let alarms = alarms.clone();
         let mut rx = handle.subscribe();
         tokio::spawn(async move {
             while let Ok(snap) = rx.recv().await {
+                historian.note_snapshot(&snap);
+                alarms
+                    .lock()
+                    .expect("alarms mutex")
+                    .note_snapshot(&snap, ironplc_bridge::monitor::wall_now_us());
                 *latest.lock().expect("latest mutex") = Some(snap.clone());
                 let _ = snapshot_tx.send(snap);
             }
@@ -423,6 +462,8 @@ async fn main() -> Result<()> {
         logs: log_capture,
         handle: handle.clone(),
         store: store.clone(),
+        historian,
+        alarms,
     };
 
     // ---- Northbound (MQTT -> supOS/Tier0) ----
@@ -461,6 +502,10 @@ async fn main() -> Result<()> {
         .route("/write", post(rt_write))
         .route("/force", post(rt_force))
         .route("/unforce", post(rt_unforce))
+        .route("/history", get(history))
+        .route("/alarms", get(alarms_state))
+        .route("/alarms/{id}/ack", post(alarms_ack))
+        .route("/alarms-journal", get(alarms_journal))
         .route("/stop", post(stop_handler))
         .route("/api/hmi", get(hmi_list))
         .route("/api/hmi/{path}", get(hmi_get))
@@ -641,12 +686,7 @@ async fn health(State(state): State<AppState>) -> Json<Health> {
     })
 }
 
-/// One pinned (forced) variable in the runtime's debug state.
-#[derive(Serialize)]
-struct ForceEntry {
-    name: String,
-    value: i32,
-}
+use ironplc_bridge::monitor::{self, ForceEntry, ModeResponse};
 
 #[derive(Serialize)]
 struct Status {
@@ -672,11 +712,23 @@ struct Status {
     /// edge poll this to tell "still scanning" from "faulted and halted"
     /// — without it a trapped program looks like a frozen snapshot.
     fault: Option<String>,
+    /// Alarms needing operator attention (active or cleared-unacked).
+    /// The full list is one GET /alarms away; the count rides on
+    /// /status so panels see it on their existing poll.
+    alarms_standing: usize,
 }
 
 async fn status(State(state): State<AppState>) -> Json<Status> {
     let last_snapshot = state.latest.lock().expect("latest").clone();
     let scan_count = last_snapshot.as_ref().map(|s| s.scan_count).unwrap_or(0);
+    let alarms_standing = state
+        .alarms
+        .lock()
+        .expect("alarms mutex")
+        .states()
+        .iter()
+        .filter(|a| a.standing())
+        .count();
     Json(Status {
         version: env!("CARGO_PKG_VERSION"),
         project: state.project_name.clone(),
@@ -687,14 +739,83 @@ async fn status(State(state): State<AppState>) -> Json<Status> {
         scan_count,
         last_snapshot,
         mode: state.handle.mode(),
-        forces: state
-            .handle
-            .forces()
-            .into_iter()
-            .map(|(name, value)| ForceEntry { name, value })
-            .collect(),
+        forces: monitor::force_entries(&state.handle),
         fault: state.handle.fault(),
+        alarms_standing,
     })
+}
+
+// ============================================================
+//  History + alarms — same shapes as the IDE server's
+//  /api/runtime/{history,alarms,alarms-journal}; served locally from
+//  the edge's persisted historian and the deployed alarms.toml.
+// ============================================================
+
+#[derive(serde::Deserialize)]
+struct HistoryQuery {
+    #[serde(default)]
+    vars: String,
+    #[serde(default)]
+    from_us: u64,
+    #[serde(default)]
+    to_us: u64,
+    #[serde(default = "default_step_ms")]
+    step_ms: u64,
+}
+
+fn default_step_ms() -> u64 {
+    1000
+}
+
+async fn history(
+    State(state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<HistoryQuery>,
+) -> Json<ironplc_bridge::monitor::HistoryResponse> {
+    let vars: Vec<String> = q
+        .vars
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    Json(state.historian.query(&vars, q.from_us, q.to_us, q.step_ms))
+}
+
+async fn alarms_state(
+    State(state): State<AppState>,
+) -> Json<Vec<ironplc_bridge::monitor::AlarmState>> {
+    Json(state.alarms.lock().expect("alarms mutex").states())
+}
+
+async fn alarms_ack(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<ironplc_bridge::monitor::AlarmState>, (StatusCode, String)> {
+    let now_us = ironplc_bridge::monitor::wall_now_us();
+    state
+        .alarms
+        .lock()
+        .expect("alarms mutex")
+        .ack(&id, now_us)
+        .map(Json)
+        .map_err(|e| (StatusCode::NOT_FOUND, e))
+}
+
+#[derive(serde::Deserialize)]
+struct JournalQuery {
+    #[serde(default = "default_journal_limit")]
+    limit: usize,
+}
+
+fn default_journal_limit() -> usize {
+    100
+}
+
+async fn alarms_journal(
+    State(state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<JournalQuery>,
+) -> Json<Vec<ironplc_bridge::monitor::AlarmJournalEntry>> {
+    Json(state.alarms.lock().expect("alarms mutex").journal(q.limit))
 }
 
 /// Same row shape as the IDE server's `HmiListEntry` (whose ts-rs export
@@ -767,7 +888,7 @@ struct LogsResponse {
 }
 
 /// One-shot: the most recent `tail` (default 200) captured log lines.
-/// This is what `cs edge logs` pulls over the SSH tunnel — surfacing
+/// This is what `cs get edges/<n>/logs` pulls over the SSH tunnel — surfacing
 /// EtherCAT discovery / bus-health / connect errors that previously
 /// only existed in journald on the edge.
 async fn logs(State(state): State<AppState>, Query(q): Query<LogQuery>) -> Json<LogsResponse> {
@@ -791,7 +912,7 @@ async fn logs_stream(
 }
 
 /// Per-device connect reports + discovered EtherCAT topology. Powers
-/// `cs edge scan` — the IDE authors PDO maps against the real bus.
+/// `cs get edges/<n>/scan` — the IDE authors PDO maps against the real bus.
 async fn discover(State(state): State<AppState>) -> Json<Vec<DeviceReport>> {
     Json(state.handle.device_reports())
 }
@@ -859,7 +980,7 @@ fn collect_system_info() -> SystemInfo {
     }
 }
 
-/// Edge interfaces / serial ports / arch — powers `cs edge system`.
+/// Edge interfaces / serial ports / arch — powers `cs get edges/<n>/system`.
 async fn system() -> Json<SystemInfo> {
     Json(collect_system_info())
 }
@@ -873,35 +994,19 @@ async fn system() -> Json<SystemInfo> {
 //  still zeroes outputs on stop.
 // ============================================================
 
-#[derive(Serialize)]
-struct ModeResp {
-    mode: RuntimeMode,
+async fn rt_pause(State(state): State<AppState>) -> Json<ModeResponse> {
+    Json(monitor::pause(&state.handle))
 }
 
-async fn rt_pause(State(state): State<AppState>) -> Json<ModeResp> {
-    state.handle.pause();
-    Json(ModeResp {
-        mode: state.handle.mode(),
-    })
+async fn rt_resume(State(state): State<AppState>) -> Json<ModeResponse> {
+    Json(monitor::resume(&state.handle))
 }
 
-async fn rt_resume(State(state): State<AppState>) -> Json<ModeResp> {
-    state.handle.resume();
-    Json(ModeResp {
-        mode: state.handle.mode(),
-    })
-}
-
-#[derive(serde::Deserialize)]
-struct StepReq {
-    cycles: u32,
-}
-
-async fn rt_step(State(state): State<AppState>, Json(req): Json<StepReq>) -> Json<ModeResp> {
-    state.handle.step(req.cycles);
-    Json(ModeResp {
-        mode: state.handle.mode(),
-    })
+async fn rt_step(
+    State(state): State<AppState>,
+    Json(req): Json<monitor::StepRequest>,
+) -> Json<ModeResponse> {
+    Json(monitor::step(&state.handle, req.cycles))
 }
 
 #[derive(serde::Deserialize)]
@@ -939,23 +1044,11 @@ async fn rt_write(
     State(state): State<AppState>,
     Json(req): Json<VarWriteReq>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let v = state
-        .handle
-        .write_variable(&req.name, req.value)
+    // The momentary-pulse reset guarantee lives in the shared monitor
+    // core — one implementation for IDE server and edge runtime.
+    let v = monitor::write_with_pulse(&state.handle, &req.name, req.value, req.pulse_ms)
         .await
         .map_err(write_err)?;
-    if let Some(ms) = req.pulse_ms {
-        let h = state.handle.clone();
-        let n = req.name.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(ms as u64)).await;
-            if let Err(e) = h.write_variable(&n, 0).await {
-                // A stopped scan loop also clears the variable, so this
-                // is benign then — but visible when the program is live.
-                tracing::warn!(variable = %n, ?e, "pulse reset write failed");
-            }
-        });
-    }
     Ok(Json(
         serde_json::json!({ "ok": true, "name": req.name, "value": v }),
     ))

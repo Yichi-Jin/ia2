@@ -1,4 +1,5 @@
 import { encodeForWrite } from "@/lib/write-encoding"
+import type { AlarmState } from "@/types/generated/AlarmState"
 import type { AttachInfo } from "@/types/generated/AttachInfo"
 import type { AttachmentStatus } from "@/types/generated/AttachmentStatus"
 import type { CheckDiagnostic } from "@/types/generated/CheckDiagnostic"
@@ -8,6 +9,7 @@ import type { Device } from "@/types/generated/Device"
 import type { Edge } from "@/types/generated/Edge"
 import type { EdgeProbe } from "@/types/generated/EdgeProbe"
 import type { FsListing } from "@/types/generated/FsListing"
+import type { HistoryResponse } from "@/types/generated/HistoryResponse"
 import type { IoMap } from "@/types/generated/IoMap"
 import type { ProjectInfo } from "@/types/generated/ProjectInfo"
 import type { MigrationResponse } from "@/types/generated/MigrationResponse"
@@ -462,6 +464,48 @@ export async function fetchRuntimeStatus(): Promise<RuntimeStatus> {
   return jsonOrThrow(
     await apiFetch(`/api/runtime/status`),
     "GET /api/runtime/status",
+  )
+}
+
+// ---------- Runtime historian + alarms ----------
+
+/** Downsampled history for one or more variables. Timestamps share the
+ *  live snapshot's time base (scan-relative micros), so seeded points
+ *  land on the same axis the SSE feed pushes onto — see
+ *  `historyToSamples` / `seedTimedBuffer`. `stepMs` picks the bucket
+ *  size (1000 = the native 1 Hz store); `fromUs`/`toUs` default to 0,
+ *  which the runtime reads as "the whole retained window". */
+export async function fetchRuntimeHistory(
+  vars: string[],
+  opts?: { fromUs?: bigint | number; toUs?: bigint | number; stepMs?: number },
+): Promise<HistoryResponse> {
+  const params = new URLSearchParams({
+    vars: vars.join(","),
+    from_us: String(opts?.fromUs ?? 0),
+    to_us: String(opts?.toUs ?? 0),
+    step_ms: String(opts?.stepMs ?? 1000),
+  })
+  return jsonOrThrow(
+    await apiFetch(`/api/runtime/history?${params.toString()}`),
+    "GET /api/runtime/history",
+  )
+}
+
+/** Current alarm states, sorted standing-first by the runtime. */
+export async function fetchRuntimeAlarms(): Promise<AlarmState[]> {
+  return jsonOrThrow(
+    await apiFetch(`/api/runtime/alarms`),
+    "GET /api/runtime/alarms",
+  )
+}
+
+/** Acknowledge one alarm; returns its updated state (404 = unknown id). */
+export async function ackRuntimeAlarm(id: string): Promise<AlarmState> {
+  return jsonOrThrow(
+    await apiFetch(`/api/runtime/alarms/${encodeURIComponent(id)}/ack`, {
+      method: "POST",
+    }),
+    `POST /api/runtime/alarms/${id}/ack`,
   )
 }
 

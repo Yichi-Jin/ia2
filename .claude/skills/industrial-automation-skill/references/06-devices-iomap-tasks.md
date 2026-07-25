@@ -1,29 +1,41 @@
 # Config shapes: devices, iomap, tasks
 
-These are the exact JSON shapes the `cs device set` / `cs iomap set` / `cs tasks set` commands accept (and that `... get` returns). Get → edit → set. Field names are snake_case; the server validates and 422s on a wrong shape.
+The JSON shapes below are the real content of this file. **One command pattern reaches all of them** — get → edit → set, whole-document:
 
-> **`cs device set NAME` takes the full `Device` shape** — not just the config below. The body needs a top-level `"name"` (which must equal `NAME`, else the server 400s) **and** a `"protocol"` discriminator (`"modbus"` | `"ethercat"`), then the protocol's own fields. The CLI passes `--from` through verbatim (it does *not* inject `name`/`protocol` from the positional arg). This is exactly what `cs device get NAME` prints, so get → edit → set round-trips. (`cs iomap set` / `cs tasks set` have no such envelope — their bodies start at `mappings` / `tasks` directly.)
+```bash
+cs get devices/<name>            # read the full Device JSON
+cs set devices/<name> --from -   # create-or-replace (upsert; a body carrying "protocol" creates)
+cs set iomap  --from -           # whole-doc replace (body starts at "mappings")
+cs set tasks  --from -           # whole-doc replace (body starts at "tasks")
+```
+
+Field names are snake_case; a wrong shape 422s with the reason on stderr (exit 2) — read it before retrying. Two device actions have no porcelain and go through `cs api`:
+
+```bash
+echo '{"detected":[16,32,48]}'    | cs api POST /api/devices/<name>/esi-assemble --from -   # modular EtherCAT, decimal idents
+echo '{"node_id":"ns=2;s=Line1"}' | cs api POST /api/devices/<name>/opcua-browse --from -   # omit node_id for ObjectsFolder
+```
+
+> **The device body is the full `Device`**: a top-level `"name"` (must equal `<name>`, else 400) **and** a `"protocol"` discriminator (`modbus` | `ethercat` | `opcua` | `canopen`), then that protocol's fields — exactly what `cs get devices/<name>` prints, so it round-trips. `iomap` / `tasks` have no envelope (bodies start at `mappings` / `tasks`). Alarm *definitions* live in `alarms.toml` on the same pattern (`cs get alarms` / `cs set alarms --from -`); shape + sim/alarm workflow are in `09-sim-alarms.md`.
 
 ---
 
 ## Modbus device
 
-The transport is a **tagged union** on `kind`. This is the post-RTU schema; old projects with flat `host`/`port` still load (auto-upgraded to `kind:"tcp"`), but always **write** the new shape.
+Transport is a **tagged union** on `kind`. Old flat-`host`/`port` projects still load (auto-upgraded to `kind:"tcp"`); always *write* the new shape.
 
 ### TCP
 ```json
 {
-  "name": "hmi",
-  "protocol": "modbus",
+  "name": "hmi", "protocol": "modbus",
   "transport": { "kind": "tcp", "host": "192.168.1.50", "port": 502 },
-  "slave_id": 1,
-  "poll_interval_ms": 100,
+  "slave_id": 1, "poll_interval_ms": 100,
   "channels": [
-    { "name": "estop",   "kind": "discrete_input",   "address": 0 },
-    { "name": "start",   "kind": "discrete_input",   "address": 1 },
-    { "name": "valve",   "kind": "coil",             "address": 0 },
-    { "name": "level",   "kind": "holding_register", "address": 0 },
-    { "name": "temp",    "kind": "input_register",   "address": 0 }
+    { "name": "estop", "kind": "discrete_input",   "address": 0 },
+    { "name": "start", "kind": "discrete_input",   "address": 1 },
+    { "name": "valve", "kind": "coil",             "address": 0 },
+    { "name": "level", "kind": "holding_register", "address": 0 },
+    { "name": "temp",  "kind": "input_register",   "address": 0 }
   ]
 }
 ```
@@ -31,56 +43,38 @@ The transport is a **tagged union** on `kind`. This is the post-RTU schema; old 
 ### RTU (serial)
 ```json
 {
-  "name": "flow_meter",
-  "protocol": "modbus",
-  "transport": {
-    "kind": "rtu",
-    "serial_device": "/dev/cu.usbserial-A1B2",
-    "baud_rate": 9600,
-    "data_bits": "eight",
-    "stop_bits": "one",
-    "parity": "none"
-  },
-  "slave_id": 1,
-  "poll_interval_ms": 200,
+  "name": "flow_meter", "protocol": "modbus",
+  "transport": { "kind": "rtu", "serial_device": "/dev/cu.usbserial-A1B2",
+                 "baud_rate": 9600, "data_bits": "eight", "stop_bits": "one", "parity": "none" },
+  "slave_id": 1, "poll_interval_ms": 200,
   "channels": [ { "name": "valve", "kind": "coil", "address": 0 } ]
 }
 ```
 
-- `serial_device`: macOS `/dev/cu.usbserial-*`, Linux `/dev/ttyUSB0` or `/dev/ttyS0`, Windows `COM3`.
-- `data_bits`: `five` | `six` | `seven` | `eight` (default `eight`).
-- `stop_bits`: `one` | `two` (default `one`).
-- `parity`: `none` | `even` | `odd` (default `none`).
-- The RTU defaults are 8-N-1, so a minimal `{ "kind":"rtu", "serial_device":"…", "baud_rate":9600 }` is valid input — the other three fields fill in.
-- `rs485` (optional, default off): **Linux half-duplex direction control** (`TIOCSRS485`). Add it when an RTU port opens fine but every request times out with baud/parity/slave/wiring all correct — a **RTS-gated** USB-485 adapter never drives the bus in plain serial mode (the connect error now says so explicitly). Shape: `{ "rts_on_send": true, "rx_during_tx": false, "delay_rts_before_send_ms": 0, "delay_rts_after_send_ms": 0 }`. `rts_on_send` false = drive on RTS *low*; `rx_during_tx` true tolerates 2-wire echo; the delays are turnaround settle times. Linux-only (no-op + warning elsewhere); omit entirely for auto-direction adapters. If it's still silent after enabling, the adapter/coupler itself is suspect — prove the bus with a known-good auto-direction dongle or a separate Modbus master.
+- `serial_device`: macOS `/dev/cu.usbserial-*`, Linux `/dev/ttyUSB0`, Windows `COM3`.
+- `data_bits` `five|six|seven|eight` (def `eight`) · `stop_bits` `one|two` (def `one`) · `parity` `none|even|odd` (def `none`). Defaults are 8-N-1, so `{ "kind":"rtu", "serial_device":"…", "baud_rate":9600 }` suffices.
+- `rs485` (optional, **Linux only**): half-duplex direction control (`TIOCSRS485`) for RTS-gated USB-485 adapters — add it when the port opens but every request times out with baud/parity/slave/wiring correct. Shape `{ "rts_on_send": true, "rx_during_tx": false, "delay_rts_before_send_ms": 0, "delay_rts_after_send_ms": 0 }`; omit for auto-direction adapters. Still silent after enabling → suspect the adapter itself.
 
-### Channel `kind` semantics
-| kind | Modbus function | read | write |
+### Channel `kind`
+| kind | Modbus fn | read | write |
 |---|---|---|---|
 | `coil` | 01/05 | ✓ | ✓ |
-| `discrete_input` | 02 | ✓ | ✗ (read-only on the wire) |
+| `discrete_input` | 02 | ✓ | ✗ |
 | `holding_register` | 03/06 | ✓ | ✓ |
 | `input_register` | 04 | ✓ | ✗ |
 
-`address` is the 0-based register/coil address. An iomap `direction: output` against a read-only channel (`discrete_input`/`input_register`) is a type error.
+`address` is 0-based. An iomap `direction: output` against a read-only channel is a type error.
 
 ### Register data types (direct-to-instrument)
-
-Register channels take two optional fields (default `"u16"` / `"hi_lo"` — old projects load unchanged):
-
+Register channels take two optional fields (default `u16` / `hi_lo`):
 ```json
 { "name": "flow",  "kind": "input_register", "address": 2,  "data_type": "f32", "word_order": "hi_lo" },
-{ "name": "temp",  "kind": "input_register", "address": 20, "data_type": "i16" },
 { "name": "total", "kind": "input_register", "address": 30, "data_type": "u32", "word_order": "lo_hi" }
 ```
+- `data_type`: `u16` (def) | `i16` | `u32` | `i32` | `f32`. 32-bit types span **two consecutive registers** from `address`.
+- `word_order` (32-bit only): `hi_lo` = ABCD (spec default) | `lo_hi` = CDAB (common on Chinese instruments). Float reads as garbage (1.18e-38) → flip this first. Coils/discretes ignore both.
 
-- `data_type`: `u16` (default) | `i16` (signed, negatives survive) | `u32` | `i32` | `f32`. 32-bit types span **two consecutive registers** starting at `address` — the norm for instrument floats and totalizers.
-- `word_order` (32-bit only): `hi_lo` = ABCD (Modbus-spec default) | `lo_hi` = CDAB (common on Chinese instruments). If a float reads as garbage (e.g. 1.18e-38), flip this first.
-- Coils/discretes ignore both fields.
-
-### Polling model (scales to hundreds of channels)
-
-The adapter does NOT issue one request per channel. At connect it merges channels into contiguous **read spans** per function code (bridging gaps ≤8 units), and a background task refreshes the whole mirror every `poll_interval_ms` with a handful of bulk reads. `read_channel` serves the mirror; writes go through a command queue so the single connection (mandatory for RTU serial) is never used concurrently. A failed poll keeps last-known values and retries next tick.
+The adapter merges channels into contiguous **read spans** per function code and bulk-refreshes a mirror every `poll_interval_ms` — a few reads, not one per channel (scales to hundreds). Writes queue so the single RTU connection is never concurrent; a failed poll holds last-known and retries.
 
 ---
 
@@ -88,90 +82,51 @@ The adapter does NOT issue one request per channel. At connect it merges channel
 
 ```json
 {
-  "name": "servo_bus",
-  "protocol": "ethercat",
-  "nic": "_sim",
-  "cycle_us": 1000,
-  "dc_sync": "off",
-  "dc_static_sync_iterations": 0,
+  "name": "servo_bus", "protocol": "ethercat", "nic": "_sim",
+  "cycle_us": 1000, "dc_sync": "off", "dc_static_sync_iterations": 0,
   "slaves": [
     { "index": 0, "name": "EK1100", "vendor_id": 2, "product_id": 72100946 },
-    {
-      "index": 1, "name": "SV660N", "vendor_id": 1048576, "product_id": 786701,
-      "dc_sync": "sync0",
-      "init_sdo": [
-        { "index": 24672, "sub_index": 0, "value": 8, "bits": 8 }
-      ]
-    }
+    { "index": 1, "name": "SV660N", "vendor_id": 1048576, "product_id": 786701, "dc_sync": "sync0",
+      "init_sdo": [ { "index": 24672, "sub_index": 0, "value": 8, "bits": 8 } ] }
   ],
   "channels": [
-    {
-      "name": "do_0", "slave_index": 0, "direction": "rx_pdo",
-      "pdo_index": 28672, "sub_index": 1, "bit_length": 1,
-      "data_type": "bool", "pdi_byte_offset": 0, "pdi_bit_offset": 0
-    }
+    { "name": "do_0", "slave_index": 0, "direction": "rx_pdo", "pdo_index": 28672, "sub_index": 1,
+      "bit_length": 1, "data_type": "bool", "pdi_byte_offset": 0, "pdi_bit_offset": 0 }
   ]
 }
 ```
 
-- `nic`: `"_sim"` (or `""`) → in-memory simulator, runs anywhere (macOS dev, CI). Any real interface name (`"eth0"`, `"en7"`) → real `ethercrab` master. **Real mode is Linux + `CAP_NET_RAW` only.**
-- `dc_sync` (default `"off"`): bus-level Distributed-clock mode. `"off"` = free-run (right for IO couplers / simple slaves). `"sync0"` = enable the SYNC0 pulse (period = `cycle_us`) — **servo drives like the Inovance SV660N need this to reach OP**; without it the SAFE-OP→OP transition times out.
-- `slaves[].dc_sync` (optional, default = inherit the bus-level `dc_sync`): per-SubDevice override for **mixed buses**. A coupler+IO **and** a servo on one ring: leave the bus `"off"` and set just the servo's slave to `"sync0"` (or vice-versa). The bus takes the DC path whenever *any* slave ends up `"sync0"`; slaves left `"off"` free-run inside that DC bus, so a coupler that can't do DC won't block OP.
-- `dc_static_sync_iterations` (default `0`): iterations of ethercrab's init-time static-drift compensation (a burst of FRMW frames). `0` skips it — short buses come up fine, and on a non-RT host one lost frame mid-burst aborts init with `Timeout(Pdu)`. Raise to `1000`–`10000` on longer DC buses where clock convergence at OP-entry matters.
-- `slaves[].init_sdo` (optional): CoE SDO writes applied in **PRE-OP on every connect**, in order, before PDO mapping is read and before SAFE-OP. This is how drives whose setup doesn't persist in EEPROM get configured each power-up — e.g. the SV660N needs `0x6060 = 8` (CSP mode) every boot, and PDO remapping (`0x1C12`/`0x1C13` → `0x16xx`/`0x1Axx`) goes here too. Each entry: `index` (CoE object), `sub_index`, `value` (signed/unsigned, fits `bits`), `bits` (`8` | `16` | `32`). A failed write aborts init — silently running a drive in the wrong mode is worse than not starting. *(Note the JSON uses decimal: `24672` = `0x6060`.)*
-- `direction`: `tx_pdo` (slave→master, i.e. an **input** to your program) | `rx_pdo` (master→slave, an **output**).
-- `data_type`: `bool` `u8` `i8` `u16` `i16` `u32` `i32` `real`.
-- `pdi_byte_offset` / `pdi_bit_offset`: where this entry sits in the slave's process-data image. **Required for real hardware**; you read these off the slave's ESI/datasheet. Sim mode ignores them. `bit_length < 8` channels (digital I/O packed into a byte) use the bit offset.
-- `pdo_index` / `sub_index`: CoE object dictionary coordinates — informational/documentation in this version; the cyclic exchange uses the byte/bit offsets.
-- **Capacity**: the master is sized for plant-scale buses — up to **128 subdevices / 4 KiB process image** per device (a 1000-point AI/AO/DI/DO project uses ~660 B). One device = one NIC = one bus; use multiple devices for multiple NICs.
+- `nic`: `"_sim"` (or `""`) → in-memory simulator, runs anywhere (macOS/CI). A real name (`"eth0"`) → real `ethercrab` master, **Linux + `CAP_NET_RAW` only**.
+- `dc_sync` (def `"off"`): `"off"` = free-run (IO couplers). `"sync0"` = SYNC0 pulse at `cycle_us` — **servo drives (SV660N) need it to reach OP** or SAFE-OP→OP times out. `slaves[].dc_sync` overrides per-SubDevice for mixed buses (bus `"off"`, servo `"sync0"`); the bus goes DC if *any* slave is `"sync0"`, and `"off"` slaves free-run inside it.
+- `dc_static_sync_iterations` (def `0`): init-time drift compensation (FRMW burst). `0` is right for short buses; on a non-RT host one lost frame aborts init with `Timeout(Pdu)`. Raise to `1000`–`10000` on long DC buses.
+- `slaves[].init_sdo`: CoE writes applied in **PRE-OP on every connect**, in order, before PDO mapping — how non-persisting drives get set each power-up (SV660N needs `0x6060 = 8`; PDO remap goes here too). Each entry `{ index, sub_index, value, bits (8|16|32) }`, decimal (`24672` = `0x6060`). A failed write aborts init.
+- `direction`: `tx_pdo` (slave→master = **input**) | `rx_pdo` (master→slave = **output**). `data_type`: `bool` `u8` `i8` `u16` `i16` `u32` `i32` `real`.
+- `pdi_byte_offset`/`pdi_bit_offset`: the entry's spot in the process image — **required for real hardware** (from the ESI/datasheet; sim ignores them; `bit_length < 8` uses the bit offset). `pdo_index`/`sub_index` are documentation-only.
+- **Capacity**: up to **128 subdevices / 4 KiB image** per device (a 1000-point project ≈ 660 B). One device = one NIC = one bus.
 
 ### Bring-up mode (`bringup`)
-
-Default is `{ "mode": "auto" }` — discover process data from the device's runtime CoE PDO-assignment objects (`0x1C12`/`0x1C13`). That works for fixed-PDO servos and slices.
-
-**ESI-driven modular couplers** (whose assembled module PDOs never appear over runtime CoE — `0x1C12` read-only, `0xF030` absent) need `{ "mode": "esi_modular", "esi_path": "esi/coupler.xml" }`. The process image is built from the device's ESI (.xml) file + the modules it reports (object `0xF050`), not hand-entered. Workflow:
+Default `{ "mode": "auto" }` discovers process data from runtime CoE (`0x1C12`/`0x1C13`) — fine for fixed-PDO servos and slices. **ESI-driven modular couplers** (assembled module PDOs never appear over runtime CoE) need `{ "mode": "esi_modular", "esi_path": "esi/coupler.xml" }`; drop the vendor ESI at `<project>/esi/coupler.xml`, then assemble channels from it + the detected module idents (decimal, from the `0xF050` scan) in slot order:
 
 ```bash
-# 1. drop the vendor ESI into the project: <project>/esi/coupler.xml
-# 2. create the device with bringup = esi_modular (esi_path is project-relative)
-# 3. assemble channels from the ESI + the modules present, in slot order:
-cs device esi-assemble coupler --idents 0x10,0x20,0x30   # hex or decimal
+echo '{"detected":[16,32,48]}' | cs api POST /api/devices/coupler/esi-assemble --from -
 ```
 
-`esi-assemble` parses the ESI, looks each detected ident up in the module table, concatenates the modules' PDO entries into the input/output images (tracking byte/bit offsets), and **replaces** the device's `channels` with the result — so the UI shows them and iomap can bind them. The idents come from the coupler's `0xF050` scan or the modules you physically installed. Channel names are `m<slot>_<entry>` (slot-namespaced so duplicate module types stay unique).
-
-> Real-bus cyclic I/O for `esi_modular` (master-programmed SyncManager/FMMU + logical-RW exchange) is validated against the physical coupler separately; the parsing, assembly, and offline channel authoring above are hardware-independent and the recommended way to author + verify the layout first (run it in `nic: "_sim"` to exercise the program against the assembled channels).
+That parses the ESI, concatenates each module's PDO entries into the I/O images, and **replaces** the device's `channels` (names `m<slot>_<entry>`, slot-namespaced) so iomap can bind them. Author and verify offline in `nic:"_sim"`; real-bus `esi_modular` cyclic I/O is validated against the physical coupler separately.
 
 ### In-cycle electronic gear (`[[gear]]`)
-
-B-tier motion. Instead of computing a follower's `target_position` in the PLC scan and copying it to the wire, an EtherCAT device can carry one or more `[[gear]]` entries that make the **cyclic loop** generate the follower target every bus cycle, strictly SYNC0-aligned. The PLC scan plane only feeds slow parameters (ratio, engage, …) through named channels that the device routes into a lock-free struct rather than PDI bytes — which removes the scan-plane phase jitter that otherwise dominates inter-axis sync error at speed. Authored in the device TOML (a table-array, not the JSON config body):
+B-tier motion. Rather than computing a follower's `target_position` in the PLC scan, an EtherCAT device carries `[[gear]]` entries so the **cyclic loop** generates the follower target every bus cycle, SYNC0-aligned — removing the scan-plane phase jitter that dominates inter-axis sync error at speed. Authored in the device TOML (a table-array, not the JSON body):
 
 ```toml
 [[gear]]
-slave_index        = 1        # follower (controlled) axis
-target_pos_offset  = 0        # 0x607A i32, follower output PDI — loop-owned
-actual_pos_offset  = 4        # 0x6064 i32, follower input PDI
-status_word_offset = 8        # 0x6041 u16 — engine gates on Operation Enabled
+slave_index        = 1        # follower axis
+target_pos_offset  = 0        # 0x607A i32 follower output PDI — loop-owned
+actual_pos_offset  = 4        # 0x6064 i32 follower input PDI
+status_word_offset = 8        # 0x6041 u16 — gates on Operation Enabled
 master = { kind = "virtual" }  # software accumulator, +master_vel counts/cycle
-# or gear off a real leader axis on the same bus:
-# master = { kind = "axis", slave_index = 2, actual_pos_offset = 4 }
+# master = { kind = "axis", slave_index = 2, actual_pos_offset = 4 }   # or gear off a real leader
 ```
 
-The follower descriptor names the four PDI byte offsets above; `master` is either `{ kind = "virtual" }` (a software accumulator advanced by `master_vel` counts each cycle) or `{ kind = "axis", slave_index, actual_pos_offset }` (geared off another axis's `0x6064` read each cycle). Nine parameter channels carry the slow plane — each has a default name you can override, and they bind in `iomap` like any channel; seven the PLC writes, two the engine reports back:
-
-| Channel | Default name | Direction |
-|---|---|---|
-| engage | `gear_engage` | PLC → engine |
-| ratio numerator | `ratio_num` | PLC → engine |
-| ratio denominator | `ratio_den` | PLC → engine |
-| ratio slew step | `ratio_step` | PLC → engine |
-| phase offset | `phase_ofs` | PLC → engine |
-| master velocity | `master_vel` | PLC → engine |
-| max travel | `gear_max_travel` | PLC → engine |
-| engaged (feedback) | `gear_engaged` | engine → PLC |
-| trip (feedback) | `gear_trip` | engine → PLC |
-
-**Safety model** (all enforced inside the cyclic loop, so no slow-plane mistake can bypass it): while the follower is not in CiA402 Operation Enabled the engine shadows its `actual_position`, so there is no jump at enable; engaging is refused unless `max_travel > 0` (locked by default); ratio and phase latch at the engage edge, so mid-run parameter edits stay inert until you re-engage; travel past `±max_travel` hard-clamps and then trips to a position hold that clears only when the engage channel drops; and an enable loss forces a re-arm. The loop **owns** `target_position` — leave it unmapped in `iomap`, since any PLC write to that PDO field is overwritten every cycle. Worked sim example: `examples/eg_gear_incycle`.
+Nine parameter channels carry the slow plane and bind in `iomap` — seven PLC→engine (`gear_engage`, `ratio_num`, `ratio_den`, `ratio_step`, `phase_ofs`, `master_vel`, `gear_max_travel`) and two engine→PLC (`gear_engaged`, `gear_trip`); names overridable. **Safety is enforced inside the loop** (no slow-plane mistake bypasses it): the engine shadows `actual_position` until Operation Enabled (no jump at enable); engage is refused unless `max_travel > 0`; ratio/phase latch at the engage edge (mid-run edits inert until re-engage); travel past `±max_travel` clamps then trips to a hold that clears only when engage drops; enable loss forces a re-arm. The loop **owns `target_position` — leave it unmapped in `iomap`** (any PLC write is overwritten each cycle). Sim example: `examples/eg_gear_incycle`.
 
 ---
 
@@ -181,19 +136,12 @@ The follower descriptor names the four PDI byte offsets above; `master` is eithe
 {
   "mappings": [
     { "application": "main", "variable": "estop_in",   "device": "hmi", "channel": "estop", "direction": "input"  },
-    { "application": "main", "variable": "valve_open",  "device": "hmi", "channel": "valve", "direction": "output" }
+    { "application": "main", "variable": "valve_open", "device": "hmi", "channel": "valve", "direction": "output" }
   ]
 }
 ```
 
-**Five fields, all required:**
-- `application` — the POU name the variable lives in (e.g. `"main"`). **Skipping this is the #1 422 cause.**
-- `variable` — the IEC variable name in that POU.
-- `device` — a device name from `cs device list`.
-- `channel` — a channel name on that device.
-- `direction` — `input` (channel→variable, read before run_round) | `output` (variable→channel, written after run_round).
-
-Bindings that reference an unknown device/variable/channel are skipped at run time with a warning — they don't fail the run. But a wrong *shape* (missing field) 422s the `set`.
+**Five fields, all required:** `application` (POU the variable lives in — **skipping it is the #1 422**), `variable` (IEC name in that POU), `device` (a name from `cs ls devices`), `channel` (a channel on it), `direction` (`input` = channel→variable, read before run_round | `output` = variable→channel, written after). Bindings that name an unknown device/variable/channel warn-skip at run time (they don't fail the run); a wrong *shape* 422s the `set`.
 
 ---
 
@@ -201,31 +149,25 @@ Bindings that reference an unknown device/variable/channel are skipped at run ti
 
 ```json
 {
-  "tasks":    [ { "name": "fast", "interval_ms": 50,  "priority": 1 } ],
+  "tasks":    [ { "name": "fast", "interval_ms": 50, "priority": 1 } ],
   "programs": [ { "instance": "main_inst", "program": "main", "task": "fast" } ]
 }
 ```
 
-- `tasks[].interval_ms` becomes `TASK fast(INTERVAL := T#50ms, PRIORITY := 1)` in the synthesized CONFIGURATION. Periodic only (event tasks not supported yet).
-- `programs[].program` must be a **PROGRAM**-kind POU (not FB/FUNCTION).
-- `programs[].instance` is the instance name; `task` references a `tasks[].name`.
-- **`programs` may list several PROGRAM instances.** Each gets its own container and runs round-robin, so `cs run` (whole-schedule) executes them all. The one rejected shape is 2+ PROGRAMs that also share a `VAR_GLOBAL` (globals aren't shared across instances). See `01-mental-model.md` fact 2.
-
-The scan-loop cadence comes from the bound task's `interval_ms` (the bridge throttles there, because the vendored ironplc doesn't populate the VM task table from CONFIGURATION). So `interval_ms` is the real knob for "how fast does my program scan".
+- `tasks[].interval_ms` → `TASK fast(INTERVAL := T#50ms, PRIORITY := 1)` in the synthesized CONFIGURATION. Periodic only, and **the real scan-cadence knob** (the bridge throttles there; the vendored ironplc doesn't populate the VM task table from CONFIGURATION).
+- `programs[].program` is a **PROGRAM**-kind POU; `instance` names it; `task` references a `tasks[].name`. Several instances run round-robin (`cs run` runs them all); the one rejected shape is 2+ PROGRAMs sharing a `VAR_GLOBAL` (see `01-mental-model.md` fact 2).
 
 ---
 
 ## OPC UA device (southbound to an existing DCS)
 
-When the site already runs a DCS/PLC that owns the physical I/O, IA2 sits **above** it as the supervisory layer: read PV tags, write SP/command tags. The DCS keeps base regulatory control and safety.
+When the site's DCS/PLC owns the physical I/O, IA2 sits **above** it: read PV tags, write SP/command tags; the DCS keeps base regulatory control and safety.
 
 ```json
 {
-  "name": "dcs",
-  "protocol": "opcua",
+  "name": "dcs", "protocol": "opcua",
   "endpoint_url": "opc.tcp://10.0.0.10:4840",
-  "auth": { "kind": "anonymous" },
-  "poll_interval_ms": 500,
+  "auth": { "kind": "anonymous" }, "poll_interval_ms": 500,
   "channels": [
     { "name": "ft0202_pv",  "node_id": "ns=2;s=FT0202.PV",  "data_type": "f64", "access": "read" },
     { "name": "fv0203_cmd", "node_id": "ns=2;s=FV0203.CMD", "data_type": "f64", "access": "write", "failsafe": 0.0 }
@@ -233,69 +175,53 @@ When the site already runs a DCS/PLC that owns the physical I/O, IA2 sits **abov
 }
 ```
 
-- `auth`: `{ "kind": "anonymous" }` or `{ "kind": "user_password", "username": "...", "password": "..." }`. The session security policy is None in v1 (typical for trusted control-network segments / DA-gateway hops).
-- `node_id`: the full NodeId string — `ns=2;s=Tag.Path` (string) or `ns=3;i=1042` (numeric). Don't retype them from UaExpert: `cs device opcua-browse <name> [--node <id>]` walks the live server's address space and prints NodeIds with type hints, and the device editor's "Browse server…" panel adds tags by click.
-- `data_type`: `bool` `i16` `u16` `i32` `u32` `f32` `f64`. Floats land on REAL PLC vars with fractions intact (f64 is narrowed to f32).
-- `access`: `read` tags are polled into a mirror (ONE bulk Read per `poll_interval_ms` for ALL tags — hundreds of tags stay one round-trip); `write` tags get a direct Write service call when the scan loop pushes an output.
-- `failsafe`: optional value written on shutdown/trip. **Leave unset by default** — on a supervisory layer the DCS below keeps authority; only set it for tags that are exclusively IA2's (e.g. a supervisory-enable flag).
-- **OPC DA** (classic, COM/DCOM, Windows-only): IA2 does not speak DA. Route DA servers through a DA→UA gateway (KEPServerEX, Matrikon UA Proxy) and point IA2 at the gateway's UA endpoint — the standard architecture for Linux edges.
+- `auth`: `{ "kind": "anonymous" }` or `{ "kind": "user_password", "username": "...", "password": "..." }`. Session security policy is None in v1 (trusted segments / DA-gateway hops).
+- `node_id`: full NodeId — `ns=2;s=Tag.Path` or `ns=3;i=1042`. Don't retype from UaExpert: `cs api POST /api/devices/<name>/opcua-browse --from -` (`{"node_id":"…"}`, omit for ObjectsFolder) walks the live address space with type hints.
+- `data_type`: `bool` `i16` `u16` `i32` `u32` `f32` `f64` (f64 narrows to REAL's f32). `access`: `read` polls into a mirror (ONE bulk Read per interval for ALL tags) | `write` gets a direct Write on output.
+- `failsafe`: written on shutdown/trip. **Leave unset by default** — the DCS keeps authority; set it only for tags exclusively IA2's.
+- **OPC DA** (classic COM/DCOM): not spoken — route through a DA→UA gateway (KEPServerEX, Matrikon) and point IA2 at its UA endpoint.
 
 ---
 
 ## CANopen device (CiA 301 node on a CAN bus)
 
-A servo drive, remote I/O block or sensor gateway speaking CANopen. IA2 is the master side of a point-to-point conversation with one node; per-channel transport picks the lane.
+IA2 is the master side of a point-to-point conversation with one node; per-channel transport picks the lane.
 
 ```json
 {
-  "name": "servo",
-  "protocol": "canopen",
-  "interface": "can0",
-  "node_id": 34,
-  "poll_interval_ms": 100,
-  "heartbeat_timeout_ms": 3000,
-  "start_on_connect": true,
+  "name": "servo", "protocol": "canopen", "interface": "can0", "node_id": 34,
+  "poll_interval_ms": 100, "heartbeat_timeout_ms": 3000, "start_on_connect": true,
   "channels": [
-    { "name": "statusword", "index": 24641, "sub_index": 0, "data_type": "u16", "access": "read",
-      "transport": { "kind": "tpdo", "slot": 1, "byte_offset": 0 } },
-    { "name": "controlword", "index": 24640, "sub_index": 0, "data_type": "u16", "access": "write",
-      "transport": { "kind": "rpdo", "slot": 1, "byte_offset": 0 } },
-    { "name": "target_velocity", "index": 24831, "sub_index": 0, "data_type": "i32", "access": "write",
-      "transport": { "kind": "sdo" }, "failsafe": 0 }
+    { "name": "statusword",      "index": 24641, "sub_index": 0, "data_type": "u16", "access": "read",  "transport": { "kind": "tpdo", "slot": 1, "byte_offset": 0 } },
+    { "name": "controlword",     "index": 24640, "sub_index": 0, "data_type": "u16", "access": "write", "transport": { "kind": "rpdo", "slot": 1, "byte_offset": 0 } },
+    { "name": "target_velocity", "index": 24831, "sub_index": 0, "data_type": "i32", "access": "write", "transport": { "kind": "sdo" }, "failsafe": 0 }
   ]
 }
 ```
 
-- `interface`: a SocketCAN name (`can0`) on a Linux edge, or `"_sim"` for the in-memory simulated bus — the default on device creation, so dev machines and demos run without hardware (same convention as EtherCAT's `nic`). Ops bring the real interface up outside the process: `ip link set can0 up type can bitrate 500000`.
-- `index`/`sub_index`: the object-dictionary address. JSON carries them as decimal (`24641` = `0x6041` statusword); the device editor renders hex.
-- `transport`: `{"kind":"sdo"}` polls/writes via SDO expedited transfers at `poll_interval_ms` — the configuration-rate lane, fine for setpoints and parameters. `tpdo`/`rpdo` ride process data on the CiA 301 predefined COB-IDs (TPDO1..4 = 0x180/0x280/0x380/0x480 + node-id, RPDO1..4 = 0x200/…/0x500 + node-id) with `slot` 1–4 and `byte_offset` locating the object inside the ≤8-byte frame, using the node's existing PDO mapping. Objects >4 bytes (segmented SDO) are not supported — bind a scalar.
-- `heartbeat_timeout_ms`: the node's heartbeat is the health signal; no heartbeat for this long → device unhealthy (inputs freeze at last-known). `0` disables (then consecutive SDO failures flip health instead).
-- `start_on_connect`: sends NMT Start Remote Node so a node sitting pre-operational enters Operational — PDOs only run there. Leave on unless another master owns NMT.
-- `failsafe`: same opt-in contract as OPC UA — only `write` channels with an explicit value get written on shutdown/trip, and the adapter never sends NMT Stop (other tools may share the bus; a drive's safe state is an object write like controlword shutdown, not a bus-wide state change).
+- `interface`: SocketCAN name (`can0`) on a Linux edge, or `"_sim"` (default on creation). Ops bring the real one up: `ip link set can0 up type can bitrate 500000`.
+- `index`/`sub_index`: object-dictionary address, decimal (`24641` = `0x6041`); editor renders hex.
+- `transport`: `{"kind":"sdo"}` polls/writes via SDO at `poll_interval_ms` (config-rate lane — setpoints, parameters). `tpdo`/`rpdo` ride process data on the CiA 301 predefined COB-IDs (`slot` 1–4, `byte_offset` into the ≤8-byte frame) using the node's existing mapping. Objects >4 bytes (segmented SDO) unsupported — bind a scalar.
+- `heartbeat_timeout_ms`: no heartbeat this long → unhealthy (inputs freeze at last-known); `0` disables (SDO failures flip health instead).
+- `start_on_connect`: NMT Start so a pre-operational node enters Operational (PDOs only run there). Leave on unless another master owns NMT.
+- `failsafe`: as OPC UA — only `write` channels with a value are written on trip; the adapter never sends NMT Stop (other tools may share the bus).
 
 ---
 
 ## Northbound (northbound.toml — MQTT to supOS / Tier0)
 
-How the **edge runtime** publishes live data up to the plant platform. MQTT only by design. Managed via `cs northbound get/set` (JSON shape below) or by editing `northbound.toml`; the edge runtime applies it at startup (redeploy/restart to change).
+How the **edge runtime** publishes live data up to the plant platform. MQTT only. `cs get northbound` / `cs set northbound --from -`, or edit `northbound.toml`; the edge applies it at startup (redeploy/restart to change).
 
 ```json
 {
   "mqtt": {
-    "enabled": true,
-    "broker_host": "10.0.0.5",
-    "broker_port": 1883,
-    "client_id": "",
-    "username": "",
-    "password": "",
-    "topic_prefix": "",
-    "publish_interval_ms": 1000,
-    "qos": 0,
-    "allow_write": false
+    "enabled": true, "broker_host": "10.0.0.5", "broker_port": 1883,
+    "client_id": "", "username": "", "password": "", "topic_prefix": "",
+    "publish_interval_ms": 1000, "qos": 0, "allow_write": false
   }
 }
 ```
 
 - `topic_prefix` defaults to `ia2/<project>`; `client_id` to `ia2-<project>`.
-- Topics: `<prefix>/status` (retained `online`/`offline` with LWT — the platform sees crashes), `<prefix>/snapshot` (periodic `{"ts_us":…,"scan":…,"values":{"FT0202":12.7,"alarm_h":true}}` — typed JSON values, one JSON-path hop to map into the platform), and `<prefix>/write` (subscribed only when `allow_write`, payload `{"name":"sp_flow","value":12.5}` → one-shot variable write).
-- `allow_write` is **off by default** — turning the northbound link into a control path is an explicit decision. Writes are one-shot (program can overwrite next scan); latch setpoints in program logic.
+- Topics: `<prefix>/status` (retained `online`/`offline` via LWT — the platform sees crashes), `<prefix>/snapshot` (periodic `{"ts_us":…,"scan":…,"values":{…}}` typed JSON), `<prefix>/write` (only when `allow_write`; `{"name":"sp_flow","value":12.5}` → one-shot write).
+- `allow_write` is **off by default** — making the link a control path is an explicit decision. Writes are one-shot (program can overwrite next scan); latch setpoints in program logic.

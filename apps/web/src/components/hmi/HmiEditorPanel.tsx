@@ -32,6 +32,7 @@ const BASE_KINDS: {
   { label: "input", make: () => ({ type: "input", label: "setpoint" }), w: 220, h: 28 },
   { label: "trend", make: () => ({ type: "trend", series: [], window_s: 300 }), w: 480, h: 180 },
   { label: "alarmbar", make: () => ({ type: "alarmbar" }), w: 600, h: 32 },
+  { label: "alarmlist", make: () => ({ type: "alarmlist", max_rows: 0 }), w: 360, h: 200 },
   { label: "nav", make: () => ({ type: "nav", label: "Detail", target: "" }), w: 120, h: 32 },
   { label: "rect", make: () => ({ type: "shape", shape: "rect", points: [] }), w: 160, h: 100 },
   { label: "ellipse", make: () => ({ type: "shape", shape: "ellipse", points: [] }), w: 100, h: 100 },
@@ -493,6 +494,23 @@ function TypeFields({
           />
         </Section>
       )
+    case "alarmlist":
+      return (
+        <Section label="Alarm list">
+          <TextField
+            label="rows"
+            value={String(node.max_rows)}
+            placeholder="0 = 8"
+            onCommit={(v) => {
+              const n = Number(v)
+              void patch({
+                max_rows:
+                  v === "" || Number.isNaN(n) ? 0 : Math.max(0, Math.round(n)),
+              })
+            }}
+          />
+        </Section>
+      )
     default:
       return null
   }
@@ -520,6 +538,7 @@ function BindingsEditor({
       shape: ["fill", "stroke"],
       trend: [],
       alarmbar: [],
+      alarmlist: [],
     }
     const base = known[node.type] ?? []
     const existing = Object.keys(node.bind)

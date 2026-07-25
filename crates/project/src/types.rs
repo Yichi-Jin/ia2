@@ -1241,6 +1241,74 @@ pub struct Tasks {
 
 // ---------------- Northbound (edge → platform publishing) ----------------
 
+/// `alarms.toml` — declarative alarm definitions, evaluated by the
+/// runtime-monitor layer on every sampled snapshot (IDE server and edge
+/// runtime alike). Deliberately NOT a general expression language: one
+/// variable, one condition, one limit — same non-Turing philosophy as
+/// HMI bindings. Agents author this file like any other project config
+/// (`cs get alarms` / `cs set alarms --from -`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct AlarmConfig {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub alarms: Vec<AlarmDef>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct AlarmDef {
+    /// Unique id — the ack/journal key (`level_high`).
+    pub id: String,
+    /// Snapshot variable the condition reads.
+    pub variable: String,
+    pub condition: AlarmCondition,
+    /// Threshold for the numeric conditions; ignored (and omitted) for
+    /// `is_true` / `is_false`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<f64>,
+    /// Hysteresis on CLEARING a numeric alarm: `gt 90` with deadband 2
+    /// raises above 90 and clears only below 88 — stops limit-riding
+    /// values from chattering the alarm. Default 0.
+    #[serde(default)]
+    pub deadband: f64,
+    /// The condition must hold this long before the alarm raises
+    /// (debounce for spikes). Default 0 = raise on first sample.
+    #[serde(default)]
+    pub delay_ms: u32,
+    #[serde(default)]
+    pub severity: AlarmSeverity,
+    /// Operator-facing text. Keep it actionable ("Tank level high —
+    /// check outlet valve"), not a restatement of the condition.
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "snake_case")]
+pub enum AlarmCondition {
+    Gt,
+    Ge,
+    Lt,
+    Le,
+    Eq,
+    Ne,
+    IsTrue,
+    IsFalse,
+}
+
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, TS,
+)]
+#[ts(export)]
+#[serde(rename_all = "snake_case")]
+pub enum AlarmSeverity {
+    Info,
+    #[default]
+    Warn,
+    High,
+    Critical,
+}
+
 /// `northbound.toml` — how the *edge runtime* publishes live data up to
 /// the plant platform (supOS / Tier0). MQTT only by design: it's the
 /// integration protocol the platform side ingests natively. Southbound

@@ -1,17 +1,17 @@
-//! Runtime lifecycle (`cs run` / `cs stop`) and the debug-control trio
-//! (`cs runtime pause/resume/step/status/force/unforce/write`), plus the
-//! value-encoding helpers the force/write paths use.
+//! Runtime lifecycle (`cs run` / `cs stop`) and the online debug verbs
+//! (`cs runtime pause/resume/step/status/snapshot/force/unforce/write`),
+//! plus the value-encoding helpers the force/write paths use. These
+//! stay porcelain — force/write carry type-aware bit-packing and the
+//! whole family has safety semantics a generic verb shouldn't blur.
 
 use std::path::Path;
 
 use anyhow::{Context, Result};
 
-use crate::http::{delete_json, get_json, post_json, print_json, url_encode, ServerOpt};
+use crate::http::{print_json, url_encode, Client};
 use crate::RuntimeCmd;
 
-pub(crate) fn cmd_run(program: Option<&str>, file: Option<&Path>, server: &str) -> Result<i32> {
-    // The server distinguishes three run shapes by the presence of
-    // `program` / `file_path`. Mirror that here.
+pub(crate) fn cmd_run(client: &Client, program: Option<&str>, file: Option<&Path>) -> Result<i32> {
     let body = match (program, file) {
         (None, None) => serde_json::json!({ "kind": "project" }),
         (Some(name), None) => serde_json::json!({
@@ -32,166 +32,137 @@ pub(crate) fn cmd_run(program: Option<&str>, file: Option<&Path>, server: &str) 
             anyhow::bail!("--file requires --program to name the PROGRAM inside it")
         }
     };
-    let resp = post_json(&format!("{server}/api/run"), &body)?;
+    let resp = client.post("/api/run", &body)?;
     print_json(&resp)
 }
 
-pub(crate) fn cmd_stop(server: &str) -> Result<i32> {
-    let resp = post_json(&format!("{server}/api/stop"), &())?;
+pub(crate) fn cmd_stop(client: &Client) -> Result<i32> {
+    let resp = client.post("/api/stop", &serde_json::json!({}))?;
     print_json(&resp)
 }
 
-pub(crate) fn cmd_runtime(cmd: RuntimeCmd) -> Result<i32> {
+pub(crate) fn cmd_runtime(client: &Client, cmd: RuntimeCmd, json: bool) -> Result<i32> {
     match cmd {
-        RuntimeCmd::Pause {
-            edge,
-            server: ServerOpt { server },
-        } => {
-            let resp = match &edge {
-                Some(e) => post_json(
-                    &format!("{server}/api/edges/{}/runtime/pause", url_encode(e)),
-                    &serde_json::json!({}),
-                )?,
-                None => post_json(&format!("{server}/api/runtime/pause"), &())?,
-            };
+        RuntimeCmd::Pause { edge } => {
+            let resp = post_op(client, edge.as_deref(), "pause", &serde_json::json!({}))?;
             print_json(&resp)
         }
-        RuntimeCmd::Resume {
-            edge,
-            server: ServerOpt { server },
-        } => {
-            let resp = match &edge {
-                Some(e) => post_json(
-                    &format!("{server}/api/edges/{}/runtime/resume", url_encode(e)),
-                    &serde_json::json!({}),
-                )?,
-                None => post_json(&format!("{server}/api/runtime/resume"), &())?,
-            };
+        RuntimeCmd::Resume { edge } => {
+            let resp = post_op(client, edge.as_deref(), "resume", &serde_json::json!({}))?;
             print_json(&resp)
         }
-        RuntimeCmd::Step {
-            cycles,
-            edge,
-            server: ServerOpt { server },
-        } => {
+        RuntimeCmd::Step { cycles, edge } => {
             let body = serde_json::json!({ "cycles": cycles });
-            let resp = match &edge {
-                Some(e) => post_json(
-                    &format!("{server}/api/edges/{}/runtime/step", url_encode(e)),
-                    &body,
-                )?,
-                None => post_json(&format!("{server}/api/runtime/step"), &body)?,
-            };
+            let resp = post_op(client, edge.as_deref(), "step", &body)?;
             print_json(&resp)
         }
-        RuntimeCmd::Status {
-            json,
-            edge,
-            server: ServerOpt { server },
-        } => {
-            // Local: /api/runtime/status. Edge: the runtime's /status via
-            // the server proxy (different shape, but carries mode + forces).
+        RuntimeCmd::Status { edge } => {
             let status = match &edge {
-                Some(e) => get_json(&format!("{server}/api/edges/{}/status", url_encode(e)))?,
-                None => get_json(&format!("{server}/api/runtime/status"))?,
+                Some(e) => client.get(&format!("/api/edges/{}/status", url_encode(e)))?,
+                None => client.get("/api/runtime/status")?,
             };
             if json {
-                println!("{}", serde_json::to_string_pretty(&status)?);
-            } else {
-                // A minimal human summary; full status is one --json
-                // away.
-                let mode = status
-                    .get("mode")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null);
-                let forces = status
-                    .get("forces")
-                    .and_then(|v| v.as_array())
-                    .cloned()
-                    .unwrap_or_default();
-                // Edge /status has no `running` bool — derive from mode.
-                let running = status
-                    .get("running")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or_else(|| {
-                        mode.get("kind").and_then(|k| k.as_str()) == Some("running")
-                    });
-                println!(
-                    "running: {running}  mode: {}  forces: {}",
-                    serde_json::to_string(&mode)?,
-                    forces.len(),
-                );
-                for f in &forces {
-                    if let (Some(n), Some(v)) =
-                        (f.get("name").and_then(|v| v.as_str()), f.get("value"))
-                    {
-                        println!("  {n} := {v}");
-                    }
+                return print_json(&status);
+            }
+            let mode = status
+                .get("mode")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            let forces = status
+                .get("forces")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            // Edge /status has no `running` bool — derive from mode.
+            let running = status
+                .get("running")
+                .and_then(|v| v.as_bool())
+                .unwrap_or_else(|| mode.get("kind").and_then(|k| k.as_str()) == Some("running"));
+            println!(
+                "running: {running}  mode: {}  forces: {}",
+                serde_json::to_string(&mode)?,
+                forces.len(),
+            );
+            for f in &forces {
+                if let (Some(n), Some(v)) = (f.get("name").and_then(|v| v.as_str()), f.get("value"))
+                {
+                    println!("  {n} := {v}");
                 }
             }
             Ok(0)
         }
-        RuntimeCmd::Force {
-            name,
-            value,
-            edge,
-            server: ServerOpt { server },
-        } => {
+        RuntimeCmd::Snapshot { vars, edge } => {
+            // The one runtime READ agents need most: current values.
+            // Local: /api/runtime/snapshot. Edge: last_snapshot off the
+            // proxied /status (the edge monitor keeps it fresh).
+            let snap = match &edge {
+                Some(e) => {
+                    let status = client.get(&format!("/api/edges/{}/status", url_encode(e)))?;
+                    status
+                        .get("last_snapshot")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null)
+                }
+                None => client.get("/api/runtime/snapshot")?,
+            };
+            let filtered = match &vars {
+                Some(list) => filter_snapshot(&snap, list),
+                None => snap,
+            };
+            // Snapshot output is inherently machine data — always JSON.
+            print_json(&filtered)
+        }
+        RuntimeCmd::Force { name, value, edge } => {
             let resp = match &edge {
                 Some(e) => {
                     let encoded =
-                        pack_value(&name, edge_var_type(&server, e, &name).as_deref(), &value)?;
-                    post_json(
-                        &format!("{server}/api/edges/{}/runtime/force", url_encode(e)),
+                        pack_value(&name, edge_var_type(client, e, &name).as_deref(), &value)?;
+                    client.post(
+                        &format!("/api/edges/{}/runtime/force", url_encode(e)),
                         &serde_json::json!({ "name": name, "value": encoded }),
                     )?
                 }
                 None => {
-                    let encoded = parse_value(&server, &name, &value)?;
-                    post_json(
-                        &format!("{server}/api/runtime/forces/{}", url_encode(&name)),
+                    let encoded = parse_value(client, &name, &value)?;
+                    client.post(
+                        &format!("/api/runtime/forces/{}", url_encode(&name)),
                         &serde_json::json!({ "value": encoded }),
                     )?
                 }
             };
             print_json(&resp)
         }
-        RuntimeCmd::Unforce {
-            name,
-            edge,
-            server: ServerOpt { server },
-        } => {
+        RuntimeCmd::Unforce { name, edge } => {
             let resp = match &edge {
-                Some(e) => post_json(
-                    &format!("{server}/api/edges/{}/runtime/unforce", url_encode(e)),
+                Some(e) => client.post(
+                    &format!("/api/edges/{}/runtime/unforce", url_encode(e)),
                     &serde_json::json!({ "name": name }),
                 )?,
-                None => delete_json(&format!(
-                    "{server}/api/runtime/forces/{}",
-                    url_encode(&name)
-                ))?,
+                None => client.delete(&format!("/api/runtime/forces/{}", url_encode(&name)))?,
             };
             print_json(&resp)
         }
-        RuntimeCmd::Write {
-            name,
-            value,
-            edge,
-            server: ServerOpt { server },
-        } => {
+        RuntimeCmd::Ack { id } => {
+            let resp = client.post(
+                &format!("/api/runtime/alarms/{}/ack", url_encode(&id)),
+                &serde_json::json!({}),
+            )?;
+            print_json(&resp)
+        }
+        RuntimeCmd::Write { name, value, edge } => {
             let resp = match &edge {
                 Some(e) => {
                     let encoded =
-                        pack_value(&name, edge_var_type(&server, e, &name).as_deref(), &value)?;
-                    post_json(
-                        &format!("{server}/api/edges/{}/runtime/write", url_encode(e)),
+                        pack_value(&name, edge_var_type(client, e, &name).as_deref(), &value)?;
+                    client.post(
+                        &format!("/api/edges/{}/runtime/write", url_encode(e)),
                         &serde_json::json!({ "name": name, "value": encoded }),
                     )?
                 }
                 None => {
-                    let encoded = parse_value(&server, &name, &value)?;
-                    post_json(
-                        &format!("{server}/api/runtime/variables/{}", url_encode(&name)),
+                    let encoded = parse_value(client, &name, &value)?;
+                    client.post(
+                        &format!("/api/runtime/variables/{}", url_encode(&name)),
                         &serde_json::json!({ "value": encoded }),
                     )?
                 }
@@ -201,37 +172,65 @@ pub(crate) fn cmd_runtime(cmd: RuntimeCmd) -> Result<i32> {
     }
 }
 
+/// pause/resume/step against the local runtime or an edge proxy.
+fn post_op(
+    client: &Client,
+    edge: Option<&str>,
+    op: &str,
+    body: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    match edge {
+        Some(e) => client.post(&format!("/api/edges/{}/runtime/{op}", url_encode(e)), body),
+        None => client.post(&format!("/api/runtime/{op}"), body),
+    }
+}
+
+/// Keep only the named vars (comma-separated) in a snapshot payload.
+fn filter_snapshot(snap: &serde_json::Value, vars: &str) -> serde_json::Value {
+    let wanted: Vec<&str> = vars
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    let Some(arr) = snap.get("vars").and_then(|v| v.as_array()) else {
+        return snap.clone();
+    };
+    let filtered: Vec<serde_json::Value> = arr
+        .iter()
+        .filter(|v| {
+            v.get("name")
+                .and_then(|n| n.as_str())
+                .map(|n| wanted.contains(&n))
+                .unwrap_or(false)
+        })
+        .cloned()
+        .collect();
+    let mut out = snap.clone();
+    if let Some(obj) = out.as_object_mut() {
+        obj.insert("vars".into(), serde_json::Value::Array(filtered));
+    }
+    out
+}
+
 /// Convert a human-typed value into the i32 the runtime wire protocol
 /// expects, type-aware via the runtime's snapshot.
 ///
 /// Why: the bridge stores all variables — BOOL, INT, REAL, … — in
 /// 32-bit slots and the force/write endpoint takes a raw `i32`. For
 /// REAL the i32 is the IEEE-754 bit pattern of the float, NOT the
-/// integer value. Without type info, `cs runtime force x 50.0` would
-/// have to send `1112014848`. This helper does the conversion so
-/// humans (and agents) can use natural notation.
-///
-/// Strategy:
-///   1. If the value is obviously BOOL ("true"/"false" case-insensitive)
-///      → 0 / 1.
-///   2. Otherwise fetch `/api/runtime/snapshot`, look up the variable,
-///      encode based on its `type_name` (REAL → bit-pack, INT-family
-///      → as-is).
-///   3. If the snapshot doesn't include the variable (runtime not
-///      running yet, or the variable lives in a POU instance the
-///      bridge's snapshot extractor doesn't traverse — a known bridge
-///      bug as of 2026-05), fall back to format-based sniffing: a
-///      decimal point implies REAL, otherwise INT. Print a stderr
-///      note so users know we guessed.
-fn parse_value(server: &str, name: &str, raw: &str) -> Result<i32> {
-    let var_type = snapshot_var_type(server, name).unwrap_or_default();
+/// integer value. This helper does the conversion so humans (and
+/// agents) can use natural notation.
+pub(crate) fn parse_value(client: &Client, name: &str, raw: &str) -> Result<i32> {
+    let var_type = snapshot_var_type(client, name).unwrap_or_default();
     pack_value(name, var_type.as_deref(), raw)
 }
 
 /// Resolve an edge variable's type from the edge runtime's `/status`
 /// (last snapshot, which carries per-variable `type_name`).
-fn edge_var_type(server: &str, edge: &str, name: &str) -> Option<String> {
-    let status = get_json(&format!("{server}/api/edges/{}/status", url_encode(edge))).ok()?;
+fn edge_var_type(client: &Client, edge: &str, name: &str) -> Option<String> {
+    let status = client
+        .get(&format!("/api/edges/{}/status", url_encode(edge)))
+        .ok()?;
     let vars = status.get("last_snapshot")?.get("vars")?.as_array()?;
     for v in vars {
         if v.get("name").and_then(|n| n.as_str()) == Some(name) {
@@ -257,7 +256,6 @@ fn pack_value(name: &str, var_type: Option<&str>, raw: &str) -> Result<i32> {
 
     match var_type {
         Some("BOOL") => {
-            // We already handled TRUE/FALSE above; accept 0/1 too.
             let n: i32 = raw.parse().with_context(|| {
                 format!("value `{raw}` doesn't fit BOOL (expected TRUE/FALSE/1/0)")
             })?;
@@ -284,9 +282,6 @@ fn pack_value(name: &str, var_type: Option<&str>, raw: &str) -> Result<i32> {
             let n: i64 = raw.parse().with_context(|| {
                 format!("value `{raw}` doesn't parse as integer for {int_type}")
             })?;
-            // Wire is i32; for unsigned and larger types we just bit-
-            // truncate. Users wanting precise unsigned semantics can
-            // pass the i32 reinterpretation directly.
             Ok(n as i32)
         }
         Some(other) => {
@@ -313,13 +308,9 @@ fn pack_value(name: &str, var_type: Option<&str>, raw: &str) -> Result<i32> {
     }
 }
 
-/// Best-effort variable type lookup via `/api/runtime/snapshot`. The
-/// snapshot returns one record per live variable with `type_name`. If
-/// the runtime isn't running, or the bridge's extractor doesn't
-/// include this variable's POU, return Ok(None) and let the caller
-/// fall back to format-sniffing.
-fn snapshot_var_type(server: &str, name: &str) -> Result<Option<String>> {
-    let snap = match get_json(&format!("{server}/api/runtime/snapshot")) {
+/// Best-effort variable type lookup via `/api/runtime/snapshot`.
+fn snapshot_var_type(client: &Client, name: &str) -> Result<Option<String>> {
+    let snap = match client.get("/api/runtime/snapshot") {
         Ok(v) => v,
         Err(_) => return Ok(None),
     };

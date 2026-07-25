@@ -346,6 +346,10 @@ pub struct DeployReport {
     /// Tail of stdout/stderr from the remote script — useful for
     /// surfacing the "what just happened" to the user.
     pub log: String,
+    /// Structured caveat on an otherwise-successful deploy — today the
+    /// install_dir/systemd drift warning. `None` = nothing to flag.
+    /// Machine-readable so clients don't have to grep the log.
+    pub warning: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -449,13 +453,22 @@ pub async fn deploy_to_edge(
         .spawn()?;
     let mut ssh_stdin = ssh.stdin.take().expect("ssh stdin");
 
-    // Stream tar → ssh stdin while we wait.
-    tokio::spawn(async move {
-        let _ = tokio::io::copy(&mut tar_stdout, &mut ssh_stdin).await;
+    // Stream tar → ssh stdin while we wait. The pump's result is
+    // awaited below — a broken stream must fail the deploy, not be
+    // discovered later as a half-written version on the edge.
+    let pump = tokio::spawn(async move {
+        let res = tokio::io::copy(&mut tar_stdout, &mut ssh_stdin).await;
         let _ = ssh_stdin.shutdown().await;
+        res
     });
 
     let out = ssh.wait_with_output().await?;
+    let pump_result = pump.await;
+    let tar_status = tar_child
+        .wait()
+        .await
+        .map_err(|e| DeployError::Pack(format!("waiting for tar: {e}")))?;
+
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     let stderr = strip_pax_keyword_warnings(&String::from_utf8_lossy(&out.stderr));
     let combined = format!(
@@ -467,6 +480,9 @@ pub async fn deploy_to_edge(
         }
     );
 
+    // Remote verdict first — when the script failed, ITS error is the
+    // story (a dying remote also breaks the local tar/pump with EPIPE,
+    // which would otherwise mask the cause).
     if !out.status.success() {
         return Err(DeployError::Remote(
             out.status.code().unwrap_or(-1),
@@ -474,18 +490,49 @@ pub async fn deploy_to_edge(
         ));
     }
 
+    // Truthfulness gate: the remote said OK, but the LOCAL half must
+    // also have completed — tar exited cleanly and every byte reached
+    // ssh. `set -euo pipefail` on the remote catches most truncations,
+    // but not a tar that dies exactly on an entry boundary.
+    if !tar_status.success() {
+        return Err(DeployError::Pack(format!(
+            "local tar exited with {tar_status} — the uploaded archive was incomplete"
+        )));
+    }
+    match pump_result {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => {
+            return Err(DeployError::Pack(format!(
+                "tar stream to the edge aborted mid-transfer: {e}"
+            )));
+        }
+        Err(e) => {
+            return Err(DeployError::Pack(format!("tar stream task panicked: {e}")));
+        }
+    }
+
     // The script prints `VERSION=<ts>` as its last informational line.
-    let version = combined
+    // Its absence from a "successful" run means the script we shipped
+    // and the script that ran have drifted — refuse to guess.
+    let Some(version) = combined
         .lines()
         .rev()
         .find_map(|l| l.strip_prefix("VERSION="))
-        .unwrap_or("?")
-        .to_string();
+        .map(str::to_string)
+    else {
+        return Err(DeployError::Remote(
+            0,
+            format!("remote script succeeded but printed no VERSION= line — deploy state unknown\n{combined}"),
+        ));
+    };
 
     // Guard the classic drift: deploying to an `install_dir` the running
     // service doesn't actually read. systemd is the source of truth — if its
     // ExecStart runs from a different tree, this deploy is invisible to it.
+    // Surfaced BOTH as a structured `warning` field and prepended to the
+    // log, so agents don't have to grep prose.
     let mut combined = combined;
+    let mut warning = None;
     let svc = query_service(edge).await;
     if let Some(svc_root) = svc
         .project_dir
@@ -493,12 +540,14 @@ pub async fn deploy_to_edge(
         .map(|pd| pd.strip_suffix("/current/project").unwrap_or(pd))
     {
         if svc_root != edge.install_dir {
-            combined = format!(
-                "WARNING: deployed to install_dir={} but systemd '{EDGE_UNIT}' runs from {} — \
+            let msg = format!(
+                "deployed to install_dir={} but systemd '{EDGE_UNIT}' runs from {} — \
                  the service will NOT see this deploy. Reconcile the edge's install_dir with the \
-                 unit's INSTALL_DIR.\n{}",
-                edge.install_dir, svc_root, combined,
+                 unit's INSTALL_DIR.",
+                edge.install_dir, svc_root,
             );
+            combined = format!("WARNING: {msg}\n{combined}");
+            warning = Some(msg);
         }
     }
 
@@ -506,6 +555,7 @@ pub async fn deploy_to_edge(
         ok: true,
         version,
         log: combined,
+        warning,
     })
 }
 
@@ -632,12 +682,19 @@ ln -sfn "$DEST" "$TMPLINK"
 mv -Tf "$TMPLINK" "$INSTALL_DIR/current"
 echo "VERSION=$TS"
 # Reload the unit if systemd is available; tolerate environments without
-# systemd (handy in containers / tests).
+# systemd (handy in containers / tests). A FAILED restart fails the
+# deploy — reporting success while the old code keeps running would be
+# a lie the operator discovers at the worst possible time.
 if command -v systemctl >/dev/null 2>&1; then
   if systemctl is-enabled --quiet ia2 2>/dev/null; then
-    sudo systemctl restart ia2 || systemctl --user restart ia2 || true
+    if sudo -n systemctl restart ia2 2>/dev/null || systemctl --user restart ia2 2>/dev/null; then
+      echo "RESTARTED=ia2"
+    else
+      echo "ERROR: deployed files but FAILED to restart the ia2 unit — the edge still runs the previous version" >&2
+      exit 3
+    fi
   else
-    echo "(ia2.service not enabled — install it once via infra/install.sh)" >&2
+    echo "(ia2.service not enabled — install it once via infra/install.sh; the new version is staged but nothing restarted)" >&2
   fi
 fi
 "#,
@@ -764,6 +821,144 @@ fn first_line(s: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Hermetic end-to-end run of `remote_deploy_script` — the exact
+    /// bytes we ssh to edges — under a local bash with a tar stream on
+    /// stdin, against a tmpdir INSTALL_DIR. macOS `mv` lacks GNU's
+    /// `-Tf`, so the test PATH carries a tiny shim that emulates the
+    /// one invocation shape the script uses (replace a symlink).
+    fn run_deploy_script(
+        install_dir: &std::path::Path,
+        script: &str,
+        tar_dir: &std::path::Path,
+        tar_args: &[&str],
+    ) -> std::process::Output {
+        use std::io::Write as _;
+        use std::process::{Command as StdCommand, Stdio as StdStdio};
+
+        // PATH shim dir with a GNU-flavoured `mv`.
+        let shim = install_dir.join(".shim");
+        std::fs::create_dir_all(&shim).unwrap();
+        let mv = shim.join("mv");
+        std::fs::write(
+            &mv,
+            "#!/bin/bash\nif [ \"$1\" = \"-Tf\" ]; then rm -rf \"$3\"; exec /bin/mv \"$2\" \"$3\"; fi\nexec /bin/mv \"$@\"\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&mv, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let tar_bytes = StdCommand::new("tar")
+            .arg("-cf")
+            .arg("-")
+            .args(host_tar_metadata_flags())
+            .arg("-C")
+            .arg(tar_dir)
+            .args(tar_args)
+            .output()
+            .unwrap();
+        assert!(tar_bytes.status.success(), "local tar failed");
+
+        let path = format!(
+            "{}:{}",
+            shim.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let mut child = StdCommand::new("bash")
+            .arg("-c")
+            .arg(script)
+            .env("PATH", path)
+            .stdin(StdStdio::piped())
+            .stdout(StdStdio::piped())
+            .stderr(StdStdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(&tar_bytes.stdout)
+            .unwrap();
+        drop(child.stdin.take());
+        child.wait_with_output().unwrap()
+    }
+
+    #[test]
+    fn deploy_script_extracts_swaps_symlink_and_prints_version() {
+        let tmp = tempfile::tempdir().unwrap();
+        let install = tmp.path().join("ia2");
+        std::fs::create_dir_all(&install).unwrap();
+
+        // A minimal "project" dir + a fake runtime binary to stream in.
+        let stage = tmp.path().join("stage");
+        std::fs::create_dir_all(stage.join("myproj/pous")).unwrap();
+        std::fs::write(stage.join("myproj/project.toml"), "name = \"myproj\"\n").unwrap();
+        std::fs::write(stage.join("ia2-runtime"), "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                stage.join("ia2-runtime"),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        }
+
+        let script = remote_deploy_script(
+            install.to_str().unwrap(),
+            "myproj",
+            Some("ia2-runtime"),
+            None,
+        );
+        let out = run_deploy_script(&install, &script, &stage, &["myproj", "ia2-runtime"]);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "script failed: status={:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            out.status
+        );
+
+        // VERSION= printed, version dir laid out, symlink swapped.
+        let version = stdout
+            .lines()
+            .rev()
+            .find_map(|l| l.strip_prefix("VERSION="))
+            .expect("script must print VERSION=");
+        let vdir = install.join("versions").join(version);
+        assert!(
+            vdir.join("project/project.toml").is_file(),
+            "project normalised"
+        );
+        assert!(vdir.join("runtime").is_file(), "binary renamed to runtime");
+        let current = std::fs::read_link(install.join("current")).unwrap();
+        assert_eq!(current, vdir, "current symlink points at the new version");
+    }
+
+    #[test]
+    fn deploy_script_fails_loudly_without_runtime_binary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let install = tmp.path().join("ia2");
+        std::fs::create_dir_all(&install).unwrap();
+        let stage = tmp.path().join("stage");
+        std::fs::create_dir_all(stage.join("myproj")).unwrap();
+        std::fs::write(stage.join("myproj/project.toml"), "name = \"myproj\"\n").unwrap();
+
+        // No binary in the stream and no prior `current` to carry from.
+        let script = remote_deploy_script(install.to_str().unwrap(), "myproj", None, None);
+        let out = run_deploy_script(&install, &script, &stage, &["myproj"]);
+        assert_eq!(out.status.code(), Some(2), "documented exit for no-runtime");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("no runtime binary"),
+            "expected the no-runtime message, got:\n{stderr}"
+        );
+        // And crucially: `current` was never flipped.
+        assert!(!install.join("current").exists());
+    }
 
     #[test]
     fn sh_squote_neutralizes_command_substitution() {

@@ -5,6 +5,7 @@ mod events;
 mod hmi_routes;
 mod library;
 mod routes;
+mod runtime_routes;
 mod state;
 
 use std::net::SocketAddr;
@@ -115,9 +116,22 @@ async fn main() -> anyhow::Result<()> {
         .or_else(|| {
             let dev_default = PathBuf::from("library");
             dev_default.is_dir().then_some(dev_default)
+        })
+        .or_else(|| {
+            // Installed layout: `install-skill.sh` copies the repo's
+            // library/ to ~/.local/share/ia2/library so a server
+            // started from any CWD still has the registry. Without
+            // this, `cs library import` 404s after a standard install.
+            let home = std::env::var_os("HOME").map(PathBuf::from)?;
+            let installed = home.join(".local/share/ia2/library");
+            installed.is_dir().then_some(installed)
         });
-    if let Some(dir) = &library_dir {
-        tracing::info!(library_dir = %dir.display(), "FB-library registry enabled");
+    match &library_dir {
+        Some(dir) => tracing::info!(library_dir = %dir.display(), "FB-library registry enabled"),
+        None => tracing::warn!(
+            "FB-library registry DISABLED — no ./library, ~/.local/share/ia2/library, \
+             --library-dir or IA2_LIBRARY_DIR (`cs library import` will 404)"
+        ),
     }
     let state = AppState::new(
         demo_slave.clone(),
@@ -280,20 +294,45 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/stop", post(routes::stop))
         .route("/api/events", get(routes::events))
         // Synchronous runtime queries — agent-friendly alternatives to SSE.
-        .route("/api/runtime/snapshot", get(routes::runtime_snapshot))
-        .route("/api/runtime/status", get(routes::runtime_status))
+        .route(
+            "/api/runtime/snapshot",
+            get(runtime_routes::runtime_snapshot),
+        )
+        .route("/api/runtime/status", get(runtime_routes::runtime_status))
         // Debug control trio
-        .route("/api/runtime/pause", post(routes::runtime_pause))
-        .route("/api/runtime/resume", post(routes::runtime_resume))
-        .route("/api/runtime/step", post(routes::runtime_step))
-        .route("/api/runtime/forces", get(routes::list_runtime_forces))
+        .route("/api/runtime/pause", post(runtime_routes::runtime_pause))
+        .route("/api/runtime/resume", post(runtime_routes::runtime_resume))
+        .route("/api/runtime/step", post(runtime_routes::runtime_step))
+        .route(
+            "/api/runtime/forces",
+            get(runtime_routes::list_runtime_forces),
+        )
         .route(
             "/api/runtime/forces/{name}",
-            post(routes::force_runtime_variable).delete(routes::unforce_runtime_variable),
+            post(runtime_routes::force_runtime_variable)
+                .delete(runtime_routes::unforce_runtime_variable),
         )
         .route(
             "/api/runtime/variables/{name}",
-            post(routes::write_runtime_variable),
+            post(runtime_routes::write_runtime_variable),
+        )
+        // Historian + alarm state (shared monitor layer; the edge
+        // runtime serves the same shapes at /history and /alarms).
+        .route("/api/runtime/history", get(runtime_routes::runtime_history))
+        .route("/api/runtime/alarms", get(runtime_routes::runtime_alarms))
+        .route(
+            "/api/runtime/alarms/{id}/ack",
+            post(runtime_routes::runtime_alarm_ack),
+        )
+        .route(
+            "/api/runtime/alarms-journal",
+            get(runtime_routes::runtime_alarm_journal),
+        )
+        // Alarm definitions (alarms.toml) — project config, same
+        // get→edit→set shape as iomap/tasks/northbound.
+        .route(
+            "/api/alarms",
+            get(routes::get_alarms).put(routes::put_alarms),
         )
         // Agent activity heartbeat — transient one-off path; the
         // overlay flashes on then ages out after TRANSIENT_TTL.

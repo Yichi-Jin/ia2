@@ -80,6 +80,9 @@ export type EdgeStatus = {
   fault?: string | null
   mode?: RuntimeMode | null
   device_health?: DeviceHealth[] | null
+  /** Standing alarm count from the runtime's alarm engine (0 / absent
+   *  = none). Drives the shell's compact "N ALARMS" chip. */
+  alarms_standing?: number | null
 }
 
 /** Map the edge /status payload to the host seam's runtime state.

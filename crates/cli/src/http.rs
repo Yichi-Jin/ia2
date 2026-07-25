@@ -1,63 +1,271 @@
 //! HTTP plumbing shared by every online subcommand: a no-proxy `ureq`
-//! agent, JSON verb helpers, the `--project` routing header, and the
-//! small `ServerOpt` / `print_json` conveniences the handlers lean on.
+//! agent, JSON/text verb helpers that PRESERVE the server's error body,
+//! the `--project` routing header, and exit-code mapping.
+//!
+//! The error contract (see `MEMORY/principles.md`): the server writes
+//! human-actionable error bodies ("missing field `application`", …).
+//! Every helper here surfaces that body verbatim and maps the HTTP
+//! status onto the CLI's exit-code convention:
+//!   * 4xx — the request was wrong (fixable by the caller) → exit 2
+//!   * 5xx — the server failed → exit 3
+//!   * transport (refused / timeout / DNS) → exit 3
 
 use anyhow::{Context, Result};
 
-/// The shared `--server URL` option, flattened into every online
-/// subcommand so the flag name and default stay identical everywhere.
-#[derive(clap::Args, Debug)]
-pub(crate) struct ServerOpt {
-    /// Base URL of the IA2 HTTP server to talk to. Defaults to the
-    /// local server; point it at an edge box (e.g. via an SSH-forwarded
-    /// port) to reach a remote runtime.
-    #[arg(long, default_value = "http://127.0.0.1:3001")]
+/// Base URL + routing context for one CLI invocation. Built once in
+/// `main` from the global `--server` / `--project` flags and threaded
+/// through every command so there is exactly one place that speaks HTTP.
+#[derive(Clone, Debug)]
+pub(crate) struct Client {
     pub server: String,
+    pub project: Option<String>,
+}
+
+/// A failed HTTP call, with everything the agent needs to fix it.
+#[derive(Debug)]
+pub(crate) enum ApiError {
+    /// The server answered with a non-2xx status. `body` is the
+    /// server's error text (its whole point is to be shown).
+    Status {
+        method: &'static str,
+        url: String,
+        code: u16,
+        body: String,
+    },
+    /// No HTTP conversation happened (connection refused, timeout…).
+    Transport {
+        method: &'static str,
+        url: String,
+        detail: String,
+    },
+}
+
+impl std::fmt::Display for ApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ApiError::Status {
+                method,
+                url,
+                code,
+                body,
+            } => {
+                let body = body.trim();
+                if body.is_empty() {
+                    write!(f, "{method} {url}: HTTP {code}")
+                } else {
+                    write!(f, "{method} {url}: HTTP {code}\n{body}")
+                }
+            }
+            ApiError::Transport {
+                method,
+                url,
+                detail,
+            } => write!(
+                f,
+                "{method} {url}: {detail}\n(is the server running? start it with `ia2-server` \
+                 or `cargo run -p server`)"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ApiError {}
+
+impl ApiError {
+    /// CLI exit code for this failure: 2 when the caller can fix the
+    /// request (4xx), 3 when the infrastructure is at fault.
+    pub fn exit_code(&self) -> i32 {
+        match self {
+            ApiError::Status { code, .. } if (400..500).contains(code) => 2,
+            _ => 3,
+        }
+    }
+}
+
+/// A caller-fixable input problem (bad resource path, unreadable
+/// `--from` file, malformed JSON body). Exits 2, like clap usage
+/// errors — distinct from infrastructure failures (exit 3).
+#[derive(Debug)]
+pub(crate) struct UsageError(pub anyhow::Error);
+
+impl std::fmt::Display for UsageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:#}", self.0)
+    }
+}
+
+impl std::error::Error for UsageError {}
+
+impl UsageError {
+    pub fn wrap(e: anyhow::Error) -> anyhow::Error {
+        anyhow::Error::new(UsageError(e))
+    }
+}
+
+/// Request body variants the IA2 API actually uses.
+pub(crate) enum Body<'a> {
+    None,
+    Json(&'a serde_json::Value),
+    /// POU source — `save_pou` takes text/plain, not JSON.
+    Text(&'a str),
+}
+
+impl Client {
+    pub fn new(server: String, project: Option<String>) -> Self {
+        Self { server, project }
+    }
+
+    /// Absolute URL for an API path (`/api/...`).
+    pub fn url(&self, path: &str) -> String {
+        format!("{}{}", self.server, path)
+    }
+
+    pub fn get(&self, path: &str) -> Result<serde_json::Value> {
+        self.request("GET", path, Body::None, None)
+    }
+
+    pub fn post(&self, path: &str, body: &serde_json::Value) -> Result<serde_json::Value> {
+        self.request("POST", path, Body::Json(body), None)
+    }
+
+    pub fn put(&self, path: &str, body: &serde_json::Value) -> Result<serde_json::Value> {
+        self.request("PUT", path, Body::Json(body), None)
+    }
+
+    pub fn put_text(&self, path: &str, body: &str) -> Result<serde_json::Value> {
+        self.request("PUT", path, Body::Text(body), None)
+    }
+
+    pub fn delete(&self, path: &str) -> Result<serde_json::Value> {
+        self.request("DELETE", path, Body::None, None)
+    }
+
+    /// Does the resource answer 2xx to GET? 404 → Ok(false); any other
+    /// failure (transport, 5xx, 4xx≠404) propagates, so "server down"
+    /// never masquerades as "doesn't exist yet".
+    pub fn exists(&self, path: &str) -> Result<bool> {
+        match self.get(path) {
+            Ok(_) => Ok(true),
+            Err(e) => match e.downcast_ref::<ApiError>() {
+                Some(ApiError::Status { code: 404, .. }) => Ok(false),
+                _ => Err(e),
+            },
+        }
+    }
+
+    /// One HTTP round-trip. `timeout` overrides the default 30 s (the
+    /// deploy path passes 600 s — tar+ssh can take minutes).
+    pub fn request(
+        &self,
+        method: &str,
+        path: &str,
+        body: Body<'_>,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<serde_json::Value> {
+        let url = self.url(path);
+        // `method` lives for the whole error's lifetime; leak-free
+        // static mapping for the common verbs.
+        let method_static: &'static str = match method.to_ascii_uppercase().as_str() {
+            "GET" => "GET",
+            "POST" => "POST",
+            "PUT" => "PUT",
+            "DELETE" => "DELETE",
+            "PATCH" => "PATCH",
+            other => anyhow::bail!("unsupported HTTP method `{other}`"),
+        };
+
+        let mut req = http_agent().request(method_static, &url);
+        if let Some(t) = timeout {
+            req = req.timeout(t);
+        }
+        if let Some(p) = &self.project {
+            req = req.set("X-IA2-Project", p);
+        }
+
+        let outcome = match body {
+            Body::None => req.call(),
+            Body::Json(v) => req.set("Content-Type", "application/json").send_json(v),
+            Body::Text(s) => req.set("Content-Type", "text/plain").send_string(s),
+        };
+
+        let resp = match outcome {
+            Ok(resp) => resp,
+            Err(ureq::Error::Status(code, resp)) => {
+                // THE load-bearing line: read the server's error body
+                // instead of discarding it. This is what turns
+                // "HTTP 422" into "missing field `application`".
+                let body = resp.into_string().unwrap_or_default();
+                return Err(ApiError::Status {
+                    method: method_static,
+                    url,
+                    code,
+                    body,
+                }
+                .into());
+            }
+            Err(ureq::Error::Transport(t)) => {
+                return Err(ApiError::Transport {
+                    method: method_static,
+                    url,
+                    detail: t.to_string(),
+                }
+                .into());
+            }
+        };
+
+        // 2xx. Most endpoints answer JSON; tolerate empty bodies.
+        let text = resp
+            .into_string()
+            .with_context(|| format!("reading response from {url}"))?;
+        if text.trim().is_empty() {
+            return Ok(serde_json::Value::Null);
+        }
+        serde_json::from_str(&text)
+            .with_context(|| format!("decoding JSON from {url} (got: {})", truncate(&text, 200)))
+    }
+}
+
+fn truncate(s: &str, n: usize) -> String {
+    if s.len() <= n {
+        return s.to_string();
+    }
+    let mut end = n;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &s[..end])
 }
 
 /// Pretty-print a serialisable value as JSON on stdout and return the
-/// clean-success exit code. Collapses the `println!("{}",
-/// serde_json::to_string_pretty(&v)?); Ok(0)` tail every online
-/// subcommand handler ends with.
+/// clean-success exit code.
 pub(crate) fn print_json<T: serde::Serialize>(v: &T) -> Result<i32> {
     println!("{}", serde_json::to_string_pretty(v)?);
     Ok(0)
 }
 
-/// Shared helper: read a JSON document from a file path, or from
-/// stdin if `from == "-"`. Used by every `set --from` subcommand
-/// so the shape is consistent (matches what `cs pou save` already
-/// does for source text).
-pub(crate) fn read_json_blob(from: &str) -> Result<serde_json::Value> {
+/// Read a body from a file path, or from stdin if `from == "-"`.
+pub(crate) fn read_blob(from: &str) -> Result<String> {
     use std::io::Read;
-    let bytes = if from == "-" {
+    if from == "-" {
         let mut buf = String::new();
         std::io::stdin()
             .read_to_string(&mut buf)
             .context("reading stdin")?;
-        buf.into_bytes()
+        Ok(buf)
     } else {
-        std::fs::read(from).with_context(|| format!("reading {from}"))?
-    };
-    serde_json::from_slice(&bytes).with_context(|| format!("parsing JSON from {from}"))
+        std::fs::read_to_string(from).with_context(|| format!("reading {from}"))
+    }
 }
 
-pub(crate) fn put_json(url: &str, body: &impl serde::Serialize) -> Result<serde_json::Value> {
-    let resp = with_project_header(http_agent().put(url))
-        .set("Content-Type", "application/json")
-        .send_json(body)
-        .map_err(|e| anyhow::anyhow!("PUT {url}: {e}"))?;
-    let value: serde_json::Value = resp
-        .into_json()
-        .map_err(|e| anyhow::anyhow!("decode JSON from {url}: {e}"))?;
-    Ok(value)
+/// Read + parse a JSON body from a file path or stdin (`-`).
+pub(crate) fn read_json_blob(from: &str) -> Result<serde_json::Value> {
+    let text = read_blob(from)?;
+    serde_json::from_str(&text).with_context(|| format!("parsing JSON from {from}"))
 }
 
-/// Tiny URL-component escaper. Variable names should be IEC identifiers
-/// (alphanumeric + `_`), but operators sometimes write `instance.pin`
-/// in `cs runtime force foo.bar` — the dot is safe but slashes
-/// wouldn't be. Cover the common cases without pulling a full
-/// percent-encoding crate.
+/// Tiny URL-component escaper. Encodes everything outside
+/// `[A-Za-z0-9_.~-]` — notably `/`, so nested resource names travel as
+/// `%2F` the way the API expects.
 pub(crate) fn url_encode(s: &str) -> String {
     s.chars()
         .map(|c| {
@@ -72,72 +280,14 @@ pub(crate) fn url_encode(s: &str) -> String {
 
 /// Build a no-proxy ureq Agent. ureq 2.x auto-picks up `HTTP_PROXY` /
 /// `HTTPS_PROXY` env vars at request time, which routes our localhost
-/// API traffic through the user's developer proxy (Clash etc.). Users
-/// running a system-wide proxy see "Header field didn't end with \n"
-/// because their proxy speaks SOCKS / Trojan, not HTTP. Building an
-/// explicit Agent with no proxy fixes it.
-///
-/// We cache the Agent in a OnceLock so each `cs` invocation pays the
-/// build cost once even if it makes several requests.
+/// API traffic through the user's developer proxy (Clash etc.). An
+/// explicit Agent with no proxy keeps API calls direct.
 pub(crate) fn http_agent() -> &'static ureq::Agent {
     use std::sync::OnceLock;
     static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
     AGENT.get_or_init(|| {
         ureq::AgentBuilder::new()
-            // No `.proxy(...)` call — ureq treats absence as "direct
-            // connection". Without this Agent, the static `ureq::post(...)`
-            // path defaults to reading proxy from env.
             .timeout(std::time::Duration::from_secs(30))
             .build()
     })
-}
-
-/// Stores the `--project NAME` value parsed off the command line.
-/// When present, every HTTP request adds an `X-IA2-Project` header
-/// so the server routes the call to the named project; otherwise
-/// the header is omitted and the server uses its active fallback
-/// (back-compat with all the existing single-window flows).
-pub(crate) static PROJECT_OVERRIDE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-
-/// Wrap a `ureq::Request` so it carries the X-IA2-Project header when
-/// the user passed `--project NAME`. The builder pattern means each
-/// call site is a one-line `with_project_header(http_agent().post(url))`
-/// or similar.
-fn with_project_header(req: ureq::Request) -> ureq::Request {
-    if let Some(name) = PROJECT_OVERRIDE.get() {
-        req.set("X-IA2-Project", name)
-    } else {
-        req
-    }
-}
-
-pub(crate) fn post_json(url: &str, body: &impl serde::Serialize) -> Result<serde_json::Value> {
-    let resp = with_project_header(http_agent().post(url))
-        .set("Content-Type", "application/json")
-        .send_json(body)
-        .map_err(|e| anyhow::anyhow!("POST {url}: {e}"))?;
-    let value: serde_json::Value = resp
-        .into_json()
-        .map_err(|e| anyhow::anyhow!("decode JSON from {url}: {e}"))?;
-    Ok(value)
-}
-
-pub(crate) fn get_json(url: &str) -> Result<serde_json::Value> {
-    let resp = with_project_header(http_agent().get(url))
-        .call()
-        .map_err(|e| anyhow::anyhow!("GET {url}: {e}"))?;
-    let value: serde_json::Value = resp
-        .into_json()
-        .map_err(|e| anyhow::anyhow!("decode JSON from {url}: {e}"))?;
-    Ok(value)
-}
-
-pub(crate) fn delete_json(url: &str) -> Result<serde_json::Value> {
-    let resp = with_project_header(http_agent().delete(url))
-        .call()
-        .map_err(|e| anyhow::anyhow!("DELETE {url}: {e}"))?;
-    let value: serde_json::Value = resp
-        .into_json()
-        .map_err(|e| anyhow::anyhow!("decode JSON from {url}: {e}"))?;
-    Ok(value)
 }

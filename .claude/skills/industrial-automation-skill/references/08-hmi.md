@@ -1,7 +1,7 @@
 # HMI — generating operator screens
 
 A screen is one JSON document under the project's `hmi/` directory,
-addressed by slug like a POU (`cs hmi get overview`). You author it the way
+addressed by slug like a POU (`cs get hmi/overview`). You author it the way
 you author everything else in IA2: through the CLI against the running
 server, with the IDE reflecting every change live. The intended rhythm is
 **generate a baseline, then reshape it element by element** — each `cs hmi
@@ -22,9 +22,9 @@ same project; your job is the creative pass on top of it. If the screen
 already exists, generate returns 409 unless you pass `--force` — never
 force over a screen a human may have curated without asking.
 
-Then look before you edit. `cs hmi get overview` prints the document;
-`cs hmi symbols` prints the palette contract (each built-in symbol's
-bindable keys, props and default size); `cs hmi check overview` validates
+Then look before you edit. `cs get hmi/overview` prints the document;
+`cs get hmi-symbols` prints the palette contract (each built-in symbol's
+bindable keys, props and default size); `cs check hmi/overview` validates
 structure and warns about bindings that name variables no POU declares.
 With the picture in hand, reshape incrementally:
 
@@ -67,8 +67,10 @@ shows real values, which is the strongest self-review available.
 
 Nodes are a closed set: `group` (absolute positioning only — flow
 layouts are retired; lay children out with coordinates), `text`,
-`value`, `symbol`, `trend`, `alarmbar`, `button`, `input`, `nav`, `shape`
-(`rect` / `ellipse` / `line` / `polyline`).
+`value`, `symbol`, `trend`, `alarmbar`, `alarmlist`
+(`{"type":"alarmlist","max_rows":N}` — an alarm-summary table with
+per-row ack, the multi-row companion to the single-line `alarmbar`),
+`button`, `input`, `nav`, `shape` (`rect` / `ellipse` / `line` / `polyline`).
 Coordinates live on a fixed grid (default 1280×800, snap 8) that every
 client letterboxes identically. `bind` maps a prop to a variable — a bare
 name in the common case, or `{"variable":"x_raw","expr":"x / 100",
@@ -141,7 +143,7 @@ area, reading left-to-right in flow order; use `level` honestly (1 plant
 overview → 4 diagnostic detail) and `nav` nodes to descend, rather than
 cramming levels together.
 
-Seventeen symbols (see `cs hmi symbols` for each one's contract). Beyond the
+Seventeen symbols (see `cs get hmi-symbols` for each one's contract). Beyond the
 original nine, reach for: `analog` — the moving analog indicator ISA-101
 prefers over gauges (scale + shaded normal band via `lo`/`hi` props + live
 pointer + `sp` bind for the setpoint tick); `bar` — linear fill, `h`/`v`;
@@ -157,7 +159,7 @@ drop the animation, not the meaning).
 
 ## The screens travel with the project — the edge serves them
 
-`cs edge deploy` ships the whole project directory, `hmi/` included —
+`cs deploy <edge>` ships the whole project directory, `hmi/` included —
 plus the built web assets when the IDE server has them — so whatever
 screens exist at deploy time are exactly what the edge box has. The
 standard systemd unit starts the runtime with `--static-dir`, which
@@ -165,7 +167,8 @@ serves a standalone operator panel on the runtime's port: `/hmi` lists
 the deployed screens and `/hmi/<screen>` renders one live against that
 runtime's own `/events` and `/write` — same canvas, same confirm flows
 as the IDE, no IDE required. The default bind is loopback (the ssh-tunnel
-trust perimeter), so reach it through `cs edge attach`'s tunnel, or widen
+trust perimeter), so reach it through the tunnel `cs api POST
+/api/edges/<edge>/attach` opens (`detach` to close), or widen
 `--bind` in the unit as a deliberate ops decision when operator tablets
 need direct access. The panel is read-only as a document (no arrange, no
 ops); to change a screen, edit it in the project and redeploy.

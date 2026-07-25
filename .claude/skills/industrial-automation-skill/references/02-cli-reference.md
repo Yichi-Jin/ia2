@@ -1,192 +1,159 @@
-# CLI reference (`cs`)
+# `cs` CLI reference
 
-The binary is `cs`. In a dev checkout it's `target/release/cs` (build with `cargo build -p ia2-cli --release`); installed, it's on `$PATH`. Set a variable once per session:
+The surface is bash-sized on purpose: **five meta-primitives** cover
+every resource (present and future), and a short list of **domain
+verbs** carries the semantics a generic verb shouldn't blur. If you
+remember one thing: *resources are slash-paths, and `ls/get/set/rm`
+work on all of them the same way.*
 
-```bash
-CS="${CS:-cs}"   # on PATH after install; in a checkout: ./target/release/cs
-SRV="http://127.0.0.1:60349"   # discover the real port — see checklists/first-contact.md
+Global flags (valid on every command):
+
+- `--server URL` — default `http://127.0.0.1:3001`.
+- `--project NAME` — target one open project on a multi-project server
+  (adds `X-IA2-Project` to every request, no exceptions).
+- `--json` — machine output. Commands whose output is inherently JSON
+  (`get`, `api`, `runtime snapshot`, …) emit JSON regardless.
+
+Exit codes (uniform, enforced): `0` success · `1` problems in YOUR
+content (check diagnostics, failed probe, remote deploy failure, sim
+expectation failed) · `2` bad request — usage errors AND HTTP 4xx, with
+the server's reason printed verbatim on stderr · `≥3` infrastructure
+(server down, 5xx). A 422 like ``missing field `application` `` reaches
+you word-for-word — read stderr before retrying anything.
+
+Heartbeat rule: MUTATING commands announce to the IDE overlay
+(`set`, `rm`, `api` non-GET, `run`, `stop`, `deploy`, `runtime`
+pause/step/force/write/ack, `hmi op/generate`, `library import`,
+`project create/open/close`, `sim run`). Reads (`ls`, `get`, `check`,
+`probe`, `runtime status/snapshot`, …) stay silent — querying isn't
+operating.
+
+## The quartet — any resource, four verbs
+
+```
+cs ls                          # resource-kind overview (start here)
+cs ls pous|devices|edges|hmi|library|projects|device-catalog
+cs get <path>                  # read one resource
+cs set <path> [--from f|-]     # create-or-replace (upsert)
+cs rm  <path>                  # delete (trailing / = folder)
 ```
 
-## Global flags
+Path grammar: first segment = resource kind; the rest is the resource's
+own slash-path (the same one it has on disk and in the API). Nested
+names are fine (`pous/lib/pid/fb_pid`).
 
-| Flag | Meaning |
-|---|---|
-| `--project NAME` | Target a specific open project. **Global** — works on every subcommand. Omit when only one project is open. |
-| `--server URL` | Server base URL. Default `http://127.0.0.1:3001`; override when the server runs elsewhere. |
-| `--json` | Machine output on stdout (most read subcommands). |
+| Path | get | set | notes |
+|---|---|---|---|
+| `pous/<slug>[.st\|.ld.json\|.fbd.json\|.sfc.json]` | prints RAW SOURCE (redirect to a file) | body = raw source via `--from f\|-`; creating a NEW POU needs the extension (that's where the language comes from) + optional `--type function_block` | `cs get pous/motor --json` for the parsed `{path, source, declarations}` |
+| `pous/<slug>/variables` | declared variables of one POU | — | |
+| `devices/<name>` | full JSON config | `--from cfg.json`; create needs `--protocol modbus\|ethercat\|opcua\|canopen` (or `protocol` in the body) | get → edit → set is THE device workflow |
+| `edges/<name>` | edge config | `--from cfg.json`; create needs `--host user@box` | |
+| `edges/<n>/probe·status·logs·scan·system` | sub-reads over ssh | — | `--query tail=500` on logs |
+| `hmi/<slug>` | full screen document | `--from doc.json`; create takes `--title` | incremental edits: `cs hmi op` (below) |
+| `iomap` · `tasks` · `northbound` · `alarms` | the single config doc | `--from f\|-` (whole-doc replace) | shapes in 06 / 09 |
+| `library` | — (`cs ls library`) | — | `cs rm library/<name>` removes an import |
+| `project` · `project/variables` · `project/pous` | tree / cross-POU indexes | — | |
+| `runtime/status·snapshot·forces·history·alarms·alarms-journal` | live runtime reads | — | `--query vars=a,b`, `--query step_ms=500` on history |
+| `hmi-symbols` | the HMI palette contract | — | |
+| `pous/<dir>/` etc. (trailing slash) | — | creates a folder | `cs rm pous/<dir>/` deletes one |
 
-Exit codes: `0` success · `1` clean run but source has errors · `2` usage error · `≥3` infrastructure failure.
+## `cs api` — the escape hatch
 
-## Static analysis (no server needed)
+Any endpoint in `docs/api.md`, no porcelain required:
 
-```bash
-cs check pous/main.st                  # validate one POU; --explain for RST docs; --json
-cs check a.st b.ld.json                # multiple files, aggregated
-cs transpile pous/conveyor.ld.json     # ST that a graphical POU (.ld / .fbd / .sfc.json) lowers to; --with-map (no-op on ST)
-cs symbols pous/main.st                # declared symbols (name/type/direction); also reads .ld / .fbd / .sfc.json; --json
-cs explain P0073                        # full RST doc for an ironplc problem code
-cs project check ~/Documents/IA2/foo   # compile the WHOLE project (every POU + synth CONFIG)
-cs project info  ~/Documents/IA2/foo   # list POUs/devices/edges; --json
+```
+cs api GET  /api/edges/pi/probe
+cs api POST /api/edges/pi/attach
+cs api POST /api/devices/rio/esi-assemble --from -    # {"detected":[16,17]} on stdin (decimal idents)
+cs api POST /api/devices/dcs/opcua-browse --from -    # {"node_id":"ns=2;s=Line1"} (null = ObjectsFolder)
+cs api POST /api/project/migrate-tasks
+cs api GET  /api/edges/pi/logs --query tail=500
 ```
 
-`cs check` / `cs project check` are cheap (compile only, no run). **Run them before every `cs run`.**
+Full API parity is guaranteed by construction — if the GUI can do it,
+`cs api` can. Prefer porcelain when it exists (better output + exit
+semantics).
 
-## Project lifecycle (server)
+## Domain verbs
 
-```bash
-cs project create NAME                 # new project under ~/Documents/IA2/NAME, becomes active
-cs project open  /abs/path/to/project  # add to open set, becomes active (doesn't close others)
-cs project close                       # close the --project (or active); stops its program
-cs project list                        # open projects, active marked with *; --json
+### Validate / inspect (offline where possible)
+
+```
+cs check pous/*.st motor.ld.json     # files check TOGETHER (cross-file FBs resolve)
+cs check hmi/overview                # server-side screen check (structure + variables)
+cs check P0002                       # a problem code prints its full explanation
+cs check bad.st --explain            # human mode + explanations (JSON always carries them)
+cs transpile motor.ld.json [--with-map]   # the ST a graphical POU compiles to
+cs symbols motor.fbd.json [--name pid]    # declared variables / FB instances
+cs project check [dir]               # strongest offline gate: full project compile
+cs project info  [dir]               # offline orientation (POUs/devices/edges)
 ```
 
-## POUs
+### Run / debug (online)
 
-```bash
-# create seeds a minimal compileable skeleton for the language
-cs pou create main          --type program        --language st
-cs pou create safety        --type function_block --language st
-cs pou create conveyor      --type program        --language ld
-cs pou create batch_state   --type program        --language sfc
-cs pou create flow_calc     --type function_block --language fbd
-
-# overwrite source — three input modes
-cs pou save main --from main.st          # from a file
-cs pou save main --stdin <<'ST' ... ST   # from a heredoc (most common for agents)
-echo "$SRC" | cs pou save main           # piped stdin (auto-detected when not a TTY)
-
-cs pou delete main
+```
+cs run [--program NAME [--file path.st]]  # tasks.toml schedule, or one PROGRAM
+cs stop
+cs runtime status [--edge NAME]      # mode + forces (no variable values)
+cs runtime snapshot [--vars a,b] [--edge NAME]   # LIVE VALUES — the read you want
+cs runtime pause | resume | step [N] [--edge NAME]
+cs runtime force <var> <value> [--edge NAME]     # pinned every scan; type-aware encoding
+cs runtime unforce <var> [--edge NAME]
+cs runtime write <var> <value> [--edge NAME]     # one-shot (program may overwrite)
+cs runtime ack <alarm-id>            # acknowledge an alarm (see 09-sim-alarms.md)
 ```
 
-`--type`: `program` | `function_block` | `function`. `--language`: `st` | `ld` | `fbd` | `sfc`.
-LD/FBD/SFC sources are **JSON**, not text — `cs pou save` for those expects the graphical-program JSON shape. For hand-authoring, ST is almost always what you want.
+Value encoding for force/write: human notation — `TRUE`/`FALSE`/`1`/`0`
+for BOOL, `50.0` for REAL (the CLI bit-packs by the variable's live
+type). Negative numbers after `--`: `cs runtime force setpoint -- -5`.
 
-## Devices (Modbus / EtherCAT / OPC UA / CANopen)
+### Simulate (prove behaviour before hardware)
 
-```bash
-cs device create hmi_plc   --protocol modbus      # TCP defaults (127.0.0.1:502)
-cs device create servo_bus --protocol ethercat    # sim NIC "_sim" by default
-cs device create dcs       --protocol opcua       # endpoint opc.tcp://127.0.0.1:4840
-cs device create servo_can --protocol canopen     # sim bus "_sim" by default
-cs device list                                    # name + protocol; --json
-cs device get  hmi_plc                             # full config as JSON (round-trip source)
-cs device set  hmi_plc --from cfg.json             # replace config; --from - reads stdin
-cs device delete hmi_plc
-
-# modular EtherCAT coupler: build channels from its ESI + the modules present
-cs device esi-assemble coupler --idents 0x10,0x20,0x30   # slot order; hex or decimal
-
-# OPC UA: walk the live server's address space to find NodeIds
-cs device opcua-browse dcs                         # ObjectsFolder children + type hints
-cs device opcua-browse dcs --node "ns=2;s=Channel1.Device1"
+```
+cs sim run scenarios/fill.toml [--program NAME] [--trace out.jsonl] [--keep-running] [--no-run]
 ```
 
-To configure channels / switch a Modbus device to RTU / set EtherCAT PDOs, use
-`cs device get NAME` → edit the JSON → `cs device set NAME --from -`. Shapes are in `06-devices-iomap-tasks.md`.
+Exit 0 = every expectation held; 1 = a step failed (the report names
+the step, the deadline, and the last observed value). Scenario
+vocabulary + alarm/history workflow: `references/09-sim-alarms.md`.
 
-`cs device esi-assemble NAME --idents <ids>` is the exception to hand-editing channels: for a device with `bringup = esi_modular`, it parses the device's ESI file, looks up each comma-separated module ident (hex `0x10` or decimal) in slot order, and **replaces** the channel list with the assembled process image. The idents come from the coupler's `0xF050` scan or the modules you physically installed. Full workflow in `06-devices-iomap-tasks.md` § EtherCAT.
+### Deploy / edge
 
-## Edges (deploy targets)
-
-```bash
-cs edge create field_pi --host pi@bottle-line.local
-cs edge list                                       # name + host; --json
-cs edge get  field_pi                              # full config (ssh_port, install_dir, runtime_port…)
-cs edge set  field_pi --from edge.json             # replace; --from - for stdin
-cs edge delete field_pi
-cs deploy field_pi          # tar project → ssh → versioned dir + symlink swap + systemd restart
-cs probe  field_pi          # quick ssh+curl reachability (scan count, uptime, version)
-
-# Introspect a live edge (all over ssh+curl — see transport note):
-cs edge logs   field_pi [--tail N]  # tail the runtime log (EtherCAT discovery, bus health, connect errors); N default 200, cap 2000
-cs edge scan   field_pi             # per-device connect status + discovered EtherCAT topology (index/name/vendor/product/PDI sizes)
-cs edge system field_pi             # the edge's NICs / serial ports / arch — pick a nic or tty for a device
+```
+cs deploy <edge>        # tar → ssh → versioned extract → atomic swap → systemd restart
+cs probe <edge>         # reachability; exit 0/1
 ```
 
-**Transport.** `cs` never reaches the edge runtime directly — the *local* server shells out to your machine's `ssh` (`~/.ssh/config`, keys, agent; `BatchMode=yes`, `StrictHostKeyChecking=accept-new`). Two shapes:
-- **one-shot `ssh host curl 127.0.0.1:<runtime_port>/…`** — used by `probe`, `edge logs/scan/system`, and `runtime … --edge` (below). A fresh ssh per call; fine for pokes, *not* for tight loops.
-- **persistent `ssh -N -L <localport>:127.0.0.1:<runtime_port>`** — a server-managed "attach" tunnel for live streaming (log stream, the web **Edge → Debug** tab's polling). Torn down on `cs edge delete` / project close. Not exposed as a `cs` subcommand.
+Deploy REFUSES to lie: a failed restart, broken tar stream, or missing
+version stamp fails the deploy (`ok:false` + log). install_dir/systemd
+drift surfaces as a structured `warning` field. Attach/detach live
+streaming: `cs api POST /api/edges/<n>/attach` / `detach`.
 
-## IoMap + Tasks (whole-document get/set)
+### HMI authoring actions
 
-```bash
-cs iomap get                # current bindings as JSON
-cs iomap set --from map.json # replace all; --from - reads stdin
-cs tasks get                # current tasks.toml as JSON
-cs tasks set --from t.json   # replace all; --from - reads stdin
+```
+cs hmi generate <slug> [--title T] [--force]   # deterministic baseline from project truth
+cs hmi op <slug> --from ops.json               # incremental structured edits (animate live)
 ```
 
-Both are **replace-the-whole-document** operations — `get`, edit, `set`. There's no per-entry add/remove. Shapes in `06-devices-iomap-tasks.md`.
+CRUD is the quartet (`cs ls hmi`, `cs get/set/rm hmi/<slug>`); palette
+contract is `cs get hmi-symbols`. See `references/08-hmi.md`.
 
-## HMI screens
+### Libraries
 
-```bash
-cs hmi generate overview            # deterministic baseline from project truth (409 if exists; --force)
-cs hmi symbols                      # palette contract: bindable keys + props per built-in symbol
-cs hmi get overview                 # full document JSON
-echo '[{"op":"add_node","node":{...}}]' | cs hmi op overview --from -   # incremental edits, atomic batch
-cs hmi check overview               # structure + variable-existence warnings
-cs hmi list / create / save / delete
+```
+cs ls library                        # registry + import state
+cs library import process-control [--blocks fb_pid.st,fb_ramp.st]
+cs rm library/process-control
 ```
 
-Author screens incrementally — each `op` batch renders live (with a spawn
-animation) in every open IDE canvas. Full workflow + document model:
-`08-hmi.md`.
+### Projects & sessions
 
-## Run + runtime debug
-
-```bash
-cs run                              # run the whole tasks.toml schedule
-cs run --program main               # ad-hoc single-PROGRAM run (synth schedule, tasks.toml untouched)
-cs run --program main --file pous/main.st   # isolated: Monitor scoped to this file; sibling FB/FN files still resolve
-cs stop                             # stop the running program
-
-cs runtime status                   # mode + forces + which project/program is running; --json
-cs runtime pause                    # freeze the plant (no IO, no run_round)
-cs runtime resume
-cs runtime step 20                  # run N cycles then auto-pause
-cs runtime force  setpoint 200      # pin a variable every scan until unforced
-cs runtime unforce setpoint
-cs runtime write  setpoint 200      # one-shot write (program can overwrite next cycle)
+```
+cs ls projects                       # open projects; * marks the active fallback
+cs project create <name>             # → ~/Documents/IA2/<name>/
+cs project open <path> | close
+cs agent run --label "..." -- bash -c '...'    # REQUIRED wrapper for multi-step work
+cs agent enter --label "..." / cs agent leave  # script-managed session variant
 ```
 
-Value encoding for `force`/`write`: the CLI fetches the variable's type from the live snapshot and bit-packs. `TRUE`/`FALSE`/`1`/`0` for BOOL, decimal for INT, decimal float for REAL (IEEE-754 bit pattern sent). **Negative / leading-dash values need a `--` separator** — `cs runtime force -- speed -500` — otherwise clap parses `-500` as a flag and the force silently fails (positives work without it).
-
-**Target an edge runtime with `--edge <name>`.** Every `cs runtime …` verb (`status/pause/resume/step/force/unforce/write`) accepts `--edge field_pi` to drive a *deployed* edge instead of the local server (routed as one-shot `ssh host curl …` — see Edges transport). It's the same surface the web **Edge → Debug** tab uses, so the pokes render in the IDE's agent-takeover overlay. But `force --edge` is a *debug override, not a setpoint channel* — see workflow G in `04-workflows.md` for when **not** to reach for it.
-
-## Agent session (the wrapper you almost always want)
-
-```bash
-# Wrap a whole workflow — banner stays steady with --label for the duration
-cs agent run --label "Building bottling line" -- bash -c '
-  cs project create ...
-  cs pou save ...
-  cs run ...
-'
-
-# Manual session for shell scripts (prefer `run` — it cleans up on Ctrl-C)
-SESSION=$(cs agent enter --label "Long task")
-# ... many cs calls; they auto-attach via IA2_AGENT_SESSION env ...
-cs agent leave --id "$SESSION"
-```
-
-See `03-agent-sessions.md` — this is the single most important pattern in the skill.
-
-## Reading the live SSE event stream
-
-There's no `cs events` subcommand. Tail the stream with `curl`:
-
-```bash
-curl -sN "$SRV/api/events"     # Server-Sent Events: snapshots, mutations, agent activity, started/stopped
-```
-
-For one-shot state, prefer `cs runtime status --json` or `curl -s "$SRV/api/runtime/snapshot"`.
-
-## Northbound (MQTT publishing config)
-
-```bash
-cs northbound get                  # northbound.toml as JSON
-cs northbound set --from nb.json   # replace; --from - for stdin
-```
-
-Shape + topic contract in `06-devices-iomap-tasks.md` § Northbound. The *edge runtime* reads this at startup — `cs deploy` + restart to apply on a box.

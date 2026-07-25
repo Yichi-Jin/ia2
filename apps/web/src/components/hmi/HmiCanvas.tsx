@@ -32,14 +32,24 @@ import {
   resolveOn,
 } from "@/lib/hmi-binding"
 import {
+  historyToSamples,
   pushTimedHistory,
+  seedTimedBuffer,
   windowSlice,
   type TimedSample,
 } from "@/lib/var-history"
+import {
+  alarmStanding,
+  fmtAlarmClock,
+  severityTone,
+  standingCount,
+  type AlarmTone,
+} from "@/lib/alarms"
 import { cn } from "@/lib/utils"
 import { useHmiMutation } from "@/state/hmi-live"
 import { useConnected, useLastSnapshot } from "@/state/live-feed"
-import { TrendChart } from "@/components/charts/TrendChart"
+import { TrendChart, type TrendSeries } from "@/components/charts/TrendChart"
+import type { AlarmState } from "@/types/generated/AlarmState"
 import type { HmiAction } from "@/types/generated/HmiAction"
 import type { HmiDoc } from "@/types/generated/HmiDoc"
 import type { HmiNode } from "@/types/generated/HmiNode"
@@ -155,9 +165,13 @@ export function HmiCanvas({
   // retained for the widest window_s among the nodes referencing it;
   // each node slices its own window at render) ----
   const historyRef = useRef<Map<string, TimedSample[]>>(new Map())
+  const [, bumpSeed] = useState(0)
   useEffect(() => {
     if (!snapshot || !doc) return
-    const t = Date.now() / 1000
+    // Samples ride the snapshot's own time base (scan-relative micros →
+    // seconds) so backfilled history lands on the same axis and merges.
+    if (snapshot.timestamp_us <= 0n) return
+    const t = Number(snapshot.timestamp_us) / 1e6
     for (const [name, windowS] of trendWindows(doc)) {
       const found = lookupVar(snapshot, name)
       if (!found) continue
@@ -172,6 +186,37 @@ export function HmiCanvas({
       pushTimedHistory(buf, t, n, windowS)
     }
   }, [snapshot, doc])
+
+  // Backfill: when the screen's trend/sparkline variables change, seed
+  // their ring buffers from stored history so a reload keeps the trace
+  // instead of starting empty. Best-effort — the live feed fills forward
+  // regardless. Re-runs on every doc reload; already-buffered live
+  // samples are preserved by the merge.
+  useEffect(() => {
+    if (!doc) return
+    const windows = trendWindows(doc)
+    const vars = [...windows.keys()]
+    if (vars.length === 0) return
+    let cancelled = false
+    void host
+      .history(vars, 1000)
+      .then((resp) => {
+        if (cancelled) return
+        for (const s of resp.series) {
+          const windowS = windows.get(s.name) ?? SPARKLINE_WINDOW_S
+          const existing = historyRef.current.get(s.name) ?? []
+          historyRef.current.set(
+            s.name,
+            seedTimedBuffer(existing, historyToSamples(s.points), windowS),
+          )
+        }
+        bumpSeed((n) => n + 1)
+      })
+      .catch(() => {})
+    return () => {
+      cancelled = true
+    }
+  }, [doc, host])
 
   // ---- drag-to-move (Arrange mode) --------------------------------
   // Gesture data lives in the ref (single source of truth — pointerup may
@@ -451,11 +496,12 @@ function CanvasNode({
     visBind !== undefined && (resolveBinding(snapshot, visBind) ?? 1) === 0
   if (hidden && mode === "operate") return null
 
-  const body = renderKind(node, snapshot, historyRef, onAction, host)
+  const body = renderKind(node, snapshot, historyRef, onAction, host, mode)
 
   return (
     <div
       data-hmi-id={node.id}
+      data-hmi-type={node.type}
       className={cn(
         "absolute",
         spawning !== undefined && "hmi-spawn",
@@ -516,6 +562,7 @@ function renderKind(
   historyRef: React.MutableRefObject<Map<string, TimedSample[]>>,
   onAction: (nodeId: string, action: HmiAction, value?: number) => void,
   host: HmiHost,
+  mode: CanvasMode,
 ) {
   switch (node.type) {
     case "group":
@@ -608,15 +655,14 @@ function renderKind(
       )
     }
     case "trend": {
-      const series = node.series.map((s, i) => {
+      const series: TrendSeries[] = node.series.map((s, i) => {
         const buf = windowSlice(
           historyRef.current.get(s.variable) ?? [],
           node.window_s,
         )
         return {
           name: s.label ?? s.variable,
-          values: buf.map((p) => p.v),
-          times: buf.map((p) => p.t),
+          points: buf.map((p) => ({ t: p.t, v: p.v, lo: p.lo, hi: p.hi })),
           color: TREND_COLORS[i % TREND_COLORS.length],
           binary: false,
         }
@@ -633,6 +679,10 @@ function renderKind(
     }
     case "alarmbar":
       return <AlarmBar host={host} />
+    case "alarmlist":
+      return (
+        <AlarmList host={host} maxRows={node.max_rows} operate={mode === "operate"} />
+      )
     case "button": {
       // Optional state feedback: with `bind.on` the button lights while
       // the bound value is truthy (the indicator's lit treatment), so a
@@ -844,6 +894,139 @@ function AlarmBar({ host }: { host: HmiHost }) {
     >
       <span className={cn("size-2 shrink-0 rounded-full", tone.dot)} />
       <span className="truncate">{health.text}</span>
+    </div>
+  )
+}
+
+/** Alarm summary table (the `alarmlist` node) — the operator-surface
+ *  cousin of the Monitor's alarm section. Polls the host every 2 s; the
+ *  backend pre-sorts standing-first. Calm until something stands
+ *  (ISA-101): muted rows, severity colour only on standing ones, and ACK
+ *  buttons only in Operate. `maxRows` caps visible rows (0 = 8). */
+const CANVAS_ALARM_TONE: Record<AlarmTone, { chip: string; text: string }> = {
+  muted: {
+    chip: "bg-muted/60 text-muted-foreground",
+    text: "text-muted-foreground",
+  },
+  warn: { chip: "bg-warn/15 text-warn", text: "text-foreground" },
+  alert: {
+    chip: "bg-destructive/15 text-destructive",
+    text: "text-foreground",
+  },
+}
+
+function AlarmList({
+  host,
+  maxRows,
+  operate,
+}: {
+  host: HmiHost
+  maxRows: number
+  operate: boolean
+}) {
+  const [alarms, setAlarms] = useState<AlarmState[]>([])
+  const [failed, setFailed] = useState(false)
+  useEffect(() => {
+    let cancelled = false
+    const tick = async () => {
+      try {
+        const a = await host.alarms()
+        if (!cancelled) {
+          setAlarms(a)
+          setFailed(false)
+        }
+      } catch {
+        if (!cancelled) setFailed(true)
+      }
+    }
+    void tick()
+    const id = setInterval(tick, 2000)
+    return () => {
+      cancelled = true
+      clearInterval(id)
+    }
+  }, [host])
+
+  const ack = async (id: string) => {
+    // Optimistic; the 2 s poll reconciles.
+    setAlarms((prev) =>
+      prev.map((a) => (a.id === id ? { ...a, acked: true } : a)),
+    )
+    try {
+      await host.ackAlarm(id)
+    } catch {
+      /* next poll re-syncs */
+    }
+  }
+
+  const cap = maxRows > 0 ? maxRows : 8
+  const rows = alarms.slice(0, cap)
+  const hidden = alarms.length - rows.length
+
+  return (
+    <div className="flex h-full w-full flex-col overflow-hidden rounded border border-border bg-card/60">
+      <div className="flex shrink-0 items-center justify-between border-b border-border/70 px-2 py-1 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+        <span>Alarms</span>
+        {alarms.length > 0 && (
+          <span className="font-mono normal-case tracking-normal">
+            {standingCount(alarms)}/{alarms.length}
+          </span>
+        )}
+      </div>
+      {rows.length === 0 ? (
+        <div className="flex flex-1 items-center px-2 py-1 text-[11px] text-muted-foreground/60">
+          {failed ? "Alarms unavailable" : "No active alarms"}
+        </div>
+      ) : (
+        <ul className="min-h-0 flex-1 divide-y divide-border/50 overflow-auto">
+          {rows.map((a) => {
+            const standing = alarmStanding(a)
+            const tone = CANVAS_ALARM_TONE[severityTone(a.severity, standing)]
+            return (
+              <li
+                key={a.id}
+                className={cn(
+                  "flex items-center gap-2 px-2 py-1 text-[11px]",
+                  !standing && "opacity-60",
+                )}
+              >
+                <span
+                  className={cn(
+                    "shrink-0 rounded px-1 py-px font-mono text-[9px] uppercase tracking-wider",
+                    tone.chip,
+                  )}
+                >
+                  {a.severity}
+                </span>
+                <span
+                  className={cn("min-w-0 flex-1 truncate", tone.text)}
+                  title={`${a.variable} — ${a.message}`}
+                >
+                  {a.message}
+                </span>
+                <span className="shrink-0 font-mono text-[9px] tabular-nums text-muted-foreground">
+                  {fmtAlarmClock(a.raised_at_us)}
+                </span>
+                {operate && !a.acked && (
+                  <button
+                    type="button"
+                    onClick={() => void ack(a.id)}
+                    className="shrink-0 rounded border border-border bg-card px-1.5 py-px font-mono text-[9px] uppercase tracking-wider text-muted-foreground hover:text-foreground"
+                    title="Acknowledge"
+                  >
+                    ack
+                  </button>
+                )}
+              </li>
+            )
+          })}
+        </ul>
+      )}
+      {hidden > 0 && (
+        <div className="shrink-0 border-t border-border/60 px-2 py-0.5 text-[9px] text-muted-foreground/60">
+          +{hidden} more
+        </div>
+      )}
     </div>
   )
 }

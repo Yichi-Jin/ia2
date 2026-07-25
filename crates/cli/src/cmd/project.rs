@@ -1,12 +1,13 @@
-//! `cs project` — validate / inspect a project directory, plus the
-//! open-project lifecycle (create / open / close / list) over HTTP.
+//! `cs project` — offline validate / inspect of a project directory,
+//! plus the open-project lifecycle (create / open / close) over HTTP.
+//! Listing open projects is `cs ls projects`.
 
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use project::ProjectStore;
 
-use crate::http::{get_json, post_json, print_json};
+use crate::http::{print_json, Client};
 
 pub(crate) fn cmd_project_check(path: &Path, json: bool) -> Result<i32> {
     let store = open_project(path)?;
@@ -79,73 +80,25 @@ pub(crate) fn cmd_project_info(path: &Path, json: bool) -> Result<i32> {
     Ok(0)
 }
 
-// Wrap the HTTP API so agents call `cs project create foo` instead
-// of `curl -X POST localhost:3001/api/projects -d '{"name":"foo"}'`.
-// Symmetric with `cs project info / check` which already operate on
-// project directories.
-
-pub(crate) fn cmd_project_create(name: &str, server: &str) -> Result<i32> {
-    let resp = post_json(
-        &format!("{server}/api/projects"),
-        &serde_json::json!({ "name": name }),
-    )?;
+pub(crate) fn cmd_project_create(client: &Client, name: &str) -> Result<i32> {
+    let resp = client.post("/api/projects", &serde_json::json!({ "name": name }))?;
     print_json(&resp)
 }
 
-pub(crate) fn cmd_project_open(path: &Path, server: &str) -> Result<i32> {
+pub(crate) fn cmd_project_open(client: &Client, path: &Path) -> Result<i32> {
     let abs = path
         .canonicalize()
         .with_context(|| format!("resolving {}", path.display()))?;
-    let resp = post_json(
-        &format!("{server}/api/projects/open"),
+    let resp = client.post(
+        "/api/projects/open",
         &serde_json::json!({ "path": abs.display().to_string() }),
     )?;
     print_json(&resp)
 }
 
-pub(crate) fn cmd_project_close(server: &str) -> Result<i32> {
-    let resp = post_json(&format!("{server}/api/projects/close"), &())?;
+pub(crate) fn cmd_project_close(client: &Client) -> Result<i32> {
+    let resp = client.post("/api/projects/close", &serde_json::json!({}))?;
     print_json(&resp)
-}
-
-pub(crate) fn cmd_project_list(server: &str, json: bool) -> Result<i32> {
-    let value = get_json(&format!("{server}/api/projects/open-list"))?;
-    if json {
-        return print_json(&value);
-    }
-    // Human-readable: active marked with `*`, names padded into a
-    // column. Path on the right for orientation.
-    let active = value
-        .get("active")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    let projects = value
-        .get("projects")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-    if projects.is_empty() {
-        eprintln!("no projects open");
-        return Ok(0);
-    }
-    let name_width = projects
-        .iter()
-        .filter_map(|p| p.get("name").and_then(|v| v.as_str()).map(str::len))
-        .max()
-        .unwrap_or(0);
-    for p in &projects {
-        let name = p.get("name").and_then(|v| v.as_str()).unwrap_or("?");
-        let path = p.get("path").and_then(|v| v.as_str()).unwrap_or("?");
-        let marker = if name == active { "*" } else { " " };
-        println!("{marker} {name:<name_width$}  {path}");
-    }
-    eprintln!(
-        "{} project{} open · active marked with *",
-        projects.len(),
-        if projects.len() == 1 { "" } else { "s" },
-    );
-    Ok(0)
 }
 
 /// Open a project store at `path`. Resolves `.` to the current working

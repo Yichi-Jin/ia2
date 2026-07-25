@@ -44,7 +44,7 @@ should be obvious.
 - Inline hints over modal tutorials. ("Bind a PROGRAM to a task" → the "Schedule" button next to the editor.)
 - Discoverable affordances. Selected POU should make the Run button mean "run this".
 - Same gesture, same effect. Run button always says what it'll do.
-- Examples ship with the product. `cascade_pid`, `lorenz_attractor`, `polymer_cstr` are demo POUs; they teach by being readable.
+- Examples ship with the product and STAY TRUE: `examples/` holds real, runnable projects (`sim_smoke` is the sim-scenario reference; `eg_gear_incycle`, `nx6_modbus`, `supervisory-demo` cover motion / RTU / DCS-supervision). A doc that names an example that doesn't exist is a bug.
 
 ## 4. Agent-friendly is co-equal with human-friendly
 
@@ -75,29 +75,57 @@ the only path that works offline, in CI, in pre-commit, and inside
 batch refactoring scripts.
 
 **Rules**:
-- **Everything you'd do _before_ runtime starts — validate, transpile,
-  compile, lint, deploy, inspect project — MUST have a `cs` subcommand**.
-  The HTTP equivalent is supplemental, not primary. If a feature only
-  exists in HTTP, that's a regression on this axis.
-- **Anything that requires the running runtime (live values, attach,
-  Run/Stop, SSE streaming) stays HTTP-only**. A CLI wrapper that just
-  proxies to the server isn't a real CLI primitive — don't bother.
+- **Meta-primitives over noun×verb sprawl.** The CLI stays bash-sized:
+  ONE generic resource quartet (`cs ls/get/set/rm <path>`, where the
+  path mirrors the on-disk/API layout) plus ONE raw escape hatch
+  (`cs api METHOD /api/...`) cover every resource — including ones
+  that don't exist yet. Before adding a `cs` subcommand, prove the
+  quartet and `cs api` can't express it; only actions with real domain
+  semantics (safety, exit codes, type-aware encoding: `check`, `run`,
+  `runtime force/write`, `deploy`, `sim run`, `hmi op/generate`,
+  `agent run`) earn a verb. In review, count new leaf subcommands as
+  a cost. This is what makes "everything via CLI" a THEOREM instead
+  of a treadmill: a new server resource is CLI-covered by construction.
+- **One generic proxy IS a primitive; N specialized wrappers are not.**
+  Online operations (live values, debug control, attach) are fine to
+  reach through the CLI because they all flow through the same two
+  code paths (quartet + `api`), not a hand-rolled wrapper each.
+- **Error truthfulness is the contract.** The server writes actionable
+  error bodies; the CLI surfaces them VERBATIM on stderr and maps
+  status onto exit codes: `0` success / `1` problems in the user's
+  content (diagnostics, failed probe/deploy/sim) / `2` bad request —
+  usage errors and HTTP 4xx / `≥3` infrastructure. An agent must never
+  need to guess why a call failed.
 - **`--help` text is written FOR THE AGENT**. Say when to use the tool,
   when NOT to, what to call next. Style reference:
-  `vendor/ironplc/compiler/mcp/src/server.rs` — note how each tool's
-  description tells the agent the right sequencing
-  ("Call check until ok:true, then compile to obtain container_id,
-  then run").
-- **Every subcommand**: supports `--json` for machine output, prints
-  human-readable to stdout by default, errors to stderr. Exit codes
-  follow Unix: `0` success / `1` clean run but found issues (errors
-  in source / failed tests) / `2` usage error / `>2` infrastructure.
+  `vendor/ironplc/compiler/mcp/src/server.rs`.
+- **Global flags, global behaviour**: `--json`, `--server`, `--project`
+  are top-level flags honored by every command — no per-command
+  re-implementation, no command that silently drops one.
 - **No MCP server (yet)**. MCP is a wire format with a specific
-  protocol; CLI is universal. Future work can wrap our CLI as MCP if
-  some agent platform demands it — doing it the other way around
-  (CLI as a thin shim over MCP) would be awkward. The upstream
-  `ironplc-mcp` is a great _design_ reference for tool descriptions
-  and tool sequencing, not necessarily a protocol to copy.
+  protocol; CLI is universal (and cheaper in agent context tokens).
+  Future work can wrap our CLI as MCP if some agent platform demands
+  it — doing it the other way around would be awkward.
+
+## 5. Truthfulness everywhere; proof before hardware
+
+Two doctrines that started in the HMI ("Stop unconfirmed", "no e-stop
+cosplay") now apply to the whole system:
+
+- **Every layer tells the truth about outcomes.** Deploy fails when the
+  service didn't restart, when the tar stream broke, or when the
+  version stamp is missing — never "success with a footnote". The CLI
+  surfaces server error bodies verbatim and exit-codes honestly. Docs
+  that describe unimplemented behaviour (or deny implemented behaviour)
+  are release blockers, same as failing tests: `docs/api.md` coverage
+  is test-enforced, and command examples in the skill must exist.
+- **Behaviour ships with proof.** The loop is generate → `cs check` →
+  `cs project check` → **`cs sim run <scenario>`** → deploy. Logic
+  with dynamics (fills, sequences, interlocks, alarm conditions)
+  carries a scenario in `scenarios/`; alarms are declared in
+  `alarms.toml` next to the logic that can trip them. "It compiles"
+  is not "it works" — an agent that can't demonstrate behaviour in sim
+  has not finished the task.
 
 ## What this rules out
 

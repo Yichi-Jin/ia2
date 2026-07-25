@@ -72,7 +72,7 @@ is curlable.
                         in terminal / CI          MCP wrappers)
 ```
 
-When an agent runs `cs pou create`, the server emits a `Mutation`
+When an agent runs `cs set pous/…`, the server emits a `Mutation`
 event over SSE; the IDE's project tree updates in real time and the
 editor auto-jumps to the new POU. Same in reverse: when a human saves
 a POU in the IDE, an agent's `cs runtime status` sees the new symbol
@@ -96,8 +96,9 @@ modes:
   command name and ages out after 3 s of silence. Fine for one-offs;
   multi-step work should use session mode so the banner doesn't strobe.
 
-Read-only commands (`cs check`, `cs project list`, `cs runtime status`)
-don't trigger the overlay — querying state isn't "operating."
+Read-only commands (`cs check`, `cs ls`, `cs get …`, `cs runtime
+status/snapshot`) don't trigger the overlay — querying state isn't
+"operating."
 
 ## Quickstart
 
@@ -124,40 +125,49 @@ cargo run -p server --release -- --static-dir apps/web/dist
 cargo build -p ia2-cli
 alias cs=./target/debug/cs
 
-# the everyday agent loop
-cs check pous/safe_start.ld.json        # validate any language
-cs project info ~/Documents/IA2/demo    # what's in this project?
+# the mental model is bash-sized: 4 resource verbs + an API escape hatch
+cs ls                                   # what resource kinds exist? (start here)
+cs ls pous                              # enumerate any collection
+cs get devices/plc1                     # read any resource (JSON, or raw POU source)
+cs set devices/plc1 --from cfg.json     # create-or-replace (get → edit → set)
+cs rm  hmi/overview                     # delete
+cs api POST /api/edges/pi/attach        # anything else in docs/api.md — full parity
+
+# author + validate (offline where possible)
+cs check pous/safe_start.ld.json        # validate any language; `cs check P0002` explains a code
 cs project check ~/Documents/IA2/demo   # full compile
+printf '...' | cs set pous/motor.ld.json --from -   # extension picks the language
+cs library import process-control --blocks fb_pid.st
 
-# project CRUD (talks to a running server)
-cs project create my_line               # → ~/Documents/IA2/my_line/
-cs project list                         # open projects; --project NAME targets one
-cs pou create motor --language ld
-cs pou save motor --from motor.ld.json
-cs library import process-control --blocks fb_pid.st  # vendor library blocks; omit --blocks for all
+# wiring / scheduling / alarms — single-doc configs, one shape each
+cs set iomap  --from iomap.json         # variable ↔ device.channel bindings
+cs set tasks  --from tasks.json         # PROGRAM ↔ task schedule
+cs set alarms --from alarms.json        # declarative alarm definitions (alarms.toml)
 
-# devices / wiring / scheduling (get → edit → set, JSON shapes)
-cs device create hmi --protocol modbus  # then `cs device set hmi --from -` for TCP/RTU + channels
-cs iomap set --from iomap.json          # variable ↔ device.channel bindings
-cs tasks set --from tasks.json          # PROGRAM ↔ task schedule
-cs edge create field_pi --host pi@plc.local
-cs deploy field_pi                      # tar → ssh → versioned swap → systemd restart
-
-# runtime control
+# run · simulate · debug
 cs run                                  # schedule everything in tasks.toml
-cs runtime status
+cs sim run scenarios/fill.toml          # PROVE behaviour against the sim device layer — CI-ready
+cs runtime snapshot --vars level,pump   # live values
 cs runtime force pump_pct 50.0          # type-aware: REAL bit-packed, BOOL as 0/1
-cs runtime pause / step / resume
+cs get runtime/alarms && cs runtime ack level_high
+cs get runtime/history --query vars=level   # 1 Hz historian, ~2 h window
 cs stop
 
+# ship it
+cs set edges/field_pi --host pi@plc.local
+cs deploy field_pi                      # tar → ssh → versioned swap → systemd restart — and it
+                                        # FAILS honestly if the unit didn't restart
+
 # wrap a whole multi-step workflow in one steady takeover session
-cs agent run --label "build my_line" -- bash -c 'cs project create my_line; cs pou save ...; cs run'
+cs agent run --label "build my_line" -- bash -c 'cs project create my_line; cs set pous/...; cs run'
 ```
 
-Exit codes follow Unix: `0` clean / `1` source has errors / `2` usage /
-`≥3` infrastructure. Every subcommand supports `--json`. Every
-subcommand's `--help` explains when to call it and what to call next —
-written for agent readers.
+Exit codes follow Unix and are enforced uniformly: `0` clean / `1` your
+content has problems (diagnostics, failed probe/deploy/sim) / `2` bad
+request — including HTTP 4xx, with the server's reason printed verbatim
+on stderr / `≥3` infrastructure. `--json`, `--server` and `--project`
+are global flags. Every command's `--help` explains when to call it and
+what to call next — written for agent readers.
 
 ## Project on disk
 
@@ -179,7 +189,11 @@ written for agent readers.
 JSON for graphical languages (not PLCopen XML) so agents and
 `git diff` can read it. LD / FBD / SFC are transpiled to ST before
 reaching ironplc; the intermediate ST is observable via
-`cs transpile foo.ld.json`.
+`cs transpile foo.ld.json`. `alarms.toml` declares alarm conditions
+(limit + deadband + delay + severity) that the runtime's alarm engine
+evaluates — with an ISA-18.2-shaped ack/journal lifecycle — and
+`scenarios/*.toml` hold `cs sim` scenarios that prove the program's
+behaviour against the simulated device layer before deploy.
 
 ## Edge deployment
 
@@ -203,10 +217,11 @@ The repo ships an agent skill at **`.claude/skills/industrial-automation-skill/`
 When you open this project in Claude Code, the skill auto-loads on
 PLC/automation work (triggers on "ironplc", "modbus", "structured
 text", "PLC", "cs CLI", etc.) and teaches the agent the whole `cs`
-workflow: the mental model, every command, the mandatory
-`cs agent run` session pattern, end-to-end recipes, the exact
-device/iomap/tasks JSON shapes, IEC 61131-3 quirks ironplc actually
-accepts, and a troubleshooting table. It also carries two checklists —
+workflow: the meta-primitive mental model (`ls/get/set/rm` + `api`),
+the mandatory `cs agent run` session pattern, end-to-end recipes
+including scenario simulation and alarms/history, the exact
+device/iomap/tasks/alarms JSON shapes, IEC 61131-3 quirks ironplc
+actually accepts, and a troubleshooting table. It also carries two checklists —
 `first-contact` (find the server port, see what's open) and `handoff`
 (compile clean, release forces, report state) — so an agent starts and
 finishes a task the right way.

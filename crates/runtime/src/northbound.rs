@@ -194,15 +194,17 @@ async fn handle_write(ctx: &NorthboundCtx, payload: &[u8]) {
     }
 }
 
-/// VarSnapshot (display strings) → compact JSON with typed values. The
-/// IDE-side formatter renders `REAL` as `12.5`, `WORD` as `16#1637`,
-/// `BOOL` as `TRUE`/`FALSE`, ints as decimal — decode those so the
-/// platform gets numbers, not strings. Anything unparseable passes
-/// through as a string rather than being dropped.
+/// VarSnapshot → compact JSON with typed values, decoded from the raw
+/// VM slot bits by the shared monitor decoder (`monitor::typed_value`)
+/// — the platform gets numbers/bools straight from the source of
+/// truth, with the display string only as the STRING-type fallback.
 fn snapshot_json(snap: &VarSnapshot) -> String {
     let mut values = serde_json::Map::with_capacity(snap.vars.len());
     for v in &snap.vars {
-        values.insert(v.name.clone(), decode_display_value(&v.type_name, &v.value));
+        values.insert(
+            v.name.clone(),
+            ironplc_bridge::monitor::typed_value(&v.type_name, v.bits, &v.value),
+        );
     }
     serde_json::json!({
         "ts_us": snap.timestamp_us,
@@ -212,53 +214,40 @@ fn snapshot_json(snap: &VarSnapshot) -> String {
     .to_string()
 }
 
-fn decode_display_value(type_name: &str, s: &str) -> serde_json::Value {
-    let t = type_name.to_ascii_uppercase();
-    if t == "BOOL" {
-        return serde_json::Value::Bool(s.eq_ignore_ascii_case("true"));
-    }
-    if let Some(hex) = s.strip_prefix("16#") {
-        if let Ok(n) = u32::from_str_radix(hex, 16) {
-            return serde_json::json!(n);
-        }
-    }
-    if t == "REAL" || t == "LREAL" {
-        if let Ok(f) = s.parse::<f64>() {
-            return serde_json::json!(f);
-        }
-    }
-    if let Ok(i) = s.parse::<i64>() {
-        return serde_json::json!(i);
-    }
-    serde_json::Value::String(s.to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ironplc_bridge::VarValue;
+
+    fn var(name: &str, type_name: &str, value: &str, bits: u64) -> VarValue {
+        VarValue {
+            name: name.into(),
+            type_name: type_name.into(),
+            value: value.into(),
+            bits,
+        }
+    }
 
     #[test]
-    fn display_values_decode_to_typed_json() {
-        assert_eq!(
-            decode_display_value("BOOL", "TRUE"),
-            serde_json::json!(true)
-        );
-        assert_eq!(
-            decode_display_value("BOOL", "FALSE"),
-            serde_json::json!(false)
-        );
-        assert_eq!(
-            decode_display_value("WORD", "16#1637"),
-            serde_json::json!(0x1637)
-        );
-        assert_eq!(
-            decode_display_value("REAL", "12.5"),
-            serde_json::json!(12.5)
-        );
-        assert_eq!(decode_display_value("DINT", "-42"), serde_json::json!(-42));
-        assert_eq!(
-            decode_display_value("STRING", "hello"),
-            serde_json::json!("hello")
-        );
+    fn snapshot_publishes_typed_values_from_bits() {
+        let snap = VarSnapshot {
+            timestamp_us: 42,
+            scan_count: 7,
+            vars: vec![
+                var("run", "BOOL", "TRUE", 1),
+                var("flow", "REAL", "12.5", 12.5f32.to_bits() as u64),
+                var("mask", "WORD", "16#1637", 0x1637),
+                var("delta", "DINT", "-42", (-42i32) as u32 as u64),
+                var("label", "STRING", "'hello'", 0),
+            ],
+        };
+        let json: serde_json::Value = serde_json::from_str(&snapshot_json(&snap)).unwrap();
+        assert_eq!(json["ts_us"], 42);
+        assert_eq!(json["scan"], 7);
+        assert_eq!(json["values"]["run"], serde_json::json!(true));
+        assert_eq!(json["values"]["flow"], serde_json::json!(12.5));
+        assert_eq!(json["values"]["mask"], serde_json::json!(0x1637));
+        assert_eq!(json["values"]["delta"], serde_json::json!(-42));
+        assert_eq!(json["values"]["label"], serde_json::json!("'hello'"));
     }
 }

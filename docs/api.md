@@ -46,7 +46,7 @@ slash-separated under `pous/`, no `.st` extension.
 
 | Method | Path | Purpose |
 |---|---|---|
-| `POST` | `/api/pous` | Create a POU file. Body: `CreatePouRequest { path, type, language }`. `type` is `program` / `function_block` / `function`; `language` currently must be `st`. |
+| `POST` | `/api/pous` | Create a POU file. Body: `CreatePouRequest { path, type, language }`. `type` is `program` / `function_block` / `function`; `language` is `st` / `ld` / `fbd` / `sfc` (picks the on-disk extension). |
 | `POST` | `/api/pous/folders` | Create a folder under `pous/`. Body: `CreateFolderRequest { path }`. |
 | `DELETE` | `/api/pous/folders/{path}` | Delete an empty folder. |
 | `GET` | `/api/pous/{path}` | Read a POU file. Returns `Pou { path, source, declarations: PouDecl[] }`. |
@@ -87,7 +87,7 @@ read-only device-template catalog used to pre-fill devices from a bus scan.
 | `PUT` | `/api/devices/{name}` | Update full device config. Body: `Device`. |
 | `DELETE` | `/api/devices/{name}` | Delete. |
 | `POST` | `/api/devices/{name}/esi-assemble` | Assemble a modular EtherCAT coupler's channels from its ESI file + the modules it reports. Body: `EsiAssembleRequest { detected: u32[] }` (module idents in slot order). Requires the device to be EtherCAT with `bringup = esi_modular`; the assembled channels **replace** the device's channel list. Returns the updated `Device`. |
-| `POST` | `/api/devices/{name}/opcua-browse` | Live-browse one level of an OPC UA device's address space using its own endpoint/auth config. Body: `OpcuaBrowseRequest { node_id? }` (omitted = ObjectsFolder). Returns `OpcuaBrowseNode[]` — NodeId, display name, node class, and for Variables the UA data type plus the channel `data_type` that fits. Backs the editor's NodeId picker and `cs device opcua-browse`. |
+| `POST` | `/api/devices/{name}/opcua-browse` | Live-browse one level of an OPC UA device's address space using its own endpoint/auth config. Body: `OpcuaBrowseRequest { node_id? }` (omitted = ObjectsFolder). Returns `OpcuaBrowseNode[]` — NodeId, display name, node class, and for Variables the UA data type plus the channel `data_type` that fits. Backs the editor's NodeId picker; CLI: `cs api POST /api/devices/<n>/opcua-browse`. |
 
 ## Edges (deploy targets)
 
@@ -161,6 +161,23 @@ the *deployed* edge runtime, proxy the same ops through
 | `POST` | `/api/runtime/forces/{name}` | Pin a variable every cycle until released. Body: `ForceRequest { value }`. Returns `ForceResponse { name, value }`; 404 unknown variable, 409 if stopped. |
 | `DELETE` | `/api/runtime/forces/{name}` | Release a forced variable. Idempotent (200 even if it wasn't forced). |
 
+## Runtime history & alarms
+
+Served by the shared monitor layer (`ironplc_bridge::monitor`): an
+in-memory 1 Hz historian (~2 h window; the edge runtime persists the
+same rings to disk) and the alarm engine over the project's
+`alarms.toml`. Alarm DEFINITIONS are project config (`/api/alarms`
+below, same get→edit→set shape as iomap); alarm STATE lives here.
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/api/runtime/history` | Downsampled history. Query: `vars=a,b` (empty = all), `from_us`, `to_us` (0 = open), `step_ms` (default 1000). Returns `HistoryResponse { series: [{ name, points: [{ t_us, min, max, v }] }], oldest_us, sample_interval_us }`. |
+| `GET` | `/api/runtime/alarms` | Live alarm states, standing-first then severity. Returns `AlarmState[]` (`active`, `acked`, `raised_at_us`, `value_at_raise`, `count`). |
+| `POST` | `/api/runtime/alarms/{id}/ack` | Acknowledge one alarm. Returns the updated `AlarmState`; 404 unknown id. |
+| `GET` | `/api/runtime/alarms-journal` | Most-recent-first event journal (`raised` / `acked` / `returned`). Query: `limit` (default 100, ring-capped at 1000). Returns `AlarmJournalEntry[]`. |
+| `GET` | `/api/alarms` | Read the project's alarm definitions (`alarms.toml`). Returns `AlarmConfig { alarms: AlarmDef[] }`. |
+| `PUT` | `/api/alarms` | Replace the alarm definitions. Rejects duplicate ids and numeric conditions without a `limit`. Applies on the NEXT run. |
+
 ## Agent activity (takeover overlay)
 
 Drives the IDE's "an agent is operating" overlay. See
@@ -194,9 +211,10 @@ been pointed at real hardware yet.
 
 # Coverage
 
-This doc was reconciled against the router on **2026-07-11** — every
-`.route()` in `crates/server/src/main.rs` has a row above, and every route in
-`crates/runtime/src/main.rs` has a row in the Edge runtime table below. When
+Coverage is TEST-ENFORCED, not dated prose: `crates/server/tests/
+api_doc_coverage.rs` fails the build when any `.route()` mounted in
+`crates/server/src/main.rs` (or `crates/runtime/src/main.rs`, for the Edge
+runtime table below) has no row here. When
 you add a route, add its row here in the same change; the generated TypeScript
 types under `apps/web/src/types/generated/` remain the source of truth for
 shapes.
@@ -235,16 +253,20 @@ the debug ops).
 | `GET` | `/health` | Liveness: status, uptime, scan count, plus `fieldbus_healthy` (true only when every configured device's transport is live) and a per-device `devices` health breakdown. |
 | `GET` | `/status` | Project + PROGRAM instances + device list + scan count + last snapshot + debug mode + forces, plus `device_health` (per-device transport health; a `false` entry means that device's inputs are frozen at last-known values) and `fault` (why the scan loop died — VM trap / panic message — `null` while running or after a clean stop). |
 | `GET` | `/events` | SSE stream of `VarSnapshot` (bare — no `AppEvent` wrapper). |
-| `GET` | `/logs?tail=N` | The most recent `tail` (default 200) captured log lines. What `cs edge logs` pulls over the tunnel. |
+| `GET` | `/logs?tail=N` | The most recent `tail` (default 200) captured log lines. What `cs get edges/<n>/logs` pulls over the tunnel. |
 | `GET` | `/logs/stream` | SSE stream of log lines as they're emitted (no backlog; pair with `/logs` for history). |
-| `GET` | `/discover` | Per-device connect reports + discovered EtherCAT topology. Powers `cs edge scan`. |
-| `GET` | `/system` | Edge NICs / serial ports / arch, for authoring device configs against real edge facts. Powers `cs edge system`. |
+| `GET` | `/discover` | Per-device connect reports + discovered EtherCAT topology. Powers `cs get edges/<n>/scan`. |
+| `GET` | `/system` | Edge NICs / serial ports / arch, for authoring device configs against real edge facts. Powers `cs get edges/<n>/system`. |
 | `POST` | `/pause` | Freeze the scan loop (last outputs hold). Returns `{ mode }`. |
 | `POST` | `/resume` | Resume free-running. Returns `{ mode }`. |
 | `POST` | `/step` | Advance N cycles while paused. Body: `{ cycles }`. Returns `{ mode }`. |
 | `POST` | `/write` | One-shot write of a variable. Body: `{ name, value }`. Returns the applied value. |
 | `POST` | `/force` | Pin a variable every cycle until released. Body: `{ name, value }`. |
 | `POST` | `/unforce` | Release a forced variable. Body: `{ name }`. |
+| `GET` | `/history` | Downsampled history, same query/response shape as `/api/runtime/history`. Backed by JSONL segments under the edge's state dir — survives restarts AND deploys (state/ sits beside `current`). |
+| `GET` | `/alarms` | Live `AlarmState[]` for the deployed `alarms.toml`, standing-first. `/status` carries the `alarms_standing` count on the panel's existing poll. |
+| `POST` | `/alarms/{id}/ack` | Acknowledge one alarm (operator action from the panel). 404 unknown id. |
+| `GET` | `/alarms-journal` | Most-recent-first alarm event journal (`raised` / `acked` / `returned`). Query: `limit`. |
 | `POST` | `/stop` | Request graceful shutdown. |
 | `GET` | `/api/hmi` | HMI screens deployed with the project: `[{ path, title, level }]` (same row shape as the IDE route). Read-only — screens are edited in the IDE and arrive via deploy. |
 | `GET` | `/api/hmi/{path}` | One screen's full `HmiDoc` JSON. 404 if the deployed project has no such screen. |

@@ -14,9 +14,12 @@ import { findNode, HmiCanvas, type CanvasMode } from "@/components/hmi/HmiCanvas
 import { HmiInspector, HmiPalette } from "@/components/hmi/HmiEditorPanel"
 import { HmiHostProvider, type HmiHost } from "@/components/hmi/host"
 import {
+  ackRuntimeAlarm,
   checkHmi,
   fetchHmi,
   fetchProjectVariables,
+  fetchRuntimeAlarms,
+  fetchRuntimeHistory,
   fetchRuntimeStatus,
   saveHmi,
   writeVariable,
@@ -55,6 +58,9 @@ export function HmiPane() {
           mode: s.mode?.kind,
         }
       },
+      history: (vars, stepMs) => fetchRuntimeHistory(vars, { stepMs }),
+      alarms: fetchRuntimeAlarms,
+      ackAlarm: ackRuntimeAlarm,
     }),
     [selectHmi],
   )

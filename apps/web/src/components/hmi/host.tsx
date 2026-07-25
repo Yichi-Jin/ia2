@@ -14,6 +14,8 @@
 
 import { createContext, useContext } from "react"
 
+import type { AlarmState } from "@/types/generated/AlarmState"
+import type { HistoryResponse } from "@/types/generated/HistoryResponse"
 import type { HmiDoc } from "@/types/generated/HmiDoc"
 import type { RuntimeMode } from "@/types/generated/RuntimeMode"
 
@@ -48,6 +50,13 @@ export type HmiHost = {
   nav(target: string): void
   /** Polled by the alarm bar (~2 s cadence). */
   runtimeState(): Promise<HmiRuntimeState>
+  /** Stored history for `vars` at `stepMs` buckets — seeds trend/
+   *  sparkline ring buffers on mount so a reload keeps the trace. */
+  history(vars: string[], stepMs: number): Promise<HistoryResponse>
+  /** Current alarm states, sorted standing-first (alarmlist node). */
+  alarms(): Promise<AlarmState[]>
+  /** Acknowledge one alarm; resolves to its updated state. */
+  ackAlarm(id: string): Promise<AlarmState>
 }
 
 const HmiHostContext = createContext<HmiHost | null>(null)

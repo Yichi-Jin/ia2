@@ -1,0 +1,8 @@
+[[alarms]]
+id = "level_high"
+variable = "level"
+condition = "gt"
+limit = 30.0
+deadband = 2.0
+severity = "high"
+message = "Tank level high — stop the inlet"

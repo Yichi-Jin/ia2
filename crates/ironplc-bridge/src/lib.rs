@@ -5,6 +5,7 @@
 mod errors;
 mod fbd_transpile;
 mod ld_transpile;
+pub mod monitor;
 mod problem_docs;
 mod retain;
 mod runtime;

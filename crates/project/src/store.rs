@@ -755,6 +755,25 @@ impl ProjectStore {
         Ok(())
     }
 
+    // ---------------- Alarms (alarms.toml) ----------------
+
+    /// Read alarms.toml. Missing file = no alarms configured (the
+    /// default for projects that haven't authored any yet).
+    pub fn read_alarms(&self) -> Result<crate::types::AlarmConfig, StoreError> {
+        let path = self.root.join("alarms.toml");
+        if !path.exists() {
+            return Ok(crate::types::AlarmConfig::default());
+        }
+        let text = fs::read_to_string(&path)?;
+        Ok(toml::from_str(&text)?)
+    }
+
+    pub fn write_alarms(&self, alarms: &crate::types::AlarmConfig) -> Result<(), StoreError> {
+        let path = self.root.join("alarms.toml");
+        fs::write(path, toml::to_string_pretty(alarms)?)?;
+        Ok(())
+    }
+
     // ---------------- Northbound (northbound.toml) ----------------
 
     /// Read northbound.toml. Missing file = northbound disabled (the
@@ -1410,8 +1429,8 @@ fn template_for_sfc(name: &str, type_: PouType) -> String {
 fn default_config_for(protocol: Protocol) -> ProtocolConfig {
     match protocol {
         // New devices default to Modbus TCP on the demo slave port —
-        // that's what `cs device create --protocol modbus` lands a
-        // user on. RTU users do `cs device set --from rtu.json`
+        // that's what `cs set devices/<n> --protocol modbus` lands a
+        // user on. RTU users do `cs set devices/<n> --from rtu.json`
         // to swap the transport variant after creation.
         Protocol::Modbus => ProtocolConfig::Modbus(ModbusConfig {
             transport: crate::types::ModbusTransport::Tcp(crate::types::ModbusTcpParams {

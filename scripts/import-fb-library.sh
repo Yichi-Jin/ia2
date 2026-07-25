@@ -1,69 +1,36 @@
 #!/usr/bin/env bash
 #
-# import-fb-library.sh — import process-control FB blocks into a project
-# via the server's library API (the same path the IDE's import dialog
-# uses). Blocks land in `pous/lib/process-control/` (read-only via the
-# generic POU routes) and the import is recorded in project.toml's
-# `[libraries]` table.
+# import-fb-library.sh — thin wrapper kept for muscle memory; the real
+# tool is the CLI (one implementation, not two):
 #
-# Usage:
-#   scripts/import-fb-library.sh <project-name-or-dir> [fb_name ...]
+#   cs library import process-control [--blocks fb_pid.st,fb_alarm_hl.st]
+#   cs ls library          # registry + imported state
+#   cs rm library/<name>   # remove from the project
 #
-#   # whole library, project already open in the server:
-#   scripts/import-fb-library.sh my_line
-#   # open-by-path, then import just a few blocks:
-#   scripts/import-fb-library.sh ~/Documents/IA2/my_line fb_pid fb_alarm_hl
-#
+# Usage: scripts/import-fb-library.sh <project-name-or-dir> [fb_name ...]
 # Server URL defaults to http://127.0.0.1:3001 (IA2_SERVER_URL overrides).
-# Equivalent raw API, for agents:
-#   GET    /api/library                  — registry + imported state
-#   POST   /api/library/import           — {"library":"…","blocks":["fb_pid.st",…]}
-#   DELETE /api/library/<name>           — remove from project
 
 set -euo pipefail
 
 SERVER="${IA2_SERVER_URL:-http://127.0.0.1:3001}"
-LIBRARY="process-control"
 PROJ="${1:-}"
-
 [ -n "$PROJ" ] || { echo "usage: $0 <project-name-or-dir> [fb_name ...]" >&2; exit 2; }
 shift || true
 
-curl -sf "$SERVER/api/health" >/dev/null || {
-  echo "ERROR: no IA2 server at $SERVER — start it (or set IA2_SERVER_URL)." >&2
-  exit 2
-}
+CS="${CS:-cs}"
+command -v "$CS" >/dev/null 2>&1 || CS="$(dirname "$0")/../target/debug/cs"
+[ -x "$CS" ] || { echo "ERROR: cs not found — install it or set CS=/path/to/cs" >&2; exit 2; }
 
-# A directory argument means "open that project first" (idempotent),
-# then address it by name like any other client.
+# A directory argument means "open that project first" (idempotent).
 if [ -d "$PROJ" ]; then
-  curl -sf -X POST "$SERVER/api/projects/open" \
-    -H "Content-Type: application/json" \
-    -d "{\"path\":\"$PROJ\"}" >/dev/null || {
-      echo "ERROR: could not open project at $PROJ" >&2; exit 2; }
-  PROJ="$(basename "$PROJ")"
+  ABS="$(cd "$PROJ" && pwd)"
+  "$CS" --server "$SERVER" project open "$ABS" >/dev/null
+  PROJ="$(basename "$ABS")"
 fi
 
-blocks_json="[]"
 if [ "$#" -gt 0 ]; then
-  blocks_json="$(printf '%s\n' "$@" | sed -E 's/(\.st)?$/.st/' \
-    | python3 -c 'import json,sys; print(json.dumps([l.strip() for l in sys.stdin if l.strip()]))')"
+  BLOCKS="$(printf '%s\n' "$@" | sed -E 's/(\.st)?$/.st/' | paste -sd, -)"
+  exec "$CS" --server "$SERVER" --project "$PROJ" library import process-control --blocks "$BLOCKS"
+else
+  exec "$CS" --server "$SERVER" --project "$PROJ" library import process-control
 fi
-
-resp="$(curl -sf -X POST "$SERVER/api/library/import" \
-  -H "Content-Type: application/json" \
-  -H "X-IA2-Project: $PROJ" \
-  -d "{\"library\":\"$LIBRARY\",\"blocks\":$blocks_json}")" || {
-    echo "ERROR: import failed — is project '$PROJ' open in the server?" >&2
-    echo "       check: curl -s $SERVER/api/library -H 'X-IA2-Project: $PROJ'" >&2
-    exit 2
-  }
-
-echo "$resp" | python3 -c '
-import json, sys
-r = json.load(sys.stdin)
-print(f"imported {len(r[\"imported\"])} block(s) from {r[\"library\"]}@{r[\"version\"]}:")
-for f in r["imported"]:
-    print(f"  + pous/lib/{r[\"library\"]}/{f}")
-'
-echo "Blocks now show under the Libraries section and the FBD/LD '+ Block' palette."

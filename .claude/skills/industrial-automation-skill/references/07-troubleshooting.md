@@ -4,21 +4,29 @@ Each entry: the symptom you'll see, the cause, the fix.
 
 ## HTTP / CLI errors
 
-### `409` on `cs device create NAME` (or edge create)
-**Cause:** that device/edge already exists in the project.
-**Fix:** `cs device list` to confirm; use `cs device set NAME --from -` to reconfigure instead of create.
+### exit `2` with a server message on stderr
+**Cause:** an HTTP 4xx. The CLI prints the server's reason **verbatim on stderr** and exits 2 — the message *is* the diagnosis, not a generic "bad request".
+**Fix:** read it before changing anything. Examples: `missing field `application`` (an iomap mapping lacks the POU name) → add it; `duplicate alarm id "…"` (two `alarms.toml` entries share an id) → rename one. Usage errors (unknown flag, bad path) exit 2 the same way. (Exit 1 = problems in your content — diagnostics, failed probe, remote deploy failure, sim expectation failed; `≥3` = infrastructure, server down / 5xx.)
 
-### `422` on `cs iomap set` / `cs device set` / `cs tasks set`
-**Cause:** wrong JSON shape. For iomap, almost always a missing `application` field. For device, a transport union missing its `kind`.
-**Fix:** `cs iomap get` (or `device get`) to see the exact shape the server emits, edit *that*, set it back. Field names are snake_case.
+### `409` Conflict
+**Cause:** a create-only or read-only path. Devices/edges don't hit this — `cs set` is upsert, so reconfiguring replaces in place. What does 409: `cs hmi generate <slug>` on a screen that already exists (curated by a human — pass `--force` only if you mean to overwrite), or writing a `pous/lib/<name>/…` block imported from a library (read-only through the generic POU routes — copy it out of `lib/` to own it).
+**Fix:** for a rewrite you intend, `cs ls devices` / `cs ls hmi` to confirm the name, then `cs set <path> --from -` (or `--force` for generate).
 
-### `404` on `cs pou save` / `cs device get` / any project-scoped call
+### `422` on `cs set iomap` / `cs set devices/<n>` / `cs set tasks`
+**Cause:** wrong JSON shape. For iomap, almost always a missing `application` field. For a device, a transport union missing its `kind`.
+**Fix:** read the stderr reason first (see above), then `cs get iomap` (or `cs get devices/<n>`) to see the exact shape the server emits, edit *that*, set it back. Field names are snake_case.
+
+### `404` on `cs set pous/<n>.st` / `cs get devices/<n>` / any project-scoped call
 **Cause:** the project isn't open on the server, or `--project NAME` names a project that isn't in the open set.
-**Fix:** `cs project list`. If absent, `cs project open /abs/path`. If multiple are open and you omitted `--project`, the server used its LRU active fallback — name it explicitly.
+**Fix:** `cs ls projects`. If absent, `cs project open /abs/path`. If multiple are open and you omitted `--project`, the server used its LRU active fallback — name it explicitly.
+
+### `404` "not in registry" on `cs library import`
+**Cause:** the server found no library directory to import from — *not* a bad library name.
+**Fix:** the FB-library registry resolves the repo's `library/` when `ia2-server` runs from the checkout root, and the installed `~/.local/share/ia2/library` otherwise. So start the server from the repo root, pass `--library-dir /path/to/library`, or re-run `scripts/install-skill.sh` (it vendors the library to `~/.local/share/ia2/library`). Then `cs ls library` should list `process-control`.
 
 ### `400` "project 'X' is not open on this server"
 **Cause:** you passed `--project X` but X isn't open.
-**Fix:** `cs project open` it first, or pick a name from `cs project list`.
+**Fix:** `cs project open` it first, or pick a name from `cs ls projects`.
 
 ### CLI can't reach the server at all (`connection refused`)
 **Cause:** no server on the expected port. `cs` defaults to `:3001`.
@@ -36,7 +44,7 @@ Each entry: the symptom you'll see, the cause, the fix.
 
 ### `cs project check` fails with `P####`
 **Cause:** an IEC source error.
-**Fix:** `cs check --explain pous/FILE.st` (or `cs explain P####`) prints the full ironplc problem doc. Common ones: missing `;`, C-style `&&` instead of `AND`, bare number where a `T#…ms` time literal is expected, a second PROGRAM in the file. See `05-iec-61131.md` § quirks.
+**Fix:** `cs check --explain pous/FILE.st` (or `cs check P####` for a bare problem code) prints the full ironplc problem doc. Common ones: missing `;`, C-style `&&` instead of `AND`, bare number where a `T#…ms` time literal is expected, a second PROGRAM in the file. See `05-iec-61131.md` § quirks.
 
 ### "modbus connect failed" in the run log, but the run still starts
 **Cause (TCP):** nothing listening at host:port. **(RTU):** the serial device doesn't exist / is busy / wrong permissions.
@@ -95,7 +103,7 @@ An `init_sdo` entry targets a CoE object the drive doesn't have. A failed startu
 
 - **`Failed to read own certificate/private key` ERROR lines on connect** — harmless noise. The UA library probes its PKI store even when the session uses SecurityPolicy None (IA2's v1 posture); no certificate is needed and the connection proceeds. Ignore unless you also see the connect itself failing.
 - **`browse failed: opcua endpoint … unreachable`** — the endpoint in the device config must be reachable *from the IDE server machine* (browse connects live). Check URL/port, then whether the UA server allows anonymous None-policy sessions.
-- **Tags read as 0 while connected** — usually a `node_id` typo (the mirror skips tags the server answers with a bad status) or a wrapped/nonscalar value on the server side. `cs device opcua-browse` shows the exact NodeIds; the adapter unwraps `Variant`/`DataValue` nesting but arrays/strings don't map to channels.
+- **Tags read as 0 while connected** — usually a `node_id` typo (the mirror skips tags the server answers with a bad status) or a wrapped/nonscalar value on the server side. `cs api POST /api/devices/<name>/opcua-browse --from -` (`{"node_id":"…"}`, or `{}` for ObjectsFolder) shows the exact NodeIds; the adapter unwraps `Variant`/`DataValue` nesting but arrays/strings don't map to channels.
 
 ## CANopen
 

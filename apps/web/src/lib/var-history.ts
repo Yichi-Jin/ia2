@@ -1,3 +1,4 @@
+import type { HistoryPoint } from "@/types/generated/HistoryPoint"
 import type { VarValue } from "@/types/generated/VarValue"
 
 export const MAX_HISTORY = 256
@@ -130,10 +131,12 @@ export function pushHistory(buf: number[], next: number): number[] {
  *  fits. */
 export const MAX_TIMED_HISTORY = 4096
 
-/** One trend sample: wall-clock seconds + charted value. Timestamped
- *  because retention is by age (`window_s`), not by count — a count
- *  cap makes the visible window silently vary with snapshot rate. */
-export type TimedSample = { t: number; v: number }
+/** One trend sample: seconds (snapshot time base) + charted value.
+ *  Timestamped because retention is by age (`window_s`), not by count —
+ *  a count cap makes the visible window silently vary with snapshot
+ *  rate. `lo`/`hi` carry a history bucket's min/max envelope; live
+ *  single samples leave them undefined (the band collapses to `v`). */
+export type TimedSample = { t: number; v: number; lo?: number; hi?: number }
 
 /** Push one timestamped sample in place, trimming samples older than
  *  `windowS` seconds behind the newest one, then enforcing the hard
@@ -184,4 +187,51 @@ export const SERIES_COLORS = [
 
 export function colorFor(index: number): string {
   return SERIES_COLORS[index % SERIES_COLORS.length]
+}
+
+// ============================================================
+//   History backfill — seeding a live ring buffer from the
+//   runtime's stored history so a page reload doesn't wipe trends.
+// ============================================================
+
+/** Convert one downsampled history series into ring-buffer samples.
+ *  History timestamps share the snapshot time base the live feed uses
+ *  (scan-relative micros), so `t_us / 1e6` lands on the same seconds
+ *  axis the live samples are pushed on — that shared base is what makes
+ *  the merge dedupe cleanly. `min`/`max` ride along as the band. */
+export function historyToSamples(points: HistoryPoint[]): TimedSample[] {
+  return points.map((p) => ({
+    t: Number(p.t_us) / 1e6,
+    v: p.v,
+    lo: p.min,
+    hi: p.max,
+  }))
+}
+
+/** Merge stored history (older, ~1 Hz) with the live ring buffer
+ *  (newer, higher rate). History fills the span before the live
+ *  buffer's earliest sample; any history point at or after that
+ *  boundary is dropped so the overlap is never double-plotted (the
+ *  live feed is authoritative once it picks up). Inputs are assumed
+ *  ascending in `t`; the result stays ascending. */
+export function mergeHistory(
+  history: TimedSample[],
+  live: TimedSample[],
+): TimedSample[] {
+  if (live.length === 0) return history.slice()
+  if (history.length === 0) return live.slice()
+  const boundary = live[0].t
+  const older = history.filter((p) => p.t < boundary)
+  return older.concat(live)
+}
+
+/** Seed a live buffer with fetched history, keeping only the newest
+ *  `windowS` seconds (the window the chart shows) — the endpoint may
+ *  return far more than a trend node displays. */
+export function seedTimedBuffer(
+  live: TimedSample[],
+  history: TimedSample[],
+  windowS: number,
+): TimedSample[] {
+  return windowSlice(mergeHistory(history, live), windowS)
 }

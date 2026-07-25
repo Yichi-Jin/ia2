@@ -707,7 +707,7 @@ fn smol_main(
         // Early bus census: log every SubDevice's identity *now*, in PRE-OP,
         // before any init_sdo / PDO / OP step that a non-matching device can
         // abort (e.g. a coupler with no 0x6060, or one that rejects the CoE
-        // 0x1600 PDO-assign). This makes `cs edge scan` work as a pure
+        // 0x1600 PDO-assign). This makes `cs get edges/<n>/scan` work as a pure
         // discovery probe against unknown hardware: you always see what's on
         // the wire, even when the configured device can't reach OP.
         for (pos, sd) in group.iter(&maindevice).enumerate() {

@@ -1,8 +1,13 @@
 # HMI: design for generation-first operator screens
 
-Status: design, 2026-07-18. Nothing here is implemented; this document is the
-plan of record for the feature and the contract its phases will be reviewed
-against.
+Status: living design, first written 2026-07-18. P0–P2 are SHIPPED
+(schema + live canvas + incremental op authoring, human editor on the
+same op endpoint, edge-served operator panel, expressiveness layer);
+where this document and the code disagree, the code is ahead — treat
+the phase list below as the review contract each phase was built
+against, not a to-do. P3 (custom `ref` symbols) remains open; the
+server-side history half of P3 is now covered by the historian +
+alarms subsystem (`docs/api.md` §Runtime history & alarms).
 
 ## What we are building, and the one idea that shapes it
 
@@ -185,7 +190,7 @@ Validation is a pure function in `project` (`validate_hmi`): unknown node
 types, duplicate ids, dangling `nav` targets, bindings that name variables
 absent from the project's variable index, actions that write read-only
 directions — all surfaced as the same `CheckDiagnostic` shape the compile
-path uses, so `cs hmi check` and `/api/project/validate` fold HMI problems
+path uses, so `cs check hmi/<slug>` and `/api/project/validate` fold HMI problems
 into the existing diagnostics story.
 
 ## The expressiveness layer: maps, state color, motion
@@ -241,7 +246,7 @@ by color/shape, and `prefers-reduced-motion` turns all of it off.
 **Binding reliability, hardened.** Tail-name resolution
 (`level` matching `feeder.level`) now requires the tail to be *unique* in
 the snapshot — two programs both owning a `temp` render "—" instead of
-whichever serialized first, and `cs hmi check` warns "exists in N POUs —
+whichever serialized first, and `cs check hmi/<slug>` warns "exists in N POUs —
 qualify as instance.variable" at authoring time. Non-finite results
 (`x / 0`, STRING parsed as number) resolve to null, never to "Infinity" on
 an operator screen.
@@ -280,8 +285,9 @@ This is deferred to its own phase but designed now so nothing in the format
 assumes the IDE server.
 
 **Agent surface** — the reason the feature exists, in three layers. First,
-plumbing: `cs hmi list|get|save|delete|check` as thin JSON passthroughs, same
-grammar as `cs pou`. Second, generation: `cs hmi generate [--program P]
+plumbing: screen CRUD rides the generic resource quartet (`cs ls hmi`,
+`cs get/set/rm hmi/<slug>`, `cs check hmi/<slug>`) — no dedicated noun
+commands. Second, generation: `cs hmi generate [--program P]
 [--level 2]` calls `POST /api/hmi/generate`, which builds a first-pass
 screen *deterministically* from project truth — every mapped variable gets a
 node chosen by type and direction (BOOL out → indicator/valve by name

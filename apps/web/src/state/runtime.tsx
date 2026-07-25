@@ -711,7 +711,7 @@ export function RuntimeProvider({ children }: { children: ReactNode }) {
 
   // Per-device / per-edge live-reload, mirroring the per-POU pattern
   // above: while an editor pane is open on it, an agent-side `cs device
-  // set` / `cs edge set` refreshes the pane through the `device:<name>`
+  // set` / `cs set edges/…` refreshes the pane through the `device:<name>`
   // / `edge:<name>` mutation topics the server already emits. Without
   // this the pane kept showing the select-time snapshot.
   useEffect(() => {
