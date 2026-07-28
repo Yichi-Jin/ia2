@@ -147,6 +147,8 @@ function Editor({
         scan_count: null,
         uptime_secs: null,
         runtime_version: null,
+        fieldbus_healthy: null,
+        unhealthy_devices: [],
         error: String(e),
       })
     } finally {
