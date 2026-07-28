@@ -65,7 +65,26 @@ pub(crate) fn cmd_probe(client: &Client, name: &str, json: bool) -> Result<i32> 
             .get("runtime_version")
             .and_then(|v| v.as_str())
             .unwrap_or("?");
-        println!("✓ {name} reachable · v{version} · {scans} scans · up {uptime}");
+        // "Reachable" only means the runtime answered. A live scan loop on
+        // top of a dead fieldbus must not print the same ✓ as a healthy
+        // edge — that is the reading that sends people hunting the wrong
+        // fault. Exit code stays 0 (it IS reachable); the text tells the
+        // truth about the buses.
+        let down: Vec<&str> = value
+            .get("unhealthy_devices")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|d| d.as_str()).collect())
+            .unwrap_or_default();
+        if down.is_empty() {
+            println!("✓ {name} reachable · v{version} · {scans} scans · up {uptime}");
+        } else {
+            println!("⚠ {name} reachable · v{version} · {scans} scans · up {uptime}");
+            println!(
+                "  fieldbus DEGRADED — {} down (inputs frozen, outputs dropped): {}",
+                down.len(),
+                down.join(", ")
+            );
+        }
     } else {
         let err = value
             .get("error")

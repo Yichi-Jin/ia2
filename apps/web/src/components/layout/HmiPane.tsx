@@ -51,11 +51,18 @@ export function HmiPane() {
       runtimeState: async () => {
         const s = await fetchRuntimeStatus()
         // mode rides along so a paused scan loop doesn't show as a
-        // green "Running" in the canvas alarmbar.
+        // green "Running" in the canvas alarmbar. unhealthyDevices does
+        // the same job for a dead fieldbus: the scan loop keeps running
+        // and every value keeps updating, so without this the IDE's
+        // alarmbar shows a calm green plant while the bus is down —
+        // the standalone edge panel has always shown it.
         return {
           running: s.running,
           alarm: s.last_error ?? null,
           mode: s.mode?.kind,
+          unhealthyDevices: s.device_health
+            .filter((d) => !d.healthy)
+            .map((d) => d.name),
         }
       },
       history: (vars, stepMs) => fetchRuntimeHistory(vars, { stepMs }),

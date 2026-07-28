@@ -68,7 +68,13 @@ prompts — the IDE runs `ssh -o BatchMode=yes`).
    `~/.ssh/config` entry works — including jump hosts, custom keys, etc.
 
 2. **Wait for the probe**. The edge pane auto-probes every 10 s and on
-   open. Green badge = the runtime's `/health` came back ok.
+   open. Green `running` badge = the runtime's `/health` came back ok
+   **and** every configured fieldbus device is connected. An ochre
+   `degraded` badge means the runtime is up and scanning but at least one
+   bus is down — hover it for the device names. That state is easy to
+   misread from the outside: the scan count keeps climbing and values keep
+   updating, but the down device's inputs are frozen at last-known values
+   and its outputs are dropped.
 
 3. **Deploy**. Click `Deploy`. The IDE:
    - `tar`s your project directory + (if found) a freshly-built

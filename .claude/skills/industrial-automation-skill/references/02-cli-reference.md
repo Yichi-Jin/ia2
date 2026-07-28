@@ -124,6 +124,14 @@ cs deploy <edge>        # tar → ssh → versioned extract → atomic swap → 
 cs probe <edge>         # reachability; exit 0/1
 ```
 
+`probe` distinguishes *reachable* from *working*. A runtime whose fieldbus
+is down still answers `/health`, so it prints `⚠ … reachable` plus a
+`fieldbus DEGRADED — N down (inputs frozen, outputs dropped): <names>`
+line. **Exit code stays 0** — the edge IS reachable — so scripts that
+gate on health must read `fieldbus_healthy` / `unhealthy_devices` from
+`cs probe --json`, not the exit status. Same data on
+`/api/runtime/status`'s `device_health` for a locally-running program.
+
 Deploy REFUSES to lie: a failed restart, broken tar stream, or missing
 version stamp fails the deploy (`ok:false` + log). install_dir/systemd
 drift surfaces as a structured `warning` field. Attach/detach live

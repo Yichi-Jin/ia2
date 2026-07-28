@@ -6,7 +6,7 @@
 
 use axum::extract::{Path as AxumPath, State};
 use axum::Json;
-use ironplc_bridge::{ProgramHandle, RuntimeMode, VarSnapshot};
+use ironplc_bridge::{DeviceHealth, ProgramHandle, RuntimeMode, VarSnapshot};
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
@@ -113,7 +113,18 @@ pub struct RuntimeStatus {
     pub project: Option<String>,
     /// Program instances declared in tasks.toml (what's actually scheduled).
     pub program_instances: Vec<String>,
+    /// Device names declared in the project's `devices/` files — configuration,
+    /// not connectivity. See `device_health` for whether they are actually up.
     pub devices: Vec<String>,
+    /// Live per-device fieldbus health from the running program: `healthy:
+    /// false` means that device's inputs are frozen at last-known values and
+    /// its outputs are being dropped, while the scan loop keeps running and
+    /// `running` stays `true`. Empty when nothing is running.
+    ///
+    /// Without this, a UI built on `/api/runtime/status` cannot distinguish a
+    /// healthy plant from one whose bus died — the variable values alone never
+    /// reveal it (see `DeviceHealth`).
+    pub device_health: Vec<DeviceHealth>,
     /// Scan count from the most recent snapshot; 0 before the first one.
     pub scan_count: u64,
     /// Timestamp_us of the most recent snapshot, or 0.
@@ -178,14 +189,15 @@ pub async fn runtime_status(
     // Mode + forces come from the live ProgramHandle, when there is
     // one. Clone the handle out of the mutex briefly to avoid holding
     // the sync lock across the calls.
-    let (mode, forces) = {
+    let (mode, forces, device_health) = {
         let guard = state.program.lock();
         match guard.as_ref() {
             Some(rp) => (
                 Some(rp.handle.mode()),
                 ironplc_bridge::monitor::force_entries(&rp.handle),
+                rp.handle.device_health(),
             ),
-            None => (None, vec![]),
+            None => (None, vec![], vec![]),
         }
     };
     Json(RuntimeStatus {
@@ -193,6 +205,7 @@ pub async fn runtime_status(
         project: project_name,
         program_instances: programs,
         devices,
+        device_health,
         scan_count: snap.as_ref().map(|s| s.scan_count).unwrap_or(0),
         last_snapshot_us: snap.as_ref().map(|s| s.timestamp_us).unwrap_or(0),
         last_error,
