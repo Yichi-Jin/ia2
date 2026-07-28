@@ -16,6 +16,7 @@ use std::io;
 use std::process::Stdio;
 use std::sync::{Arc, OnceLock};
 
+use ironplc_bridge::DeviceHealth;
 use project::Edge;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -99,6 +100,15 @@ pub struct EdgeProbe {
     /// Runtime version (from `/status`), if reachable. Empty if probe
     /// stopped at the cheaper `/health` step.
     pub runtime_version: Option<String>,
+    /// Whether every configured fieldbus device on the edge is connected.
+    /// `Some(false)` means the runtime is up and scanning but at least one
+    /// bus is down — inputs frozen, outputs dropped — which is emphatically
+    /// NOT the same as "reachable". `None` when unreachable, or when the
+    /// edge runs a build predating per-device health in `/health`.
+    pub fieldbus_healthy: Option<bool>,
+    /// Names of the devices behind a `fieldbus_healthy: Some(false)`, so a
+    /// caller can say *which* bus died without a second round trip.
+    pub unhealthy_devices: Vec<String>,
     /// First line of stderr / error message when unreachable. Gives the
     /// user enough hint to fix `~/.ssh/config` or `install_dir`.
     pub error: Option<String>,
@@ -237,38 +247,64 @@ async fn edge_runtime_curl(
 
 /// Probe the edge runtime's `/health` (port-resilient — see `edge_runtime_curl`).
 pub async fn probe_edge(edge: &Edge) -> EdgeProbe {
-    #[derive(Deserialize)]
-    struct Health {
-        status: String,
-        uptime_secs: u64,
-        scan_count: u64,
-    }
-    let unreachable = |error: String| EdgeProbe {
-        reachable: false,
-        scan_count: None,
-        uptime_secs: None,
-        runtime_version: None,
-        error: Some(error),
-    };
     let body = match edge_runtime_curl(edge, |port| {
         format!("curl --silent --max-time 3 http://127.0.0.1:{port}/health")
     })
     .await
     {
         Ok(b) => b,
-        Err(e) => return unreachable(e),
+        Err(e) => return unreachable_probe(e),
     };
-    let Ok(parsed) = serde_json::from_str::<Health>(&body) else {
-        return unreachable(format!("unexpected body: {}", first_line(&body)));
+    probe_from_health_body(&body)
+}
+
+fn unreachable_probe(error: String) -> EdgeProbe {
+    EdgeProbe {
+        reachable: false,
+        scan_count: None,
+        uptime_secs: None,
+        runtime_version: None,
+        fieldbus_healthy: None,
+        unhealthy_devices: vec![],
+        error: Some(error),
+    }
+}
+
+/// Map an edge runtime's `/health` body onto an `EdgeProbe`. Split out of
+/// `probe_edge` so the wire contract is unit-testable without an ssh hop —
+/// the whole class of bug this guards is "a field the edge sent got dropped
+/// on the floor here", which no integration test would have caught either.
+fn probe_from_health_body(body: &str) -> EdgeProbe {
+    #[derive(Deserialize)]
+    struct Health {
+        status: String,
+        uptime_secs: u64,
+        scan_count: u64,
+        /// Defaulted so probing an edge whose runtime predates per-device
+        /// health degrades to "unknown" instead of failing the whole probe.
+        #[serde(default)]
+        fieldbus_healthy: Option<bool>,
+        #[serde(default)]
+        devices: Vec<DeviceHealth>,
+    }
+    let Ok(parsed) = serde_json::from_str::<Health>(body) else {
+        return unreachable_probe(format!("unexpected body: {}", first_line(body)));
     };
     if parsed.status != "ok" {
-        return unreachable(format!("runtime not ok: {}", parsed.status));
+        return unreachable_probe(format!("runtime not ok: {}", parsed.status));
     }
     EdgeProbe {
         reachable: true,
         scan_count: Some(parsed.scan_count),
         uptime_secs: Some(parsed.uptime_secs),
         runtime_version: None,
+        fieldbus_healthy: parsed.fieldbus_healthy,
+        unhealthy_devices: parsed
+            .devices
+            .iter()
+            .filter(|d| !d.healthy)
+            .map(|d| d.name.clone())
+            .collect(),
         error: None,
     }
 }
@@ -1036,5 +1072,57 @@ mod tests {
         // Already-named `web` needs no rename step.
         let s2 = remote_deploy_script("/opt/ia2", "proj", None, Some("web"));
         assert!(!s2.contains(r#""$DEST/"'web' "$DEST/web""#), "{s2}");
+    }
+
+    /// A runtime that answers /health while one of its buses is down must
+    /// NOT probe as plain "reachable and fine" — that reads as a healthy
+    /// edge in the IDE badge and in `cs probe`, while inputs are frozen
+    /// and outputs are being dropped.
+    #[test]
+    fn probe_surfaces_a_down_fieldbus_on_a_reachable_edge() {
+        let probe = probe_from_health_body(
+            r#"{"status":"ok","uptime_secs":704,"scan_count":351667,
+                "fieldbus_healthy":false,
+                "devices":[{"name":"coupler","healthy":false},
+                           {"name":"servo","healthy":true}]}"#,
+        );
+        assert!(probe.reachable, "the runtime did answer");
+        assert_eq!(probe.fieldbus_healthy, Some(false));
+        assert_eq!(probe.unhealthy_devices, vec!["coupler".to_string()]);
+        assert!(probe.error.is_none());
+    }
+
+    #[test]
+    fn probe_reports_a_fully_healthy_edge_cleanly() {
+        let probe = probe_from_health_body(
+            r#"{"status":"ok","uptime_secs":10,"scan_count":20,
+                "fieldbus_healthy":true,
+                "devices":[{"name":"servo","healthy":true}]}"#,
+        );
+        assert_eq!(probe.fieldbus_healthy, Some(true));
+        assert!(probe.unhealthy_devices.is_empty());
+    }
+
+    /// An edge running a build that predates per-device health still probes
+    /// fine; the health fields degrade to "unknown" rather than failing the
+    /// parse and reporting the whole edge unreachable.
+    #[test]
+    fn probe_tolerates_a_runtime_without_health_fields() {
+        let probe = probe_from_health_body(r#"{"status":"ok","uptime_secs":5,"scan_count":9}"#);
+        assert!(probe.reachable);
+        assert_eq!(probe.scan_count, Some(9));
+        assert_eq!(probe.fieldbus_healthy, None, "unknown, not false");
+        assert!(probe.unhealthy_devices.is_empty());
+    }
+
+    #[test]
+    fn probe_rejects_a_non_ok_runtime_and_garbage() {
+        let bad = probe_from_health_body(r#"{"status":"degraded","uptime_secs":1,"scan_count":1}"#);
+        assert!(!bad.reachable);
+        assert!(bad.error.unwrap().contains("degraded"));
+
+        let junk = probe_from_health_body("<html>502 Bad Gateway</html>");
+        assert!(!junk.reachable);
+        assert!(junk.error.unwrap().contains("unexpected body"));
     }
 }

@@ -147,6 +147,8 @@ function Editor({
         scan_count: null,
         uptime_secs: null,
         runtime_version: null,
+        fieldbus_healthy: null,
+        unhealthy_devices: [],
         error: String(e),
       })
     } finally {
@@ -866,6 +868,21 @@ function ReachBadge({
     )
   }
   if (probe.reachable) {
+    // Reachable is not the same as working: the runtime answers /health
+    // and keeps scanning while a fieldbus is down. Say so, rather than
+    // showing the same green as a fully healthy edge.
+    const down = probe.unhealthy_devices
+    if (down.length > 0) {
+      return (
+        <UppercaseBadge
+          className="bg-warn/15 text-warn"
+          title={`Runtime is up, but ${down.length === 1 ? "this device is" : "these devices are"} down (inputs frozen, outputs dropped): ${down.join(", ")}`}
+        >
+          <AlertCircle className="size-3" />
+          degraded
+        </UppercaseBadge>
+      )
+    }
     return (
       <UppercaseBadge
         className="bg-highlight/15 text-highlight"

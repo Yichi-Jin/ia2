@@ -99,7 +99,7 @@ read-only device-template catalog used to pre-fill devices from a bus scan.
 | `GET` | `/api/edges/{name}` | Read an edge. Returns `Edge`. |
 | `PUT` | `/api/edges/{name}` | Update an edge. Body: `Edge`. |
 | `DELETE` | `/api/edges/{name}` | Delete. Also tears down any open attach tunnel. |
-| `GET` | `/api/edges/{name}/probe` | SSH+curl the edge's runtime `/health`. Returns `EdgeProbe`. |
+| `GET` | `/api/edges/{name}/probe` | SSH+curl the edge's runtime `/health`. Returns `EdgeProbe { reachable, scan_count, uptime_secs, runtime_version, fieldbus_healthy, unhealthy_devices, error }`. `reachable` only means the runtime answered — check `fieldbus_healthy` for whether its buses are up, and `unhealthy_devices` for which ones are not. `fieldbus_healthy` is `null` when unreachable or when the edge runs a build predating per-device health. |
 | `GET` | `/api/edges/{name}/logs?tail=N` | Tail the edge runtime's journald logs over ssh (`tail` clamped to 2000, default 200). Returns JSON. |
 | `GET` | `/api/edges/{name}/discover` | Per-device connect status + discovered EtherCAT topology from the edge, so PDO maps can be authored against the real bus. Returns JSON. |
 | `GET` | `/api/edges/{name}/system` | Edge interfaces / serial ports / arch — for authoring device configs against real edge facts. Returns JSON. |
@@ -139,7 +139,7 @@ read-only device-template catalog used to pre-fill devices from a bus scan.
 | `POST` | `/api/symbols?language=st\|ld\|fbd\|sfc` | Extract declared variables from one source string (any language; default `st`). Body: `text/plain`. Returns `VariableInfo[]`. | Backs the editor's binding picker
 | `POST` | `/api/run` | Compile the whole project + spawn the bridge. Body: `{}` or `RunRequest`. | Reads `tasks.toml` to decide what runs
 | `POST` | `/api/stop` | Stop the running program (cooperative; scan loop drains). |
-| `GET` | `/api/runtime/status` | Synchronous overview of the runtime. Returns `RuntimeStatus { running, project, scan_count, last_snapshot_us, last_error, devices_connected, programs_active }`; `last_error` carries the VM-trap / panic message when a run dies (also emitted as SSE `error` + `stopped`), `null` after a clean run. | One-shot, agent-friendly
+| `GET` | `/api/runtime/status` | Synchronous overview of the runtime. Returns `RuntimeStatus { running, project, program_instances, devices, device_health, scan_count, last_snapshot_us, last_error, running_info, mode, forces }`; `last_error` carries the VM-trap / panic message when a run dies (also emitted as SSE `error` + `stopped`), `null` after a clean run. `devices` lists the project's configured device names, while `device_health` reports whether each one's transport is actually live — a `false` entry means that device's inputs are frozen at last-known values and its outputs are dropped, even though `running` stays `true` and the scan count keeps climbing. | One-shot, agent-friendly
 | `GET` | `/api/runtime/snapshot` | Latest `VarSnapshot` or `null`. | No SSE needed for one-off queries
 | `POST` | `/api/runtime/variables/{name}` | Write a variable while running. Body: `WriteVariableRequest { value: <i32-coerceable> }`. Returns the new value. | Critical for debugging closed loops
 | `GET` | `/api/events` | SSE stream of `AppEvent` (`snapshot` / `started` / `stopped` / `error`). | For long-running IDE clients

@@ -30,7 +30,7 @@ use ironplc_container::VarIndex;
 use ironplc_container::STRING_HEADER_BYTES;
 use ironplc_vm::{Vm, VmBuffers, VmRunning};
 use project::{Direction, Mapping, ProtocolConfig};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use ts_rs::TS;
 
@@ -100,7 +100,10 @@ pub struct DeviceReport {
 /// Devices that failed the initial connect appear here too, permanently
 /// `healthy: false`, so a project configured for a device that never came
 /// up is just as visible as one that dropped mid-run.
-#[derive(Debug, Clone, Serialize, TS)]
+/// `Deserialize` as well as `Serialize`: the IDE server parses this back
+/// out of a *remote* edge runtime's `/health` when probing it, so the same
+/// type describes local and edge fieldbus health.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct DeviceHealth {
     pub name: String,
