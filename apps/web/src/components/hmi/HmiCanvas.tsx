@@ -498,10 +498,35 @@ function CanvasNode({
 
   const body = renderKind(node, snapshot, historyRef, onAction, host, mode)
 
+  // In Operate mode a tap-actionable node IS a control: give it a real
+  // role and a keyboard path (Enter/Space through the same gated
+  // handler as the click). Button nodes already render a native
+  // <button> inside, so the wrapper stays inert for them.
+  const fireTap = () => {
+    if (mode !== "operate" || !tapAction) return
+    const enBind = node.bind["enable"]
+    if (enBind !== undefined && !resolveOn(snapshot, enBind)) return
+    onAction(node.id, tapAction)
+  }
+  const keyboardActionable =
+    mode === "operate" && tapAction !== undefined && node.type !== "button"
+
   return (
     <div
       data-hmi-id={node.id}
       data-hmi-type={node.type}
+      role={keyboardActionable ? "button" : undefined}
+      tabIndex={keyboardActionable ? 0 : undefined}
+      onKeyDown={
+        keyboardActionable
+          ? (e) => {
+              if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault()
+                fireTap()
+              }
+            }
+          : undefined
+      }
       className={cn(
         "absolute",
         spawning !== undefined && "hmi-spawn",
@@ -526,13 +551,10 @@ function CanvasNode({
       }}
       onClick={(e) => {
         e.stopPropagation()
-        if (mode !== "operate" || !tapAction) return
         // `bind.enable` gates the gesture itself, not just the visual —
         // a click on the wrapper around a disabled control must not
-        // reach the plant either.
-        const enBind = node.bind["enable"]
-        if (enBind !== undefined && !resolveOn(snapshot, enBind)) return
-        onAction(node.id, tapAction)
+        // reach the plant either (fireTap applies the same gate).
+        fireTap()
       }}
     >
       {body}
@@ -1041,8 +1063,26 @@ function ConfirmCard({
   onConfirm: () => void
 }) {
   const summary = confirmSummary(pending.action, pending.write)
+  // The card interrupts the operator's flow, so their keyboard must
+  // land IN it: focus starts on Cancel (the safe answer — Enter never
+  // fires a plant write by accident) and Escape dismisses.
+  const cancelRef = useRef<HTMLButtonElement | null>(null)
+  useEffect(() => {
+    cancelRef.current?.focus()
+  }, [])
   return (
-    <div className="absolute inset-0 z-20 grid place-items-center bg-black/20">
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-label={`Confirm action: ${summary}`}
+      className="absolute inset-0 z-20 grid place-items-center bg-black/20"
+      onKeyDown={(e) => {
+        if (e.key === "Escape") {
+          e.stopPropagation()
+          onCancel()
+        }
+      }}
+    >
       <div className="w-[300px] rounded-lg border border-border bg-popover p-4 shadow-2xl">
         <div className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
           Confirm action
@@ -1052,6 +1092,7 @@ function ConfirmCard({
         </div>
         <div className="mt-4 flex justify-end gap-2">
           <button
+            ref={cancelRef}
             type="button"
             onClick={onCancel}
             className="rounded-md border border-border bg-card px-3 py-1 text-[12px] text-muted-foreground hover:text-foreground"

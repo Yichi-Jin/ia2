@@ -493,7 +493,9 @@ function LibraryGroup({
               <ChevronRight className="size-3 shrink-0" />
             )}
             <Library className="size-3.5 shrink-0 text-muted-foreground" />
-            <span className="flex-1 truncate text-foreground">{name}</span>
+            <span className="flex-1 truncate text-foreground" title={name}>
+              {name}
+            </span>
             <span className="pr-2 font-mono text-[9px] uppercase tracking-wider text-muted-foreground">
               {blocks.length} blocks
             </span>
@@ -593,7 +595,10 @@ function TreeChildren<T>({
                     ) : (
                       <Folder className="size-3.5 shrink-0 text-muted-foreground" />
                     )}
-                    <span className="flex-1 truncate text-foreground">
+                    <span
+                      className="flex-1 truncate text-foreground"
+                      title={node.name}
+                    >
                       {node.name}
                     </span>
                   </button>
@@ -801,7 +806,9 @@ function PouItem({
             ) : (
               <FileCode2 className="size-3.5 shrink-0 text-muted-foreground" />
             )}
-            <span className="flex-1 truncate">{node.name}</span>
+            <span className="flex-1 truncate" title={node.name}>
+              {node.name}
+            </span>
             {simple ? (
               <PouTypeBadge type={decls[0].type} language={decls[0].language} />
             ) : decls.length === 0 ? (
@@ -826,7 +833,9 @@ function PouItem({
                     className="flex w-full items-center gap-1.5 py-0.5 pl-9 pr-2 text-left text-[12px] text-muted-foreground transition-colors hover:bg-accent/40 hover:text-foreground"
                   >
                     <PouTypeIcon type={d.type} />
-                    <span className="flex-1 truncate">{d.name}</span>
+                    <span className="flex-1 truncate" title={d.name}>
+                      {d.name}
+                    </span>
                     <PouTypeBadge type={d.type} language={d.language} />
                   </button>
                 </li>

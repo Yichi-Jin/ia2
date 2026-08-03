@@ -403,13 +403,13 @@ function DebugToolbar({
   onStep: () => void
 }) {
   return (
-    <span className="ml-2 flex items-center gap-0.5">
+    <span className="ml-2 flex items-center gap-2">
       {mode === "running" ? (
         <button
           type="button"
           onClick={onPause}
           title="Pause scan loop (freeze IO + program)"
-          className="rounded p-0.5 text-muted-foreground hover:bg-accent/40 hover:text-foreground"
+          className="rounded p-1.5 -m-1 text-muted-foreground hover:bg-accent/40 hover:text-foreground"
         >
           <Pause className="size-3" />
         </button>
@@ -418,7 +418,7 @@ function DebugToolbar({
           type="button"
           onClick={onResume}
           title="Resume continuous scanning"
-          className="rounded p-0.5 text-highlight hover:bg-highlight/15"
+          className="rounded p-1.5 -m-1 text-highlight hover:bg-highlight/15"
         >
           <Play className="size-3" />
         </button>
@@ -427,7 +427,7 @@ function DebugToolbar({
         type="button"
         onClick={onStep}
         title="Step one scan cycle (auto-pause after)"
-        className="rounded p-0.5 text-muted-foreground hover:bg-accent/40 hover:text-foreground"
+        className="rounded p-1.5 -m-1 text-muted-foreground hover:bg-accent/40 hover:text-foreground"
       >
         <StepForward className="size-3" />
       </button>
@@ -513,7 +513,7 @@ function VarRow({
           type="button"
           onClick={() => onPin(v.name)}
           className={cn(
-            "shrink-0 rounded p-0.5 transition-colors",
+            "shrink-0 rounded p-1.5 -m-1 transition-colors",
             isPinned
               ? "text-foreground"
               : "text-muted-foreground/30 hover:text-muted-foreground",
@@ -546,7 +546,7 @@ function VarRow({
           type="button"
           onClick={() => onToggleForce(v)}
           className={cn(
-            "shrink-0 rounded p-0.5 transition-colors",
+            "shrink-0 rounded p-1.5 -m-1 transition-colors",
             forced
               ? "text-destructive hover:text-destructive/80"
               : "text-muted-foreground/30 hover:text-muted-foreground",

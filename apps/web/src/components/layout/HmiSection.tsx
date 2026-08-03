@@ -88,7 +88,9 @@ export function HmiSection() {
               className="flex min-w-0 flex-1 items-center gap-1.5 text-left"
             >
               <MonitorDot className="size-3.5 shrink-0 text-muted-foreground" />
-              <span className="truncate">{s.path}</span>
+              <span className="truncate" title={s.path}>
+                {s.path}
+              </span>
               <span className="ml-auto shrink-0 font-mono text-[9px] uppercase tracking-wider text-muted-foreground">
                 L{s.level}
               </span>

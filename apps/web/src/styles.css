@@ -253,6 +253,17 @@ body {
   scroll-behavior: auto;
 }
 
+/* Keyboard focus must be visible on EVERY control, not just the ui/
+ * base components that carry their own ring classes. This is the
+ * floor for the hundreds of bare <button>s (tree rows, palette chips,
+ * monitor row controls, canvas nodes); components with a styled ring
+ * opt out via their own outline-none. :focus-visible keeps it off
+ * mouse clicks. */
+:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 1px;
+}
+
 /* Opt back into text selection for surfaces where the user really does
  * want to copy text — source editors, output logs, the diagnostics
  * panel. Wherever this is added, also re-enable text cursor so the
