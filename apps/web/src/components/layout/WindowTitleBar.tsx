@@ -52,6 +52,10 @@ function ProjectPicker({ currentName }: { currentName: string | null }) {
   const [open, setOpen] = useState(false)
   const [openList, setOpenList] = useState<OpenProjectInfo[] | null>(null)
   const [diskList, setDiskList] = useState<ProjectListing[] | null>(null)
+  // Name of the project a switch is in flight for. Drives the button
+  // label so a slow server-side open reads as "Opening…", never as a
+  // dead click.
+  const [switching, setSwitching] = useState<string | null>(null)
   const containerRef = useRef<HTMLDivElement | null>(null)
 
   // Refresh lists each time the dropdown opens so a project opened
@@ -87,18 +91,24 @@ function ProjectPicker({ currentName }: { currentName: string | null }) {
     // Ensure the server has this project open before we navigate —
     // the picker only lists open + disk-scanned projects, so the
     // explicit `openProject` round-trip costs at most one extra
-    // request on first switch.
+    // request on first switch. The timeout is the difference between
+    // "Opening…" and a dead click: a server stuck opening a project
+    // (an iCloud-evicted file can block the read indefinitely) must
+    // not hang the switch forever — after 8 s we navigate anyway and
+    // let the target page surface whatever is wrong.
+    setSwitching(name)
     try {
-      await apiOpenProject(path)
+      await apiOpenProject(path, { signal: AbortSignal.timeout(8000) })
     } catch {
-      /* ignore — server may already have it open */
+      /* ignore — server may already have it open, or the open timed
+       * out; either way the navigation below tells the truth */
     }
     window.location.href = url.toString()
   }, [])
 
   const openInNewWindow = useCallback(async (name: string, path: string) => {
     try {
-      await apiOpenProject(path)
+      await apiOpenProject(path, { signal: AbortSignal.timeout(8000) })
     } catch {
       /* already open is fine */
     }
@@ -120,7 +130,11 @@ function ProjectPicker({ currentName }: { currentName: string | null }) {
         className="flex items-center gap-1.5 rounded px-2 py-0.5 text-xs font-medium text-foreground/80 hover:bg-accent/40 hover:text-foreground"
         title="Switch project / open another window"
       >
-        <span className="truncate">{currentName ?? "No project"}</span>
+        <span className="truncate">
+          {switching !== null
+            ? `Opening ${switching}…`
+            : (currentName ?? "No project")}
+        </span>
         <ChevronDown className="size-3 opacity-60" />
       </button>
       {open && (

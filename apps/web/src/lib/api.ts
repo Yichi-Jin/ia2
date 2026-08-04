@@ -122,12 +122,16 @@ export async function createProject(name: string): Promise<ProjectInfo> {
   )
 }
 
-export async function openProject(path: string): Promise<ProjectInfo> {
+export async function openProject(
+  path: string,
+  opts?: { signal?: AbortSignal },
+): Promise<ProjectInfo> {
   return jsonOrThrow(
     await apiFetch(`/api/projects/open`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ path }),
+      signal: opts?.signal,
     }),
     "POST /api/projects/open",
   )
