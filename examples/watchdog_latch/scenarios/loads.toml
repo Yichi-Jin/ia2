@@ -1,0 +1,13 @@
+description = "fixture loads, scans, and holds the drive at Ready-to-switch-on (16#0006) — never Operation Enabled"
+
+[[steps]]
+wait_ms = 400
+
+# The program must be running and parked at Shutdown. If this ever reads
+# anything with bit3 (Switch on) set, the fixture has become able to move
+# an axis and must not be run on a live bench.
+[[steps]]
+expect = { var = "control_word", op = "eq", value = 6 }
+
+[[steps]]
+expect_never = { var = "control_word", op = "gt", value = 6, during_ms = 400 }

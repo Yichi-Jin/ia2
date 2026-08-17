@@ -666,6 +666,10 @@ struct Health {
     fieldbus_healthy: bool,
     /// Per-device breakdown behind `fieldbus_healthy`.
     devices: Vec<DeviceHealth>,
+    /// `true` once the scan watchdog latched the outputs off. A monitoring
+    /// probe that only checks `status: "ok"` would otherwise call a latched
+    /// runtime healthy — it is still serving HTTP and still scanning.
+    watchdog_tripped: bool,
 }
 
 async fn health(State(state): State<AppState>) -> Json<Health> {
@@ -683,6 +687,7 @@ async fn health(State(state): State<AppState>) -> Json<Health> {
         scan_count,
         fieldbus_healthy: devices.iter().all(|d| d.healthy),
         devices,
+        watchdog_tripped: state.handle.watchdog_tripped(),
     })
 }
 
@@ -699,6 +704,14 @@ struct Status {
     /// entry means that device's input variables in `last_snapshot` are
     /// frozen at last-known values (link down or connect failed).
     device_health: Vec<DeviceHealth>,
+    /// `true` once the scan watchdog tripped: the program lost real-time
+    /// guarantees, every output was zeroed and the output phase is latched
+    /// off until this process restarts.
+    ///
+    /// Check this before reading `last_snapshot` as plant state. The VM keeps
+    /// computing and `scan_count` keeps climbing after a trip, so a poller
+    /// watching only values sees a healthy plant while the bus holds zeros.
+    watchdog_tripped: bool,
     uptime_secs: u64,
     scan_count: u64,
     last_snapshot: Option<VarSnapshot>,
@@ -735,6 +748,7 @@ async fn status(State(state): State<AppState>) -> Json<Status> {
         program_instances: state.program_instances.clone(),
         devices: state.devices.clone(),
         device_health: state.handle.device_health(),
+        watchdog_tripped: state.handle.watchdog_tripped(),
         uptime_secs: state.start_time.elapsed().as_secs(),
         scan_count,
         last_snapshot,

@@ -109,6 +109,12 @@ pub struct EdgeProbe {
     /// Names of the devices behind a `fieldbus_healthy: Some(false)`, so a
     /// caller can say *which* bus died without a second round trip.
     pub unhealthy_devices: Vec<String>,
+    /// `Some(true)` when the edge's scan watchdog has latched its outputs
+    /// off. Such a runtime is reachable AND `fieldbus_healthy` — it answers
+    /// HTTP and keeps scanning — while driving nothing, so a script that
+    /// gates only on those two would call a dead plant healthy. `None` when
+    /// unreachable, or when the edge runs a build predating the flag.
+    pub watchdog_tripped: Option<bool>,
     /// First line of stderr / error message when unreachable. Gives the
     /// user enough hint to fix `~/.ssh/config` or `install_dir`.
     pub error: Option<String>,
@@ -266,6 +272,7 @@ fn unreachable_probe(error: String) -> EdgeProbe {
         runtime_version: None,
         fieldbus_healthy: None,
         unhealthy_devices: vec![],
+        watchdog_tripped: None,
         error: Some(error),
     }
 }
@@ -286,6 +293,10 @@ fn probe_from_health_body(body: &str) -> EdgeProbe {
         fieldbus_healthy: Option<bool>,
         #[serde(default)]
         devices: Vec<DeviceHealth>,
+        /// Defaulted for the same reason as `fieldbus_healthy`: an older
+        /// edge build simply omits it, which must read as "unknown".
+        #[serde(default)]
+        watchdog_tripped: Option<bool>,
     }
     let Ok(parsed) = serde_json::from_str::<Health>(body) else {
         return unreachable_probe(format!("unexpected body: {}", first_line(body)));
@@ -305,6 +316,7 @@ fn probe_from_health_body(body: &str) -> EdgeProbe {
             .filter(|d| !d.healthy)
             .map(|d| d.name.clone())
             .collect(),
+        watchdog_tripped: parsed.watchdog_tripped,
         error: None,
     }
 }

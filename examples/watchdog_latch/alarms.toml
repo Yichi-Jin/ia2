@@ -1,0 +1,2 @@
+# No alarms: the fixture's verdict is read from the drive statusword via
+# /status, not from the alarm engine.
