@@ -39,10 +39,28 @@ expect_never = { var = "overflow", op = "is_true", during_ms = 1500 }
 
 [[steps]]                                       # alarms are first-class assertables
 expect_alarm = { id = "level_high", active = true, within_ms = 5000 }
+
+[[steps]]                                       # fault injection: stall N scans so the
+inject = { scan_stall_ms = 25 }                 # watchdog trips via its REAL overrun path
+
+[[steps]]                                       # assert on the watchdog latch itself
+expect_watchdog = { tripped = true, within_ms = 3000 }
 ```
 
 Ops: `gt ge lt le eq ne is_true is_false` (`is_*` take no `value`).
-Defaults: `within_ms`/`during_ms` 5000, `expect_alarm.active` true.
+Defaults: `within_ms`/`during_ms` 5000, `expect_alarm.active` true,
+`inject.scans` threshold+1 (enough to trip), `expect_watchdog.tripped`
+true. `expect_watchdog` takes `within_ms` (state REACHED by deadline) or
+`during_ms` (state HOLDS for the whole window) — same split as expect vs
+expect_never. A negative control before inject must use `during_ms`:
+`{ tripped = false, during_ms = 800 }` — with within-semantics it would
+pass on the first poll and guard nothing. `inject` is the only
+vocabulary that can drive a TIMING fault deterministically — a CPU-burn
+program depends on host speed and proves nothing on a fast machine
+(reference scenario: `examples/watchdog_latch/scenarios/latch.toml`).
+After a trip the VM keeps computing and scan_count keeps climbing —
+that is exactly why a health gate must read `watchdog_tripped`, not
+liveness.
 Exit 0 = all held · 1 = a step failed, and the report names the step,
 the deadline, and the LAST OBSERVED value ("expected level > 20 within
 6000ms — last observed 3.5") — fix the logic, re-run. Execution stops

@@ -1,0 +1,36 @@
+description = "scan-stall injection trips the watchdog; the latch surfaces and the scan loop stays alive"
+
+# Let the program load and settle into a healthy cadence.
+[[steps]]
+wait_ms = 400
+
+# Negative control — the falsifiability guard. burn_n ships as 0, so a
+# healthy host must stay untripped for the whole window (during_ms =
+# hold semantics; within_ms would pass on one lucky poll and guard
+# nothing). If this fails, the fixture (or the host) is broken and
+# nothing after it would prove anything.
+[[steps]]
+expect_watchdog = { tripped = false, during_ms = 800 }
+
+# The program must be parked at Shutdown before the fault lands.
+[[steps]]
+expect = { var = "control_word", op = "eq", value = 6 }
+
+# Inject: six scans stalled 25 ms each against a 2 ms interval. The
+# watchdog trips through its real overrun path — same code as a real
+# stall on the bench.
+[[steps]]
+inject = { scan_stall_ms = 25 }
+
+[[steps]]
+expect_watchdog = { tripped = true, within_ms = 3000 }
+
+# The nasty half of the failure mode this fixture exists for: after the
+# latch the VM keeps computing. `scans` continuing to climb while
+# tripped is exactly why health gates must read watchdog_tripped and
+# not scan_count.
+[[steps]]
+wait_ms = 1000
+
+[[steps]]
+expect = { var = "scans", op = "gt", value = 900, within_ms = 2000 }

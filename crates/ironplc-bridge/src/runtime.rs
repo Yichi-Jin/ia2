@@ -162,6 +162,19 @@ enum RuntimeCommand {
         name: String,
         ack: tokio::sync::oneshot::Sender<Result<(), RuntimeWriteError>>,
     },
+    /// Fault injection: stall each of the next `scans` unit-scans by
+    /// `stall_ms` of real wall-clock time. The stall happens INSIDE the
+    /// measured scan window, so the cadence check at the bottom of the
+    /// scan sees a genuinely late scan and the overrun watchdog trips
+    /// through its production code path — no test-only shortcut. This is
+    /// the only way a `cs sim` scenario can drive a timing fault
+    /// deterministically; a CPU-burn program depends on host speed and
+    /// proves nothing on a fast machine.
+    InjectScanStall {
+        stall_ms: u64,
+        scans: u32,
+        ack: tokio::sync::oneshot::Sender<()>,
+    },
 }
 
 /// Scan-loop execution mode. Mutated by the HTTP API / CLI via
@@ -325,6 +338,29 @@ impl ProgramHandle {
             })
             .map_err(|_| RuntimeWriteError::Disconnected)?;
         ack_rx.await.map_err(|_| RuntimeWriteError::Disconnected)?
+    }
+
+    /// Inject an artificial stall into the next `scans` scans, `stall_ms`
+    /// each. With `stall_ms` comfortably over the task interval and
+    /// `scans` at least `WATCHDOG_OVERRUN_THRESHOLD + 1`, the scan
+    /// watchdog trips through its real code path a few hundred
+    /// milliseconds later. Backs `POST /api/runtime/inject-scan-stall`
+    /// and the `inject` scenario step — a test primitive; on a live
+    /// plant this deliberately drives the runtime into failsafe.
+    pub async fn inject_scan_stall(
+        &self,
+        stall_ms: u64,
+        scans: u32,
+    ) -> Result<(), RuntimeWriteError> {
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        self.cmd_tx
+            .send(RuntimeCommand::InjectScanStall {
+                stall_ms,
+                scans,
+                ack: ack_tx,
+            })
+            .map_err(|_| RuntimeWriteError::Disconnected)?;
+        ack_rx.await.map_err(|_| RuntimeWriteError::Disconnected)
     }
 
     /// Release a forced variable. The variable resumes program-driven
@@ -1080,7 +1116,7 @@ fn reconnect_worker(
 /// finish within its interval. 5 in a row → the simulation has lost
 /// real-time guarantees; engage failsafe and don't re-arm until the
 /// program is restarted.
-const WATCHDOG_OVERRUN_THRESHOLD: u32 = 5;
+pub const WATCHDOG_OVERRUN_THRESHOLD: u32 = 5;
 
 /// Snapshot fan-out cadence (and the cap on idle sleeps, so stop /
 /// command latency stays bounded even when every task interval is long).
@@ -1473,6 +1509,10 @@ async fn run_loop_async(
     // HTTP layer.
     let mut prev_paused = false;
     let mut vm_fault = false;
+    // Pending fault injection (InjectScanStall). Owned by the loop:
+    // written from the command drain, consumed one unit-scan at a time.
+    let mut inject_stall_ms: u64 = 0;
+    let mut inject_stall_scans: u32 = 0;
 
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -1565,6 +1605,21 @@ async fn run_loop_async(
                     }
                     let _ = ack.send(Ok(()));
                 }
+                RuntimeCommand::InjectScanStall {
+                    stall_ms,
+                    scans,
+                    ack,
+                } => {
+                    inject_stall_ms = stall_ms;
+                    inject_stall_scans = scans;
+                    tracing::warn!(
+                        stall_ms,
+                        scans,
+                        "scan-stall injection armed — the next scans will \
+                         deliberately overrun; expect the watchdog to trip"
+                    );
+                    let _ = ack.send(());
+                }
             }
         }
 
@@ -1622,6 +1677,15 @@ async fn run_loop_async(
                 continue;
             }
             ran_any = true;
+
+            // Fault injection: stall this unit-scan. Inside the scan on
+            // purpose — the cadence check at the bottom then measures a
+            // genuinely late scan, and the watchdog trips through the
+            // same path a real overrun takes.
+            if inject_stall_scans > 0 {
+                inject_stall_scans -= 1;
+                tokio::time::sleep(Duration::from_millis(inject_stall_ms)).await;
+            }
 
             // Input phase: bus → this unit's VM variables
             for rm in &unit_inputs[i] {
@@ -2634,6 +2698,85 @@ mod tests {
             tripped,
             "the latch must be visible through the handle, or a UI cannot \
              tell a latched run from a healthy one"
+        );
+    }
+
+    /// The injection primitive must trip the watchdog through the real
+    /// overrun path — and must be the ONLY reason it trips. The device
+    /// here never stalls; the first half of the test proves the run is
+    /// healthy on its own (the falsifiability guard: remove the inject
+    /// call and the second half fails), the second half proves the
+    /// injected stall alone reaches the latch, with outputs held off.
+    #[tokio::test]
+    async fn scan_stall_injection_trips_watchdog_through_the_real_path() {
+        let container = crate::compile(
+            "PROGRAM main\n\
+                VAR n : INT := 0; END_VAR\n\
+                n := n + 1;\n\
+            END_PROGRAM",
+        )
+        .expect("counter program compiles");
+
+        let failsafe_engaged = Arc::new(AtomicBool::new(false));
+        let writes_after_failsafe = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dev = StallingDevice {
+            name: "mock".into(),
+            // Zero stall: the device is innocent. Only the injection may
+            // blow the budget.
+            stall: Duration::ZERO,
+            failsafe_engaged: failsafe_engaged.clone(),
+            writes_after_failsafe: writes_after_failsafe.clone(),
+        };
+        let devices: Vec<Box<dyn IoDevice>> = vec![Box::new(dev)];
+        let mappings = vec![project::Mapping {
+            application: "main".into(),
+            variable: "n".into(),
+            direction: project::Direction::Output,
+            device: "mock".into(),
+            channel: "aout".into(),
+        }];
+
+        let handle = spawn_units_inner(
+            vec![single_unit(container, 5)],
+            DeviceSource::Prebuilt(devices),
+            mappings,
+            None,
+        );
+
+        // Negative control: with no injection the run must stay healthy.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !handle.watchdog_tripped(),
+            "a zero-stall device must not trip the watchdog by itself — \
+             if this fires, the fixture is broken and the test proves nothing"
+        );
+
+        // Inject: 12 ms stalls against a 5 ms interval, six scans — one
+        // more than WATCHDOG_OVERRUN_THRESHOLD.
+        handle
+            .inject_scan_stall(12, WATCHDOG_OVERRUN_THRESHOLD + 1)
+            .await
+            .expect("inject reaches the loop");
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        let tripped = handle.watchdog_tripped();
+        tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
+            .await
+            .expect("shutdown joins");
+
+        assert!(
+            tripped,
+            "six injected 12ms stalls against a 5ms interval must trip the \
+             watchdog through the real overrun path"
+        );
+        assert!(
+            failsafe_engaged.load(Ordering::Relaxed),
+            "the trip must reach enter_failsafe"
+        );
+        assert_eq!(
+            writes_after_failsafe.load(Ordering::Relaxed),
+            0,
+            "the injected trip must latch outputs off exactly like a real one"
         );
     }
 

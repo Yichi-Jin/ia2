@@ -502,6 +502,7 @@ async fn main() -> Result<()> {
         .route("/write", post(rt_write))
         .route("/force", post(rt_force))
         .route("/unforce", post(rt_unforce))
+        .route("/inject-scan-stall", post(rt_inject_scan_stall))
         .route("/history", get(history))
         .route("/alarms", get(alarms_state))
         .route("/alarms/{id}/ack", post(alarms_ack))
@@ -1092,6 +1093,35 @@ async fn rt_unforce(
         .await
         .map_err(write_err)?;
     Ok(Json(serde_json::json!({ "ok": true, "name": req.name })))
+}
+
+#[derive(serde::Deserialize)]
+struct InjectScanStallReq {
+    stall_ms: u64,
+    #[serde(default = "default_inject_scans")]
+    scans: u32,
+}
+
+fn default_inject_scans() -> u32 {
+    ironplc_bridge::WATCHDOG_OVERRUN_THRESHOLD + 1
+}
+
+/// Fault injection (test primitive): stall the next N scans so the
+/// scan watchdog trips through its real path. Deliberately drives the
+/// runtime into latched failsafe — bench rehearsals of the watchdog
+/// runbook, not normal operation. Restart the service to recover.
+async fn rt_inject_scan_stall(
+    State(state): State<AppState>,
+    Json(req): Json<InjectScanStallReq>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    state
+        .handle
+        .inject_scan_stall(req.stall_ms, req.scans)
+        .await
+        .map_err(write_err)?;
+    Ok(Json(
+        serde_json::json!({ "injected": { "stall_ms": req.stall_ms, "scans": req.scans } }),
+    ))
 }
 
 async fn stop_handler(State(state): State<AppState>) -> impl IntoResponse {

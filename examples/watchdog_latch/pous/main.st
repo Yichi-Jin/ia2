@@ -1,21 +1,29 @@
 (* Bench fixture for the scan-watchdog latch.
 
-   The body deliberately burns more CPU than its task interval allows, so
-   every scan overruns. Five in a row trip the watchdog, which calls
-   enter_failsafe (zeroing the output PDI) and latches the output phase
-   off. What the bench is asked to answer is whether those zeros STAY on
-   the wire.
+   Two ways to make the scans overrun, one per environment:
+
+   - sim: `scenarios/latch.toml` uses the `inject` step — deterministic,
+     host-speed independent, no burn needed. burn_n stays 0.
+   - bench: force the burn live (`cs runtime force burn_n 200000
+     --edge <edge>`) so every scan overruns for real, HTTP-free once
+     armed. Five in a row trip the watchdog, which calls enter_failsafe
+     (zeroing the output PDI) and latches the output phase off. What the
+     bench answers is whether those zeros STAY on the wire.
+
+   burn_n defaults to 0 (harmless scan) so the project deploys healthy
+   and the trip is an explicit operator/scenario action, not a startup
+   race.
 
    Safety: control_word is only ever driven to 16#0006 (Shutdown), which
    parks a CiA402 drive at Ready-to-switch-on. Operation Enabled is never
    commanded, so no axis can move during this test. The observable is the
    drive's statusword, not motion.
 
-   burn_n is a forceable variable: raise it until scan_count stops
-   tracking wall clock, i.e. until the scans actually overrun. *)
+   When forcing burn_n, raise it until scan_count stops tracking wall
+   clock, i.e. until the scans actually overrun on YOUR host. *)
 PROGRAM main
   VAR
-    burn_n       : DINT := 200000;
+    burn_n       : DINT := 0;
     idx          : DINT;
     sink         : DINT;
     scans        : DINT;

@@ -160,6 +160,7 @@ the *deployed* edge runtime, proxy the same ops through
 | `GET` | `/api/runtime/forces` | List currently-forced variables. Returns `ForceEntry[]` (`[]` when not running). |
 | `POST` | `/api/runtime/forces/{name}` | Pin a variable every cycle until released. Body: `ForceRequest { value }`. Returns `ForceResponse { name, value }`; 404 unknown variable, 409 if stopped. |
 | `DELETE` | `/api/runtime/forces/{name}` | Release a forced variable. Idempotent (200 even if it wasn't forced). |
+| `POST` | `/api/runtime/inject-scan-stall` | Fault injection (test primitive): stall the next `scans` scans by `stall_ms` each so the scan watchdog trips through its real overrun path. Body: `{ stall_ms, scans? }` (`scans` defaults to threshold + 1). Backs the scenario DSL's `inject` step; on a live plant this deliberately drives the runtime into latched failsafe — only a program restart recovers. 409 if stopped. |
 
 ## Runtime history & alarms
 
@@ -262,6 +263,7 @@ the debug ops).
 | `POST` | `/step` | Advance N cycles while paused. Body: `{ cycles }`. Returns `{ mode }`. |
 | `POST` | `/write` | One-shot write of a variable. Body: `{ name, value }`. Returns the applied value. |
 | `POST` | `/force` | Pin a variable every cycle until released. Body: `{ name, value }`. |
+| `POST` | `/inject-scan-stall` | Fault injection (test primitive): same contract as the server's `/api/runtime/inject-scan-stall` — stall `scans` scans by `stall_ms` each and trip the watchdog for real. Body: `{ stall_ms, scans? }`. |
 | `POST` | `/unforce` | Release a forced variable. Body: `{ name }`. |
 | `GET` | `/history` | Downsampled history, same query/response shape as `/api/runtime/history`. Backed by JSONL segments under the edge's state dir — survives restarts AND deploys (state/ sits beside `current`). |
 | `GET` | `/alarms` | Live `AlarmState[]` for the deployed `alarms.toml`, standing-first. `/status` carries the `alarms_standing` count on the panel's existing poll. |

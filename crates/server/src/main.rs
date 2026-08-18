@@ -300,6 +300,10 @@ async fn main() -> anyhow::Result<()> {
         )
         .route("/api/runtime/status", get(runtime_routes::runtime_status))
         // Debug control trio
+        .route(
+            "/api/runtime/inject-scan-stall",
+            post(runtime_routes::inject_scan_stall),
+        )
         .route("/api/runtime/pause", post(runtime_routes::runtime_pause))
         .route("/api/runtime/resume", post(runtime_routes::runtime_resume))
         .route("/api/runtime/step", post(runtime_routes::runtime_step))
