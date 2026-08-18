@@ -13,7 +13,13 @@ name = "servo"
 protocol = "ethercat"
 nic = "_sim"           # bench: "enp2s0"
 cycle_us = 2000
-dc_sync = "off"
+# Device-level sync0, not off: on a shared bench chain, slaves this
+# project doesn't list still join the same EtherCAT group, and group OP
+# is all-or-nothing. An unlisted servo left free-running never reaches
+# OP and vetoes the whole connect (the symptom is a 10 s init timeout).
+# Extra slaves that tolerate DC (they all must, to be on a DC bus) are
+# unaffected by receiving sync0.
+dc_sync = "sync0"
 
 [[slaves]]
 index = 0

@@ -17,7 +17,7 @@ Nothing on the bench needs to be mechanically prepared.
 |---|---|---|
 | edge up | `ssh edge 'uptime'` | responds (key auth, no password) |
 | EtherCAT NIC up | `ssh edge 'ip -br link show enp2s0'` | `UP` — if `DOWN`: `sudo ip link set enp2s0 up` |
-| Drives on the chain | `ssh edge 'curl -s localhost:13001/discover'` | 2 × `InoSV660N`, `connected: true` |
+| Drives on the chain | `ssh edge 'curl -s localhost:13001/discover'` | slave 0 = `InoSV660N` (the drive the fixture maps), `connected: true`. Extra slaves further down the chain are fine — the fixture's device-level `dc_sync = "sync0"` keeps them from vetoing group OP |
 | Rollback point noted | `ssh edge 'ls -la ~/ia2-versions/'` | note the `current` symlink target |
 
 > Nobody else should be using the bench — this restarts `ia2`.
