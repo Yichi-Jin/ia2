@@ -132,6 +132,11 @@ gate on health must read `fieldbus_healthy` / `unhealthy_devices` from
 `cs probe --json`, not the exit status. Same data on
 `/api/runtime/status`'s `device_health` for a locally-running program.
 
+`watchdog_tripped` is the third field such a gate must read, and the
+nastiest: a latched runtime is reachable AND fieldbus-healthy AND its scan
+count keeps climbing, while it drives nothing. `probe` prints
+`WATCHDOG LATCHED` for it; only a restart clears it.
+
 Deploy REFUSES to lie: a failed restart, broken tar stream, or missing
 version stamp fails the deploy (`ok:false` + log). install_dir/systemd
 drift surfaces as a structured `warning` field. Attach/detach live

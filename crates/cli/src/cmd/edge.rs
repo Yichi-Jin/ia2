@@ -75,15 +75,30 @@ pub(crate) fn cmd_probe(client: &Client, name: &str, json: bool) -> Result<i32> 
             .and_then(|v| v.as_array())
             .map(|a| a.iter().filter_map(|d| d.as_str()).collect())
             .unwrap_or_default();
-        if down.is_empty() {
+        // A latched watchdog is the harsher version of the same trap: the
+        // runtime answers, every bus is healthy, the scan count climbs —
+        // and not one output is being driven. It must never print ✓.
+        let latched = value
+            .get("watchdog_tripped")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if down.is_empty() && !latched {
             println!("✓ {name} reachable · v{version} · {scans} scans · up {uptime}");
         } else {
             println!("⚠ {name} reachable · v{version} · {scans} scans · up {uptime}");
-            println!(
-                "  fieldbus DEGRADED — {} down (inputs frozen, outputs dropped): {}",
-                down.len(),
-                down.join(", ")
-            );
+            if latched {
+                println!(
+                    "  WATCHDOG LATCHED — scan deadline lost; outputs zeroed and \
+                     held off until the program is restarted"
+                );
+            }
+            if !down.is_empty() {
+                println!(
+                    "  fieldbus DEGRADED — {} down (inputs frozen, outputs dropped): {}",
+                    down.len(),
+                    down.join(", ")
+                );
+            }
         }
     } else {
         let err = value

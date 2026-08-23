@@ -1,0 +1,90 @@
+# Scan-watchdog latch fixture — one SV660N, enable chain only.
+#
+# Ships with nic = "_sim" so the project loads and scans with no hardware.
+# For the bench run, change nic to the real EtherCAT port (often "enp2s0").
+#
+# PDI offsets below are the SV660N default CSP layout as verified on the
+# bench (see examples/eg_gear_incycle/devices/servo.toml): statusword sits
+# at TxPDO byte 2 and position_actual at byte 4 — NOT 0 and 2. Getting
+# this wrong makes the enable-ready test read the error-code register and
+# the drive never appears ready.
+
+name = "servo"
+protocol = "ethercat"
+nic = "_sim"           # bench: "enp2s0"
+cycle_us = 2000
+# Device-level sync0, not off: on a shared bench chain, slaves this
+# project doesn't list still join the same EtherCAT group, and group OP
+# is all-or-nothing. An unlisted servo left free-running never reaches
+# OP and vetoes the whole connect (the symptom is a 10 s init timeout).
+# Extra slaves that tolerate DC (they all must, to be on a DC bus) are
+# unaffected by receiving sync0.
+dc_sync = "sync0"
+
+[[slaves]]
+index = 0
+name = "sv660n"
+vendor_id = 1048576    # 0x00100000 Inovance
+product_id = 786701    # 0x000C010D SV660N
+dc_sync = "sync0"
+
+# CSP mode. Kept even though this fixture never commands motion, so the
+# drive's state machine behaves exactly as it does in the motion projects.
+[[slaves.init_sdo]]
+index = 0x6060
+sub_index = 0
+value = 8
+bits = 8
+
+# 30 % torque cap. Belt-and-braces: the fixture cannot reach Operation
+# Enabled, but if someone edits the program this keeps the ceiling low.
+[[slaves.init_sdo]]
+index = 0x6072
+sub_index = 0
+value = 300
+bits = 16
+
+[[channels]]
+name = "controlword"
+slave_index = 0
+direction = "rx_pdo"
+pdo_index = 0x6040
+sub_index = 0
+bit_length = 16
+data_type = "u16"
+pdi_byte_offset = 0
+pdi_bit_offset = 0
+
+# Declared so the RxPDO has its full length, intentionally unmapped.
+[[channels]]
+name = "target_position"
+slave_index = 0
+direction = "rx_pdo"
+pdo_index = 0x607A
+sub_index = 0
+bit_length = 32
+data_type = "i32"
+pdi_byte_offset = 2
+pdi_bit_offset = 0
+
+[[channels]]
+name = "statusword"
+slave_index = 0
+direction = "tx_pdo"
+pdo_index = 0x6041
+sub_index = 0
+bit_length = 16
+data_type = "u16"
+pdi_byte_offset = 2
+pdi_bit_offset = 0
+
+[[channels]]
+name = "position_actual"
+slave_index = 0
+direction = "tx_pdo"
+pdo_index = 0x6064
+sub_index = 0
+bit_length = 32
+data_type = "i32"
+pdi_byte_offset = 4
+pdi_bit_offset = 0

@@ -215,6 +215,16 @@ pub struct ProgramHandle {
     /// refreshed by the scan loop each round. Shared so the HTTP layer can
     /// serve health without a scan-loop round-trip.
     device_health: Arc<std::sync::Mutex<Vec<DeviceHealth>>>,
+    /// Latched `true` once the scan watchdog has tripped: outputs are held
+    /// at the zeros `enter_failsafe` wrote and the output phase no longer
+    /// runs. Monotonic — only a restart clears it.
+    ///
+    /// Shared for the same reason `device_health` is: after a trip the VM
+    /// keeps computing, `scan_count` keeps advancing and every variable
+    /// looks normal, so nothing in a snapshot reveals that the plant has
+    /// stopped being driven. Without this flag a UI cannot tell a healthy
+    /// run from a latched one.
+    watchdog_tripped: Arc<AtomicBool>,
     /// Why the scan loop died, if it died: set exactly once — to the trap
     /// message when a VM trap stops the plant, or to the panic payload if
     /// the loop panicked — and never on a clean stop. A `watch` channel
@@ -399,6 +409,14 @@ impl ProgramHandle {
             .unwrap_or_default()
     }
 
+    /// `true` once the scan watchdog has tripped and latched the outputs
+    /// off. Stays `true` until the program is restarted — a caller seeing
+    /// this must not read live variable values as plant state, because the
+    /// bus is holding zeros while the VM keeps computing.
+    pub fn watchdog_tripped(&self) -> bool {
+        self.watchdog_tripped.load(Ordering::Relaxed)
+    }
+
     /// Why the scan loop died, if it died: `Some(message)` after a VM trap
     /// or a scan-thread panic, `None` while running or after a clean stop.
     /// Callers watching the snapshot stream use this at stream close to
@@ -536,6 +554,7 @@ fn spawn_units_inner(
     let forces = Arc::new(std::sync::Mutex::new(HashMap::<String, i32>::new()));
     let device_reports = Arc::new(std::sync::Mutex::new(Vec::<DeviceReport>::new()));
     let device_health = Arc::new(std::sync::Mutex::new(Vec::<DeviceHealth>::new()));
+    let watchdog_tripped = Arc::new(AtomicBool::new(false));
     let (fault_tx, fault_rx) = tokio::sync::watch::channel(None::<String>);
 
     let stop_clone = stop.clone();
@@ -545,6 +564,7 @@ fn spawn_units_inner(
     let forces_clone = forces.clone();
     let device_reports_clone = device_reports.clone();
     let device_health_clone = device_health.clone();
+    let watchdog_tripped_clone = watchdog_tripped.clone();
     let device_reports_reconnect = device_reports.clone();
 
     let join_handle = std::thread::spawn(move || {
@@ -660,6 +680,7 @@ fn spawn_units_inner(
                 mode_clone,
                 forces_clone,
                 device_health_clone,
+                watchdog_tripped_clone,
                 &fault_tx,
                 reconnect_rx,
                 state_path,
@@ -738,6 +759,7 @@ fn spawn_units_inner(
         forces,
         device_reports,
         device_health,
+        watchdog_tripped,
         fault: fault_rx,
         thread: Arc::new(std::sync::Mutex::new(Some(join_handle))),
     }
@@ -1202,6 +1224,10 @@ async fn run_loop_async(
     mode: Arc<std::sync::Mutex<RuntimeMode>>,
     forces: Arc<std::sync::Mutex<HashMap<String, i32>>>,
     device_health: Arc<std::sync::Mutex<Vec<DeviceHealth>>>,
+    // The watchdog latch. Shared rather than local so the HTTP layer can
+    // tell a latched run from a healthy one — see the field docs on
+    // `ProgramHandle::watchdog_tripped`.
+    watchdog_tripped: Arc<AtomicBool>,
     // Borrowed: the wrapper keeps ownership so its panic path can also
     // record into the same channel (and so the sender drops — closing
     // the watch — only when the scan thread exits).
@@ -1431,10 +1457,20 @@ async fn run_loop_async(
     let mut exec_order: Vec<usize> = (0..n_units).collect();
     exec_order.sort_by_key(|&i| (units[i].priority, i));
     // Watchdog: any unit accumulating WATCHDOG_OVERRUN_THRESHOLD
-    // consecutive overruns fires failsafe once and disarms — the loop
-    // keeps scanning so operators can see live state, but outputs stay
-    // safe until the program is restarted (industrial convention).
-    let mut watchdog_armed = true;
+    // consecutive overruns fires failsafe once and latches — the loop keeps
+    // scanning so operators can see live state, but outputs stay safe until
+    // the program is restarted (industrial convention).
+    //
+    // `watchdog_tripped` IS the latch, not just a fire-once debounce: the
+    // output phase below runs only while it is clear. Setting it on trip is
+    // what makes the zeros written by `enter_failsafe` stick — otherwise the
+    // very next scan would push freshly computed (non-zero) values back over
+    // them, and the "outputs stay safe" promise above would be a comment
+    // with no code behind it.
+    //
+    // It is the shared flag rather than a local, so exactly one piece of
+    // state answers "are outputs latched off" for both the loop and the
+    // HTTP layer.
     let mut prev_paused = false;
     let mut vm_fault = false;
 
@@ -1648,17 +1684,26 @@ async fn run_loop_async(
             }
             clocks[i].scan_count += 1;
 
-            // Output phase: this unit's VM variables → bus
-            for rm in &unit_outputs[i] {
-                let Ok(raw) = runnings[i].read_variable_raw(VarIndex::new(rm.var_index)) else {
-                    continue;
-                };
-                let value = value_for_type(raw, rm.type_tag);
-                let Some(dev) = devices.get_mut(rm.device_index) else {
-                    continue;
-                };
-                if let Err(e) = dev.write_channel(&rm.channel, value).await {
-                    tracing::debug!(channel = %rm.channel, %e, "output write failed");
+            // Output phase: this unit's VM variables → bus.
+            //
+            // Skipped entirely once the watchdog has latched. `enter_failsafe`
+            // zeroed the output mirror; the cyclic bus thread keeps flushing
+            // that mirror every cycle, so leaving it alone is what holds the
+            // outputs safe. Writing here would overwrite the zeros on the very
+            // next scan — which is exactly the bug this guard closes. The scan
+            // itself keeps running so operators still see live state.
+            if !watchdog_tripped.load(Ordering::Relaxed) {
+                for rm in &unit_outputs[i] {
+                    let Ok(raw) = runnings[i].read_variable_raw(VarIndex::new(rm.var_index)) else {
+                        continue;
+                    };
+                    let value = value_for_type(raw, rm.type_tag);
+                    let Some(dev) = devices.get_mut(rm.device_index) else {
+                        continue;
+                    };
+                    if let Err(e) = dev.write_channel(&rm.channel, value).await {
+                        tracing::debug!(channel = %rm.channel, %e, "output write failed");
+                    }
                 }
             }
 
@@ -1685,21 +1730,25 @@ async fn run_loop_async(
                     );
                     clocks[i].warned_overrun = true;
                 }
-                if watchdog_armed && clocks[i].consecutive_overruns >= WATCHDOG_OVERRUN_THRESHOLD {
+                if !watchdog_tripped.load(Ordering::Relaxed)
+                    && clocks[i].consecutive_overruns >= WATCHDOG_OVERRUN_THRESHOLD
+                {
                     tracing::error!(
                         instance = %instances[i],
                         consecutive = clocks[i].consecutive_overruns,
                         threshold = WATCHDOG_OVERRUN_THRESHOLD,
                         interval_us = clocks[i].interval.as_micros() as u64,
-                        "watchdog tripped — engaging failsafe (outputs zeroed; \
-                         restart the program to re-arm)"
+                        "watchdog tripped — engaging failsafe (outputs zeroed \
+                         and latched off; restart the program to re-arm)"
                     );
                     for dev in devices.iter_mut() {
                         if let Err(e) = dev.enter_failsafe().await {
                             tracing::warn!(device = %dev.name(), %e, "watchdog failsafe call failed");
                         }
                     }
-                    watchdog_armed = false;
+                    // Latch: from here on the output phase is skipped, so the
+                    // zeros just written stay on the bus until a restart.
+                    watchdog_tripped.store(true, Ordering::Relaxed);
                 }
                 clocks[i].next_due = after + clocks[i].interval;
             }
@@ -2424,6 +2473,167 @@ mod tests {
         assert_eq!(
             got, probe,
             "LREAL must cross device→VM→device without 32-bit truncation"
+        );
+    }
+
+    /// Blows the scan deadline from inside the output phase, then counts
+    /// every write that still arrives after the watchdog engaged failsafe.
+    /// A latched watchdog must leave that count at zero — the zeros written
+    /// by `enter_failsafe` have to survive until the program is restarted.
+    struct StallingDevice {
+        name: String,
+        stall: Duration,
+        failsafe_engaged: Arc<AtomicBool>,
+        writes_after_failsafe: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl IoDevice for StallingDevice {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        async fn read_channel(&mut self, _channel: &str) -> Result<ChannelValue, IoError> {
+            Ok(ChannelValue::I32(0))
+        }
+        async fn write_channel(
+            &mut self,
+            _channel: &str,
+            _value: ChannelValue,
+        ) -> Result<(), IoError> {
+            // Stalling here is what makes the scan overrun its interval; it
+            // also puts the counter on the exact path the guard protects.
+            tokio::time::sleep(self.stall).await;
+            if self.failsafe_engaged.load(Ordering::Relaxed) {
+                self.writes_after_failsafe.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(())
+        }
+        async fn enter_failsafe(&mut self) -> Result<(), IoError> {
+            self.failsafe_engaged.store(true, Ordering::Relaxed);
+            Ok(())
+        }
+        async fn shutdown(&mut self) -> Result<(), IoError> {
+            Ok(())
+        }
+        fn is_healthy(&self) -> bool {
+            true
+        }
+    }
+
+    /// P1 power-on gate: once the scan watchdog trips, no non-zero output
+    /// may reach the bus until an explicit restart.
+    ///
+    /// Before the latch existed this failed by design: `enter_failsafe`
+    /// zeroed the output mirror exactly once, the trip flag only stopped
+    /// failsafe from firing a *second* time, and the very next scan pushed
+    /// freshly computed values straight back over the zeros. The comment
+    /// promised "outputs stay safe until the program is restarted"; nothing
+    /// in the executable path delivered it.
+    #[tokio::test]
+    async fn watchdog_trip_latches_outputs_off_until_restart() {
+        let container = crate::compile(
+            "PROGRAM main\n\
+                VAR n : INT := 0; END_VAR\n\
+                n := n + 1;\n\
+            END_PROGRAM",
+        )
+        .expect("counter program compiles");
+
+        let failsafe_engaged = Arc::new(AtomicBool::new(false));
+        let writes_after_failsafe = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dev = StallingDevice {
+            name: "mock".into(),
+            // Comfortably over the 5 ms interval so every scan overruns and
+            // the 5-in-a-row threshold is reached in well under the budget.
+            stall: Duration::from_millis(12),
+            failsafe_engaged: failsafe_engaged.clone(),
+            writes_after_failsafe: writes_after_failsafe.clone(),
+        };
+        let devices: Vec<Box<dyn IoDevice>> = vec![Box::new(dev)];
+        let mappings = vec![project::Mapping {
+            application: "main".into(),
+            variable: "n".into(),
+            direction: project::Direction::Output,
+            device: "mock".into(),
+            channel: "aout".into(),
+        }];
+
+        let handle = spawn_units_inner(
+            vec![single_unit(container, 5)],
+            DeviceSource::Prebuilt(devices),
+            mappings,
+            None,
+        );
+        // ~5 stalled scans trip the watchdog; the rest of the window is the
+        // part that matters — it is where a non-latching build writes again.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
+            .await
+            .expect("shutdown joins");
+
+        assert!(
+            failsafe_engaged.load(Ordering::Relaxed),
+            "watchdog must trip when every scan overruns its interval"
+        );
+        assert_eq!(
+            writes_after_failsafe.load(Ordering::Relaxed),
+            0,
+            "no output may be written after the watchdog latched — the zeros \
+             from enter_failsafe must hold until an explicit restart"
+        );
+    }
+
+    /// A latched run must be distinguishable from a healthy one. After the
+    /// trip the VM keeps computing and `scan_count` keeps advancing, so
+    /// variable values alone never reveal that the bus is holding zeros —
+    /// the flag on the handle is the only honest signal.
+    #[tokio::test]
+    async fn watchdog_latch_surfaces_on_the_handle() {
+        let container = crate::compile(
+            "PROGRAM main\n\
+                VAR n : INT := 0; END_VAR\n\
+                n := n + 1;\n\
+            END_PROGRAM",
+        )
+        .expect("counter program compiles");
+
+        let dev = StallingDevice {
+            name: "mock".into(),
+            stall: Duration::from_millis(12),
+            failsafe_engaged: Arc::new(AtomicBool::new(false)),
+            writes_after_failsafe: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+        let devices: Vec<Box<dyn IoDevice>> = vec![Box::new(dev)];
+        let mappings = vec![project::Mapping {
+            application: "main".into(),
+            variable: "n".into(),
+            direction: project::Direction::Output,
+            device: "mock".into(),
+            channel: "aout".into(),
+        }];
+
+        let handle = spawn_units_inner(
+            vec![single_unit(container, 5)],
+            DeviceSource::Prebuilt(devices),
+            mappings,
+            None,
+        );
+        assert!(
+            !handle.watchdog_tripped(),
+            "a fresh run must not report a tripped watchdog"
+        );
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let tripped = handle.watchdog_tripped();
+
+        tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
+            .await
+            .expect("shutdown joins");
+
+        assert!(
+            tripped,
+            "the latch must be visible through the handle, or a UI cannot \
+             tell a latched run from a healthy one"
         );
     }
 

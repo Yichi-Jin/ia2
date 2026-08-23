@@ -1,0 +1,12 @@
+# 2 ms matches the weave/motion cadence. The program body cannot finish in
+# 2 ms by construction (see pous/main.st burn_n), so every scan overruns
+# and the watchdog reaches its 5-in-a-row threshold within ~10 ms.
+[[tasks]]
+name = "motion"
+interval_ms = 2
+priority = 1
+
+[[programs]]
+instance = "main_inst"
+program = "main"
+task = "motion"

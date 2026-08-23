@@ -1,0 +1,17 @@
+# Minimal CiA402 enable-chain mapping. target_position is deliberately NOT
+# mapped: this fixture never commands motion, and leaving those bytes
+# unmapped keeps the test about the controlword alone.
+
+[[mappings]]
+application = "main"
+variable = "status_word"
+direction = "input"
+device = "servo"
+channel = "statusword"
+
+[[mappings]]
+application = "main"
+variable = "control_word"
+direction = "output"
+device = "servo"
+channel = "controlword"
