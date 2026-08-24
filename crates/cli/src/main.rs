@@ -356,6 +356,14 @@ pub(crate) enum RuntimeCmd {
     /// Pin a variable to a value every scan until unforced. Values are
     /// human notation — the CLI bit-packs by the variable's IEC type
     /// (REAL → IEEE-754 bits, BOOL → 0/1).
+    ///
+    /// The force is applied BEFORE the program runs, so it wins over the
+    /// bus but loses to the program: a variable the program assigns every
+    /// scan (most outputs) is overwritten by that assignment and the force
+    /// never reaches the field. Force works on variables the program only
+    /// reads — setpoints, mode requests, jog commands. To override a
+    /// program-written output you have to give the program a variable to
+    /// read (e.g. an override input it applies last).
     Force {
         name: String,
         value: String,
