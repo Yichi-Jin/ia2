@@ -116,7 +116,7 @@ struct AlarmStep {
     within_ms: u64,
 }
 
-/// Fault injection: stall each of the next `scans` scans by
+/// Fault injection: stall each of the next `scans` **ticks** by
 /// `scan_stall_ms` of wall-clock time, so the scan watchdog trips
 /// through its real code path. The only scenario vocabulary that can
 /// drive a timing fault deterministically — a CPU-burn program proves
@@ -420,10 +420,34 @@ fn run_step(
             let status = client
                 .get("/api/runtime/status")
                 .map_err(|e| format!("expect_watchdog: {e:#}"))?;
-            Ok(status
+            // A missing field must FAIL, not read as `false`. Against a
+            // runtime that predates the latch, `unwrap_or(false)` turned
+            // `tripped = false` into a hollow pass: the negative control
+            // that guards every scenario below it asserted nothing.
+            let tripped = status
                 .get("watchdog_tripped")
                 .and_then(|v| v.as_bool())
-                .unwrap_or(false))
+                .ok_or_else(|| {
+                    "expect_watchdog: /api/runtime/status carries no boolean \
+                     `watchdog_tripped` — this runtime predates the watchdog \
+                     latch, so the step cannot be evaluated (upgrade the \
+                     runtime, or drop the step)"
+                        .to_string()
+                })?;
+            // Nothing running ⇒ the latch means nothing. Without this a
+            // scenario whose program never started still "passed" its
+            // `tripped = false` control.
+            let running = status
+                .get("running")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if !running {
+                return Err("expect_watchdog: no program is running — the \
+                            watchdog state is not meaningful (did the program \
+                            fail to start?)"
+                    .to_string());
+            }
+            Ok(tripped)
         };
         let word = |b: bool| {
             if b {

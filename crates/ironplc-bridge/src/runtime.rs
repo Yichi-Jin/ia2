@@ -162,7 +162,7 @@ enum RuntimeCommand {
         name: String,
         ack: tokio::sync::oneshot::Sender<Result<(), RuntimeWriteError>>,
     },
-    /// Fault injection: stall each of the next `scans` unit-scans by
+    /// Fault injection: stall each of the next `scans` **ticks** by
     /// `stall_ms` of real wall-clock time. The stall happens INSIDE the
     /// measured scan window, so the cadence check at the bottom of the
     /// scan sees a genuinely late scan and the overrun watchdog trips
@@ -340,8 +340,11 @@ impl ProgramHandle {
         ack_rx.await.map_err(|_| RuntimeWriteError::Disconnected)?
     }
 
-    /// Inject an artificial stall into the next `scans` scans, `stall_ms`
-    /// each. With `stall_ms` comfortably over the task interval and
+    /// Inject an artificial stall into the next `scans` **ticks**,
+    /// `stall_ms` each. Counted in ticks, not unit-scans: the watchdog
+    /// counts consecutive overruns *per unit*, and one stall makes every
+    /// unit due in that tick late, so a per-unit-scan budget burned N x
+    /// too fast on an N-unit project and never reached the threshold. With `stall_ms` comfortably over the task interval and
     /// `scans` at least `WATCHDOG_OVERRUN_THRESHOLD + 1`, the scan
     /// watchdog trips through its real code path a few hundred
     /// milliseconds later. Backs `POST /api/runtime/inject-scan-stall`
@@ -1118,6 +1121,22 @@ fn reconnect_worker(
 /// program is restarted.
 pub const WATCHDOG_OVERRUN_THRESHOLD: u32 = 5;
 
+/// Upper bounds on fault injection. A stall is a deliberate denial of
+/// service against the scan loop; unbounded, one typo (or a hostile
+/// caller) parks the runtime for hours with no way back but a restart.
+/// 1 s is already ~500x the 2 ms motion cadence — far past anything a
+/// test needs. Values above the cap are clamped and warned, not
+/// rejected: a scenario that asked for too much still gets its fault.
+pub const MAX_INJECT_STALL_MS: u64 = 1_000;
+/// Ditto for the scan budget. THRESHOLD + 1 is the useful value; this
+/// only stops a runaway.
+pub const MAX_INJECT_SCANS: u32 = 1_000;
+
+/// An injected stall is slept in slices this long so a stop request is
+/// observed promptly. Sleeping the full stall in one call made
+/// `shutdown` wait it out.
+const INJECT_STALL_SLICE: Duration = Duration::from_millis(20);
+
 /// Snapshot fan-out cadence (and the cap on idle sleeps, so stop /
 /// command latency stays bounded even when every task interval is long).
 const SNAPSHOT_PERIOD: Duration = Duration::from_millis(100);
@@ -1510,7 +1529,7 @@ async fn run_loop_async(
     let mut prev_paused = false;
     let mut vm_fault = false;
     // Pending fault injection (InjectScanStall). Owned by the loop:
-    // written from the command drain, consumed one unit-scan at a time.
+    // written from the command drain, consumed one TICK at a time.
     let mut inject_stall_ms: u64 = 0;
     let mut inject_stall_scans: u32 = 0;
 
@@ -1554,6 +1573,28 @@ async fn run_loop_async(
                 mappings = bound,
                 "device joined after background reconnect; its variables are live"
             );
+            // A device that joins AFTER the watchdog latched never sees
+            // the failsafe pass — that ran once, over the device set as
+            // it stood then — and the output phase is skipped for as
+            // long as the latch holds. Without this it would sit at
+            // whatever its transport defaults to, and for CANopen /
+            // OPC UA the explicit failsafe VALUES (not just zeros) would
+            // never be written at all.
+            if watchdog_tripped.load(Ordering::Relaxed) {
+                if let Some(dev) = devices.last_mut() {
+                    match dev.enter_failsafe().await {
+                        Ok(()) => tracing::warn!(
+                            device = %name,
+                            "device joined while the watchdog was latched — put \
+                             straight into failsafe instead of going live"
+                        ),
+                        Err(e) => tracing::error!(
+                            device = %name, %e,
+                            "failsafe on a device adopted under a latched watchdog failed"
+                        ),
+                    }
+                }
+            }
         }
 
         // Mirror each live device's transport health for the monitor layer.
@@ -1610,6 +1651,19 @@ async fn run_loop_async(
                     scans,
                     ack,
                 } => {
+                    let clamped_ms = stall_ms.min(MAX_INJECT_STALL_MS);
+                    let clamped_scans = scans.min(MAX_INJECT_SCANS);
+                    if clamped_ms != stall_ms || clamped_scans != scans {
+                        tracing::warn!(
+                            requested_stall_ms = stall_ms,
+                            requested_scans = scans,
+                            stall_ms = clamped_ms,
+                            scans = clamped_scans,
+                            "scan-stall injection clamped to the safety ceiling"
+                        );
+                    }
+                    let stall_ms = clamped_ms;
+                    let scans = clamped_scans;
                     inject_stall_ms = stall_ms;
                     inject_stall_scans = scans;
                     tracing::warn!(
@@ -1672,20 +1726,36 @@ async fn run_loop_async(
         let tick_now = Instant::now();
         let mut ran_any = false;
 
+        // Fault injection: one stall per TICK, ahead of the unit loop.
+        // Budgeting per unit-scan was wrong twice over: the watchdog
+        // counts consecutive overruns PER UNIT, and a single stall makes
+        // every unit due in this tick late — so an N-unit project drained
+        // `scans` N x faster than it produced late ticks and the
+        // documented default (THRESHOLD + 1) could never reach the
+        // threshold. Sleeping here still lands inside every due unit's
+        // measured window: each unit's cadence check compares `next_due`
+        // against the clock read AFTER its scan body.
+        if inject_stall_scans > 0 && exec_order.iter().any(|&i| clocks[i].next_due <= tick_now) {
+            inject_stall_scans -= 1;
+            let mut left = Duration::from_millis(inject_stall_ms);
+            while !left.is_zero() {
+                if stop.load(Ordering::Relaxed) {
+                    // Abandon the rest of the budget: a stop request
+                    // outranks a test fault.
+                    inject_stall_scans = 0;
+                    break;
+                }
+                let slice = left.min(INJECT_STALL_SLICE);
+                tokio::time::sleep(slice).await;
+                left -= slice;
+            }
+        }
+
         for &i in &exec_order {
             if clocks[i].next_due > tick_now {
                 continue;
             }
             ran_any = true;
-
-            // Fault injection: stall this unit-scan. Inside the scan on
-            // purpose — the cadence check at the bottom then measures a
-            // genuinely late scan, and the watchdog trips through the
-            // same path a real overrun takes.
-            if inject_stall_scans > 0 {
-                inject_stall_scans -= 1;
-                tokio::time::sleep(Duration::from_millis(inject_stall_ms)).await;
-            }
 
             // Input phase: bus → this unit's VM variables
             for rm in &unit_inputs[i] {
@@ -2777,6 +2847,102 @@ mod tests {
             writes_after_failsafe.load(Ordering::Relaxed),
             0,
             "the injected trip must latch outputs off exactly like a real one"
+        );
+    }
+
+    /// R1 regression: the injection budget is counted in TICKS, not
+    /// unit-scans. The watchdog counts consecutive overruns PER UNIT and
+    /// one stall makes every unit due in that tick late — so budgeting
+    /// per unit-scan drained `scans` N x faster than it produced late
+    /// ticks, and on a two-unit project the documented default
+    /// (THRESHOLD + 1) never reached the threshold. The primitive
+    /// silently no-opped exactly where multi-task projects live.
+    ///
+    /// Falsifiability: revert the hoist (decrement inside the unit loop)
+    /// and this test fails while the single-unit one above still passes —
+    /// which is precisely how the defect hid.
+    #[tokio::test]
+    async fn scan_stall_injection_trips_a_multi_unit_project_on_the_default_budget() {
+        let src = "PROGRAM main\n\
+                VAR n : INT := 0; END_VAR\n\
+                n := n + 1;\n\
+            END_PROGRAM";
+        let a = crate::compile(src).expect("counter program compiles");
+        let b = crate::compile(src).expect("counter program compiles");
+
+        let handle = spawn_units_inner(
+            vec![unit("a", a, 5, 1), unit("b", b, 5, 1)],
+            DeviceSource::Prebuilt(Vec::new()),
+            Vec::new(),
+            None,
+        );
+
+        // Negative control: two idle units must not trip on their own,
+        // or the rest of the test proves nothing.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !handle.watchdog_tripped(),
+            "two idle 5ms units must not trip the watchdog by themselves"
+        );
+
+        // Exactly the documented default — what the server fills in when
+        // a scenario omits `scans`.
+        handle
+            .inject_scan_stall(12, WATCHDOG_OVERRUN_THRESHOLD + 1)
+            .await
+            .expect("inject reaches the loop");
+        tokio::time::sleep(Duration::from_millis(600)).await;
+
+        let tripped = handle.watchdog_tripped();
+        tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
+            .await
+            .expect("shutdown joins");
+        assert!(
+            tripped,
+            "the default budget (THRESHOLD + 1) must trip the watchdog on a \
+             two-unit project too — if this fails the budget is being spent \
+             per unit-scan again"
+        );
+    }
+
+    /// R3 regression: an injected stall must not outlive a stop request.
+    /// The stall used to be one uninterruptible sleep, so `shutdown`
+    /// waited out the whole thing; with the ceiling at 1 s that is a 1 s
+    /// hang on every scenario teardown, and before the ceiling existed it
+    /// was unbounded.
+    #[tokio::test]
+    async fn shutdown_is_not_blocked_by_an_injected_stall() {
+        let container = crate::compile(
+            "PROGRAM main\n\
+                VAR n : INT := 0; END_VAR\n\
+                n := n + 1;\n\
+            END_PROGRAM",
+        )
+        .expect("counter program compiles");
+
+        let handle = spawn_units_inner(
+            vec![single_unit(container, 5)],
+            DeviceSource::Prebuilt(Vec::new()),
+            Vec::new(),
+            None,
+        );
+
+        // Ask for the maximum the clamp allows, many times over.
+        handle
+            .inject_scan_stall(MAX_INJECT_STALL_MS, 50)
+            .await
+            .expect("inject reaches the loop");
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        let t0 = Instant::now();
+        tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
+            .await
+            .expect("shutdown joins");
+        let took = t0.elapsed();
+        assert!(
+            took < Duration::from_millis(MAX_INJECT_STALL_MS),
+            "shutdown took {took:?} — a pending stall must be abandoned on \
+             stop, not slept out"
         );
     }
 
