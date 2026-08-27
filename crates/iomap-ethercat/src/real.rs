@@ -261,6 +261,12 @@ struct WorkerShared {
     /// mirror's previous contents — "the bus is delivering genuinely
     /// fresh bytes", as opposed to byte-identical echoes.
     input_changes: Arc<AtomicU64>,
+    /// TRUE while the worker is re-walking the bus to OP after a
+    /// demotion (RTSO-HOLD-0731 fix). The cycle watchdog reports a
+    /// paused counter as "re-walking", not as a stall.
+    reinitializing: Arc<AtomicBool>,
+    /// Count of bus re-walks started since connect (0 = never demoted).
+    reinits: Arc<AtomicU64>,
     /// In-cycle gear engines (one per configured [[gear]] axis), owned by
     /// the cyclic worker and ticked between the mirror copy and tx_rx.
     engines: Vec<crate::gear::GearEngine>,
@@ -363,6 +369,8 @@ impl RealEthercat {
         let healthy = Arc::new(AtomicBool::new(true));
         let cycles = Arc::new(AtomicU64::new(0));
         let input_changes = Arc::new(AtomicU64::new(0));
+        let reinitializing = Arc::new(AtomicBool::new(false));
+        let reinits = Arc::new(AtomicU64::new(0));
         let (init_tx, init_rx) = mpsc::sync_channel::<InitResult>(1);
 
         let nic = config.nic.clone();
@@ -377,6 +385,8 @@ impl RealEthercat {
             healthy: healthy.clone(),
             cycles: cycles.clone(),
             input_changes: input_changes.clone(),
+            reinitializing: reinitializing.clone(),
+            reinits: reinits.clone(),
             engines,
         };
         let thread_name = format!("ec-{name}");
@@ -455,6 +465,8 @@ impl RealEthercat {
                     stopped.clone(),
                     healthy.clone(),
                     shutdown.clone(),
+                    reinitializing,
+                    reinits,
                 );
                 Ok(Self {
                     name,
@@ -643,6 +655,7 @@ fn watchdog_step(last: u64, now: u64, was_stalled: bool) -> (bool, Option<bool>)
 /// is 500 missed cycles — unambiguous. The 60 s heartbeat writes a
 /// bus-side timeline into the journal (the 1 Hz historian only sees the
 /// VM side).
+#[allow(clippy::too_many_arguments)]
 fn spawn_cycle_watchdog(
     name: String,
     cycles: Arc<AtomicU64>,
@@ -650,6 +663,8 @@ fn spawn_cycle_watchdog(
     stopped: Arc<AtomicBool>,
     healthy: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
+    reinitializing: Arc<AtomicBool>,
+    reinits: Arc<AtomicU64>,
 ) {
     let _ = thread::Builder::new()
         .name(format!("ecwd-{name}"))
@@ -663,6 +678,14 @@ fn spawn_cycle_watchdog(
                 let (next, edge) = watchdog_step(last, now, stalled);
                 stalled = next;
                 match edge {
+                    // A paused counter during a bus re-walk is the fix at
+                    // work, not a stall — report it as such (INFO).
+                    Some(true) if reinitializing.load(Ordering::Relaxed) => tracing::info!(
+                        device = %name,
+                        cycles = now,
+                        reinits = reinits.load(Ordering::Relaxed),
+                        "cyclic exchange paused: bus re-walk in progress"
+                    ),
                     Some(true) => tracing::error!(
                         device = %name,
                         cycles = now,
@@ -687,12 +710,49 @@ fn spawn_cycle_watchdog(
                         cycles = now,
                         input_changes = input_changes.load(Ordering::Relaxed),
                         healthy = healthy.load(Ordering::Relaxed),
+                        reinits = reinits.load(Ordering::Relaxed),
                         "ethercat cyclic heartbeat"
                     );
                 }
                 last = now;
             }
         });
+}
+
+/// RTSO-HOLD-0731 fix: backoff before the Nth consecutive failed bus
+/// re-walk. Attempt 0 (the walk right after a demotion) is immediate —
+/// the common case is a bus that is back and just needs the ESM walk.
+fn reinit_backoff(attempt: u64) -> Duration {
+    match attempt {
+        0 => Duration::ZERO,
+        1 => Duration::from_secs(1),
+        2 => Duration::from_secs(2),
+        3 => Duration::from_secs(4),
+        _ => Duration::from_secs(5),
+    }
+}
+
+/// RTSO-HOLD-0731 fix: shared failure handling for every step of the bus
+/// walk. First-init failures abort connect exactly as before (caller must
+/// `return`); re-walk failures log and retry (caller must `continue`).
+/// Returns TRUE when the caller should abort.
+fn walk_fail(
+    first_init: bool,
+    init_tx: &mpsc::SyncSender<InitResult>,
+    attempt: &mut u64,
+    msg: String,
+) -> bool {
+    if first_init {
+        let _ = init_tx.send(InitResult::Err(msg));
+        return true;
+    }
+    *attempt += 1;
+    tracing::warn!(
+        attempt = *attempt,
+        error = %msg,
+        "ethercat bus re-walk step failed; backing off before retry"
+    );
+    false
 }
 
 /// Health bookkeeping for one failed cyclic exchange. Exactly one ERROR
@@ -776,6 +836,8 @@ fn smol_main(
         healthy,
         cycles,
         input_changes,
+        reinitializing,
+        reinits,
         mut engines,
     } = shared;
     // Flip `stopped` on EVERY exit path (init failure or loop end) via a
@@ -859,372 +921,522 @@ fn smol_main(
             }
         });
 
-        // Walk the bus and assign each SubDevice an auto-increment address.
-        let mut group = match maindevice
-            .init_single_group::<MAX_SUBDEVICES, PDI_LEN>(ethercat_now)
-            .await
-        {
-            Ok(g) => g,
-            Err(e) => {
-                let _ = init_tx.send(InitResult::Err(format!("init_single_group: {e:?}")));
-                return;
+        // ===== RTSO-HOLD-0731 fix: supervised re-walk loop =====
+        // Everything from bus enumeration through the cyclic exchange sits
+        // inside this loop. The first iteration keeps the original connect
+        // semantics (InitResult handshake, abort on failure). When the
+        // cyclic loop detects any subdevice out of OP it breaks back here
+        // and the whole walk re-runs — bus enumeration, init SDO writes
+        // (0x6060 = 8 and any PDO remap, which a power-cycled slave has
+        // lost), PDO dump, DC config, OP transition — exactly what a
+        // process restart used to be needed for. ethercrab's init calls
+        // reset_subdevices(), which forces every slave to INIT first, so
+        // a SAFE-OP+ERROR latch is cleared by the walk itself.
+        let mut first_init = true;
+        let mut reinit_attempt: u64 = 0;
+        let mut health = HealthTracker::with_flag(UNHEALTHY_AFTER_TX_ERRORS, healthy.clone());
+        'supervise: loop {
+            if shutdown.load(Ordering::Relaxed) {
+                break;
             }
-        };
-
-        // Early bus census: log every SubDevice's identity *now*, in PRE-OP,
-        // before any init_sdo / PDO / OP step that a non-matching device can
-        // abort (e.g. a coupler with no 0x6060, or one that rejects the CoE
-        // 0x1600 PDO-assign). This makes `cs get edges/<n>/scan` work as a pure
-        // discovery probe against unknown hardware: you always see what's on
-        // the wire, even when the configured device can't reach OP.
-        for (pos, sd) in group.iter(&maindevice).enumerate() {
-            let id = sd.identity();
-            tracing::info!(
-                slave = pos,
-                sd_name = %sd.name(),
-                vendor = format!("{:#010x}", id.vendor_id),
-                product = format!("{:#010x}", id.product_id),
-                revision = format!("{:#010x}", id.revision),
-                serial = format!("{:#010x}", id.serial),
-                "bus census (PRE-OP)"
-            );
-        }
-
-        // Per-SubDevice startup SDO writes (PRE-OP, mailboxes are up).
-        // Runs before the PDO-mapping dump below so the logged layout
-        // reflects any remapping done here. A failed write aborts init:
-        // these are things like 0x6060 = 8 (CSP) — silently running a
-        // drive in the wrong mode is worse than not starting.
-        for (pos, sd) in group.iter(&maindevice).enumerate() {
-            let Some(cfg) = slaves.iter().find(|s| s.index == pos as u16) else {
-                continue;
-            };
-            for cmd in &cfg.init_sdo {
-                let res = match cmd.bits {
-                    8 => {
-                        sd.sdo_write(cmd.index, cmd.sub_index, cmd.value as u8)
-                            .await
-                    }
-                    16 => {
-                        sd.sdo_write(cmd.index, cmd.sub_index, cmd.value as u16)
-                            .await
-                    }
-                    // validate_init_sdo limited bits to {8, 16, 32}.
-                    _ => {
-                        sd.sdo_write(cmd.index, cmd.sub_index, cmd.value as u32)
-                            .await
-                    }
-                };
-                match res {
-                    Ok(()) => tracing::info!(
-                        slave = pos,
-                        obj = format!("{:#06x}:{:02x}", cmd.index, cmd.sub_index),
-                        value = cmd.value,
-                        bits = cmd.bits,
-                        "init sdo write"
-                    ),
-                    Err(e) => {
-                        let _ = init_tx.send(InitResult::Err(format!(
-                            "init sdo write {:#06x}:{:02x} = {} ({} bits) on slave {pos}: {e:?}",
-                            cmd.index, cmd.sub_index, cmd.value, cmd.bits
-                        )));
-                        return;
+            if !first_init {
+                reinitializing.store(true, Ordering::Relaxed);
+                reinits.fetch_add(1, Ordering::Relaxed);
+                let delay = reinit_backoff(reinit_attempt);
+                if !delay.is_zero() {
+                    tracing::info!(
+                        attempt = reinit_attempt,
+                        delay_ms = delay.as_millis() as u64,
+                        "ethercat re-walk backoff"
+                    );
+                    let mut waited = Duration::ZERO;
+                    while waited < delay {
+                        if shutdown.load(Ordering::Relaxed) {
+                            break 'supervise;
+                        }
+                        smol::Timer::after(Duration::from_millis(100)).await;
+                        waited += Duration::from_millis(100);
                     }
                 }
             }
-        }
 
-        // One-time: read + log the CoE PDO mapping (0x1C12 RxPDO-assign /
-        // 0x1C13 TxPDO-assign -> 0x16xx / 0x1Axx entries). Surfaces the exact
-        // byte offset of controlword / target_velocity / statusword / etc. in
-        // the logs, so iomap channels are configured off the real layout
-        // rather than guessed. Reads happen in PRE-OP where CoE is available.
-        for sd in group.iter(&maindevice) {
-            for (assign, dir) in [(0x1C12u16, "out/rxpdo"), (0x1C13u16, "in/txpdo")] {
-                let count: u8 = sd.sdo_read(assign, 0u8).await.unwrap_or(0);
-                let mut bit_off: u32 = 0;
-                for i in 1..=count {
-                    let pdo: u16 = match sd.sdo_read(assign, i).await {
-                        Ok(v) => v,
-                        Err(_) => continue,
+            // Walk the bus and assign each SubDevice an auto-increment address.
+            let mut group = match maindevice
+                .init_single_group::<MAX_SUBDEVICES, PDI_LEN>(ethercat_now)
+                .await
+            {
+                Ok(g) => g,
+                Err(e) => {
+                    if walk_fail(
+                        first_init,
+                        &init_tx,
+                        &mut reinit_attempt,
+                        format!("init_single_group: {e:?}"),
+                    ) {
+                        return;
+                    }
+                    continue 'supervise;
+                }
+            };
+
+            // Early bus census: log every SubDevice's identity *now*, in PRE-OP,
+            // before any init_sdo / PDO / OP step that a non-matching device can
+            // abort (e.g. a coupler with no 0x6060, or one that rejects the CoE
+            // 0x1600 PDO-assign). This makes `cs get edges/<n>/scan` work as a pure
+            // discovery probe against unknown hardware: you always see what's on
+            // the wire, even when the configured device can't reach OP.
+            for (pos, sd) in group.iter(&maindevice).enumerate() {
+                let id = sd.identity();
+                tracing::info!(
+                    slave = pos,
+                    sd_name = %sd.name(),
+                    vendor = format!("{:#010x}", id.vendor_id),
+                    product = format!("{:#010x}", id.product_id),
+                    revision = format!("{:#010x}", id.revision),
+                    serial = format!("{:#010x}", id.serial),
+                    "bus census (PRE-OP)"
+                );
+            }
+
+            // Per-SubDevice startup SDO writes (PRE-OP, mailboxes are up).
+            // Runs before the PDO-mapping dump below so the logged layout
+            // reflects any remapping done here. A failed write aborts init:
+            // these are things like 0x6060 = 8 (CSP) — silently running a
+            // drive in the wrong mode is worse than not starting.
+            for (pos, sd) in group.iter(&maindevice).enumerate() {
+                let Some(cfg) = slaves.iter().find(|s| s.index == pos as u16) else {
+                    continue;
+                };
+                for cmd in &cfg.init_sdo {
+                    let res = match cmd.bits {
+                        8 => {
+                            sd.sdo_write(cmd.index, cmd.sub_index, cmd.value as u8)
+                                .await
+                        }
+                        16 => {
+                            sd.sdo_write(cmd.index, cmd.sub_index, cmd.value as u16)
+                                .await
+                        }
+                        // validate_init_sdo limited bits to {8, 16, 32}.
+                        _ => {
+                            sd.sdo_write(cmd.index, cmd.sub_index, cmd.value as u32)
+                                .await
+                        }
                     };
-                    let entries: u8 = sd.sdo_read(pdo, 0u8).await.unwrap_or(0);
-                    for j in 1..=entries {
-                        let entry: u32 = match sd.sdo_read(pdo, j).await {
+                    match res {
+                        Ok(()) => tracing::info!(
+                            slave = pos,
+                            obj = format!("{:#06x}:{:02x}", cmd.index, cmd.sub_index),
+                            value = cmd.value,
+                            bits = cmd.bits,
+                            "init sdo write"
+                        ),
+                        Err(e) => {
+                            if walk_fail(
+                            first_init,
+                            &init_tx,
+                            &mut reinit_attempt,
+                            format!(
+                                "init sdo write {:#06x}:{:02x} = {} ({} bits) on slave {pos}: {e:?}",
+                                cmd.index, cmd.sub_index, cmd.value, cmd.bits
+                            ),
+                        ) {
+                            return;
+                        }
+                            continue 'supervise;
+                        }
+                    }
+                }
+            }
+
+            // One-time: read + log the CoE PDO mapping (0x1C12 RxPDO-assign /
+            // 0x1C13 TxPDO-assign -> 0x16xx / 0x1Axx entries). Surfaces the exact
+            // byte offset of controlword / target_velocity / statusword / etc. in
+            // the logs, so iomap channels are configured off the real layout
+            // rather than guessed. Reads happen in PRE-OP where CoE is available.
+            for sd in group.iter(&maindevice) {
+                for (assign, dir) in [(0x1C12u16, "out/rxpdo"), (0x1C13u16, "in/txpdo")] {
+                    let count: u8 = sd.sdo_read(assign, 0u8).await.unwrap_or(0);
+                    let mut bit_off: u32 = 0;
+                    for i in 1..=count {
+                        let pdo: u16 = match sd.sdo_read(assign, i).await {
                             Ok(v) => v,
                             Err(_) => continue,
                         };
-                        let obj = (entry >> 16) as u16;
-                        let sub = ((entry >> 8) & 0xff) as u8;
-                        let bits = (entry & 0xff) as u8;
-                        tracing::info!(
-                            dir,
-                            pdo = format!("{pdo:#06x}"),
-                            obj = format!("{obj:#06x}:{sub:02x}"),
-                            bits,
-                            byte = bit_off / 8,
-                            "pdo entry"
-                        );
-                        bit_off += bits as u32;
+                        let entries: u8 = sd.sdo_read(pdo, 0u8).await.unwrap_or(0);
+                        for j in 1..=entries {
+                            let entry: u32 = match sd.sdo_read(pdo, j).await {
+                                Ok(v) => v,
+                                Err(_) => continue,
+                            };
+                            let obj = (entry >> 16) as u16;
+                            let sub = ((entry >> 8) & 0xff) as u8;
+                            let bits = (entry & 0xff) as u8;
+                            tracing::info!(
+                                dir,
+                                pdo = format!("{pdo:#06x}"),
+                                obj = format!("{obj:#06x}:{sub:02x}"),
+                                bits,
+                                byte = bit_off / 8,
+                                "pdo entry"
+                            );
+                            bit_off += bits as u32;
+                        }
                     }
                 }
             }
-        }
 
-        let sync0 = Duration::from_micros(cycle_us as u64);
+            let sync0 = Duration::from_micros(cycle_us as u64);
 
-        // Effective DC mode per SubDevice: per-slave override if listed in
-        // the config, else the device-level default. The bus takes the DC
-        // path when any SubDevice ends up Sync0 — SubDevices left Off
-        // aren't flagged, and ethercrab's configure_dc_sync skips unflagged
-        // ones, so plain IO couplers free-run inside a DC bus.
-        let effective_dc = |pos: u16| {
-            slaves
-                .iter()
-                .find(|s| s.index == pos)
-                .and_then(|s| s.dc_sync)
-                .unwrap_or(dc_sync)
-        };
-        let subdevice_count = group.iter(&maindevice).count() as u16;
-        let bus_dc = if (0..subdevice_count).any(|p| effective_dc(p) == EthercatDcSync::Sync0) {
-            EthercatDcSync::Sync0
-        } else {
-            EthercatDcSync::Off
-        };
+            // Effective DC mode per SubDevice: per-slave override if listed in
+            // the config, else the device-level default. The bus takes the DC
+            // path when any SubDevice ends up Sync0 — SubDevices left Off
+            // aren't flagged, and ethercrab's configure_dc_sync skips unflagged
+            // ones, so plain IO couplers free-run inside a DC bus.
+            let effective_dc = |pos: u16| {
+                slaves
+                    .iter()
+                    .find(|s| s.index == pos)
+                    .and_then(|s| s.dc_sync)
+                    .unwrap_or(dc_sync)
+            };
+            let subdevice_count = group.iter(&maindevice).count() as u16;
+            let bus_dc = if (0..subdevice_count).any(|p| effective_dc(p) == EthercatDcSync::Sync0) {
+                EthercatDcSync::Sync0
+            } else {
+                EthercatDcSync::Off
+            };
 
-        match bus_dc {
-            EthercatDcSync::Sync0 => {
-                // Servo drives (e.g. Inovance SV660N) need DC SYNC0 to
-                // reach OP. Flag SYNC0 on the SubDevices that want it,
-                // configure the group DC, then *request* OP and cycle
-                // tx_rx_dc until all OP — a blocking into_op() doesn't pump
-                // PDI, so the drive's SyncManager watchdog would trip
-                // during SAFE-OP -> OP.
-                for (pos, mut subdevice) in group.iter_mut(&maindevice).enumerate() {
-                    if effective_dc(pos as u16) == EthercatDcSync::Sync0 {
-                        subdevice.set_dc_sync(DcSync::Sync0);
-                    }
-                }
-                let group = match group.into_pre_op_pdi(&maindevice).await {
-                    Ok(g) => g,
-                    Err(e) => {
-                        let _ = init_tx.send(InitResult::Err(format!(
-                            "into_pre_op_pdi (PRE-OP+PDI): {e:?}"
-                        )));
-                        return;
-                    }
-                };
-                let group = match group
-                    .configure_dc_sync(
-                        &maindevice,
-                        DcConfiguration {
-                            // Start SYNC0 100ms out; period = the cycle; send
-                            // data half-way through the cycle.
-                            start_delay: Duration::from_millis(100),
-                            sync0_period: sync0,
-                            sync0_shift: sync0 / 2,
-                        },
-                    )
-                    .await
-                {
-                    Ok(g) => g,
-                    Err(e) => {
-                        let _ = init_tx.send(InitResult::Err(format!("configure_dc_sync: {e:?}")));
-                        return;
-                    }
-                };
-                let group = match group.request_into_op(&maindevice).await {
-                    Ok(g) => g,
-                    Err(e) => {
-                        let _ = init_tx.send(InitResult::Err(format!(
-                            "request_into_op (-> request OP): {e:?}"
-                        )));
-                        return;
-                    }
-                };
-
-                // Capture discovery before confirming OP so the topology is
-                // visible even if OP never settles.
-                let discovered = capture_discovery!(group, maindevice, pdi);
-
-                // Pump tx_rx_dc until every SubDevice reaches OP (zero
-                // outputs / controlword 0 — nothing moves). Bounded.
-                {
-                    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-                    let mut reached_op = false;
-                    while std::time::Instant::now() < deadline {
-                        match group.tx_rx_dc(&maindevice).await {
-                            Ok(resp) => {
-                                if resp.all_op() {
-                                    reached_op = true;
-                                    break;
-                                }
-                            }
-                            Err(e) => tracing::warn!(?e, "tx_rx_dc while waiting for OP"),
+            match bus_dc {
+                EthercatDcSync::Sync0 => {
+                    // Servo drives (e.g. Inovance SV660N) need DC SYNC0 to
+                    // reach OP. Flag SYNC0 on the SubDevices that want it,
+                    // configure the group DC, then *request* OP and cycle
+                    // tx_rx_dc until all OP — a blocking into_op() doesn't pump
+                    // PDI, so the drive's SyncManager watchdog would trip
+                    // during SAFE-OP -> OP.
+                    for (pos, mut subdevice) in group.iter_mut(&maindevice).enumerate() {
+                        if effective_dc(pos as u16) == EthercatDcSync::Sync0 {
+                            subdevice.set_dc_sync(DcSync::Sync0);
                         }
-                        smol::Timer::after(sync0).await;
                     }
-                    if !reached_op {
-                        let _ = init_tx.send(InitResult::Err(
+                    let group = match group.into_pre_op_pdi(&maindevice).await {
+                        Ok(g) => g,
+                        Err(e) => {
+                            if walk_fail(
+                                first_init,
+                                &init_tx,
+                                &mut reinit_attempt,
+                                format!("into_pre_op_pdi (PRE-OP+PDI): {e:?}"),
+                            ) {
+                                return;
+                            }
+                            continue 'supervise;
+                        }
+                    };
+                    let group = match group
+                        .configure_dc_sync(
+                            &maindevice,
+                            DcConfiguration {
+                                // Start SYNC0 100ms out; period = the cycle; send
+                                // data half-way through the cycle.
+                                start_delay: Duration::from_millis(100),
+                                sync0_period: sync0,
+                                sync0_shift: sync0 / 2,
+                            },
+                        )
+                        .await
+                    {
+                        Ok(g) => g,
+                        Err(e) => {
+                            if walk_fail(
+                                first_init,
+                                &init_tx,
+                                &mut reinit_attempt,
+                                format!("configure_dc_sync: {e:?}"),
+                            ) {
+                                return;
+                            }
+                            continue 'supervise;
+                        }
+                    };
+                    let group = match group.request_into_op(&maindevice).await {
+                        Ok(g) => g,
+                        Err(e) => {
+                            if walk_fail(
+                                first_init,
+                                &init_tx,
+                                &mut reinit_attempt,
+                                format!("request_into_op (-> request OP): {e:?}"),
+                            ) {
+                                return;
+                            }
+                            continue 'supervise;
+                        }
+                    };
+
+                    // Capture discovery before confirming OP so the topology is
+                    // visible even if OP never settles.
+                    let discovered = capture_discovery!(group, maindevice, pdi);
+
+                    // Pump tx_rx_dc until every SubDevice reaches OP (zero
+                    // outputs / controlword 0 — nothing moves). Bounded.
+                    {
+                        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                        let mut reached_op = false;
+                        while std::time::Instant::now() < deadline {
+                            match group.tx_rx_dc(&maindevice).await {
+                                Ok(resp) => {
+                                    if resp.all_op() {
+                                        reached_op = true;
+                                        break;
+                                    }
+                                }
+                                Err(e) => tracing::warn!(?e, "tx_rx_dc while waiting for OP"),
+                            }
+                            smol::Timer::after(sync0).await;
+                        }
+                        if !reached_op {
+                            if walk_fail(
+                            first_init,
+                            &init_tx,
+                            &mut reinit_attempt,
                             "SubDevices did not reach OP within 10s (SyncManager watchdog / DC?)"
                                 .into(),
-                        ));
-                        return;
+                        ) {
+                            return;
+                        }
+                            continue 'supervise;
+                        }
+                        tracing::info!("all subdevices reached OP (dc=sync0)");
                     }
-                    tracing::info!("all subdevices reached OP (dc=sync0)");
-                }
 
-                let _ = init_tx.send(InitResult::Ok { discovered });
+                    if first_init {
+                        let _ = init_tx.send(InitResult::Ok { discovered });
+                        first_init = false;
+                    } else {
+                        tracing::info!(
+                            attempt = reinit_attempt,
+                            reinits = reinits.load(Ordering::Relaxed),
+                            "ethercat bus re-walked to OP; cyclic exchange resuming"
+                        );
+                    }
+                    reinit_attempt = 0;
+                    reinitializing.store(false, Ordering::Relaxed);
 
-                // DC cyclic loop: tx_rx_dc keeps the reference clock synced
-                // and its CycleInfo tells us when to send the next frame
-                // (stays aligned to SYNC0).
-                let mut health = HealthTracker::with_flag(UNHEALTHY_AFTER_TX_ERRORS, healthy);
-                // Tracks whether the *previous* exchange succeeded — the gear
-                // engines read inputs captured by that exchange, so on a
-                // failed cycle they freeze (no master advance / target held)
-                // and the bus recovers without a one-cycle catch-up step.
-                let mut bus_ok = true;
-                let mut prev_shape: Option<(Vec<ethercrab::SubDeviceState>, u16)> = None;
-                let mut shape_edges: u64 = 0;
-                while !shutdown.load(Ordering::Relaxed) {
-                    cycles.fetch_add(1, Ordering::Relaxed);
-                    let cycle_start = std::time::Instant::now();
-                    copy_outputs_to_bus!(group, maindevice, pdi);
-                    gear_tick!(group, maindevice, engines, bus_ok);
-                    let next_wait = match group.tx_rx_dc(&maindevice).await {
-                        Ok(resp) => {
-                            let edge = note_bus_shape(
-                                &mut prev_shape,
-                                &mut shape_edges,
-                                &resp.subdevice_states,
-                                resp.working_counter,
-                            );
-                            if edge {
-                                // Why did it demote? Fetch the AL status code
-                                // for every non-OP subdevice. Edge cycles only
-                                // (1-2 extra PDUs, can push this one cycle past
-                                // its 2 ms slot — accepted: the edge IS the
-                                // diagnostic moment).
-                                for (i, st) in resp.subdevice_states.iter().enumerate() {
-                                    if *st != ethercrab::SubDeviceState::Op {
-                                        let sd = group.subdevice(&maindevice, i);
-                                        match sd {
-                                            Ok(sd) => match sd.status().await {
-                                                Ok((state, code)) => tracing::error!(
-                                                    slave = i,
-                                                    ?state,
-                                                    ?code,
-                                                    "AL status code for demoted subdevice"
-                                                ),
-                                                // A demoted slave with its AL error
-                                                // flag set surfaces the code through
-                                                // state()'s Err path (ethercrab wraps
-                                                // it in Error::SubDevice) — that IS
-                                                // the answer, not a read failure.
-                                                // Seen live 2026-08-27: SafeOp slaves
-                                                // reported SyncManagerWatchdog /
-                                                // SynchronizationError this way.
-                                                Err(ethercrab::error::Error::SubDevice(code)) => {
-                                                    tracing::error!(
+                    // DC cyclic loop: tx_rx_dc keeps the reference clock synced
+                    // and its CycleInfo tells us when to send the next frame
+                    // (stays aligned to SYNC0). The health tracker is hoisted
+                    // above the supervise loop (with_flag resets the shared
+                    // flag to healthy, which must not happen mid-re-walk).
+                    let mut demoted = false;
+                    // Tracks whether the *previous* exchange succeeded — the gear
+                    // engines read inputs captured by that exchange, so on a
+                    // failed cycle they freeze (no master advance / target held)
+                    // and the bus recovers without a one-cycle catch-up step.
+                    let mut bus_ok = true;
+                    let mut prev_shape: Option<(Vec<ethercrab::SubDeviceState>, u16)> = None;
+                    let mut shape_edges: u64 = 0;
+                    while !shutdown.load(Ordering::Relaxed) {
+                        cycles.fetch_add(1, Ordering::Relaxed);
+                        let cycle_start = std::time::Instant::now();
+                        copy_outputs_to_bus!(group, maindevice, pdi);
+                        gear_tick!(group, maindevice, engines, bus_ok);
+                        let next_wait = match group.tx_rx_dc(&maindevice).await {
+                            Ok(resp) => {
+                                let edge = note_bus_shape(
+                                    &mut prev_shape,
+                                    &mut shape_edges,
+                                    &resp.subdevice_states,
+                                    resp.working_counter,
+                                );
+                                if edge {
+                                    // Why did it demote? Fetch the AL status code
+                                    // for every non-OP subdevice. Edge cycles only
+                                    // (1-2 extra PDUs, can push this one cycle past
+                                    // its 2 ms slot — accepted: the edge IS the
+                                    // diagnostic moment).
+                                    for (i, st) in resp.subdevice_states.iter().enumerate() {
+                                        if *st != ethercrab::SubDeviceState::Op {
+                                            let sd = group.subdevice(&maindevice, i);
+                                            match sd {
+                                                Ok(sd) => match sd.status().await {
+                                                    Ok((state, code)) => tracing::error!(
+                                                        slave = i,
+                                                        ?state,
+                                                        ?code,
+                                                        "AL status code for demoted subdevice"
+                                                    ),
+                                                    // A demoted slave with its AL error
+                                                    // flag set surfaces the code through
+                                                    // state()'s Err path (ethercrab wraps
+                                                    // it in Error::SubDevice) — that IS
+                                                    // the answer, not a read failure.
+                                                    // Seen live 2026-08-27: SafeOp slaves
+                                                    // reported SyncManagerWatchdog /
+                                                    // SynchronizationError this way.
+                                                    Err(ethercrab::error::Error::SubDevice(
+                                                        code,
+                                                    )) => {
+                                                        tracing::error!(
                                                         slave = i,
                                                         ?code,
                                                         "AL status code for demoted subdevice (AL error flag set)"
                                                     )
-                                                }
+                                                    }
+                                                    Err(e) => tracing::warn!(
+                                                        slave = i,
+                                                        ?e,
+                                                        "AL status code read failed"
+                                                    ),
+                                                },
                                                 Err(e) => tracing::warn!(
                                                     slave = i,
                                                     ?e,
-                                                    "AL status code read failed"
+                                                    "subdevice ref for AL code failed"
                                                 ),
-                                            },
-                                            Err(e) => tracing::warn!(
-                                                slave = i,
-                                                ?e,
-                                                "subdevice ref for AL code failed"
-                                            ),
+                                            }
                                         }
                                     }
                                 }
+                                if resp
+                                    .subdevice_states
+                                    .iter()
+                                    .any(|s| *s != ethercrab::SubDeviceState::Op)
+                                {
+                                    // The RTSO-HOLD-0731 mechanism: exchange
+                                    // still succeeds but the slave no longer
+                                    // applies outputs. Leave the cyclic loop
+                                    // and re-walk instead of exchanging with
+                                    // a bus that silently ignores us.
+                                    healthy.store(false, Ordering::Relaxed);
+                                    demoted = true;
+                                    break;
+                                }
+                                copy_inputs_from_bus!(group, maindevice, pdi, input_changes);
+                                if health.record_success() == HealthTransition::Recovered {
+                                    tracing::info!(
+                                        "ethercat recovered; cyclic exchange running again"
+                                    );
+                                }
+                                bus_ok = true;
+                                resp.extra.next_cycle_wait
                             }
-                            copy_inputs_from_bus!(group, maindevice, pdi, input_changes);
-                            if health.record_success() == HealthTransition::Recovered {
-                                tracing::info!("ethercat recovered; cyclic exchange running again");
+                            Err(e) => {
+                                note_txrx_failure(&mut health, &e);
+                                bus_ok = false;
+                                sync0
                             }
-                            bus_ok = true;
-                            resp.extra.next_cycle_wait
-                        }
+                        };
+                        smol::Timer::at(cycle_start + next_wait).await;
+                    }
+                    if demoted && !shutdown.load(Ordering::Relaxed) {
+                        tracing::error!(
+                            "subdevice(s) out of OP mid-run — re-walking the bus \
+                         (previously this wedged until a process restart)"
+                        );
+                    } else {
+                        // Final flush before teardown: failsafe has zeroed the
+                        // output mirror; push it out once more so the drive latches
+                        // controlword = 0 (Disable Voltage) before the thread stops,
+                        // instead of de-energizing only via its own SyncManager
+                        // watchdog once the master goes away.
+                        copy_outputs_to_bus!(group, maindevice, pdi);
+                        let _ = group.tx_rx_dc(&maindevice).await;
+                        tracing::info!("ethercat cyclic loop exiting (shutdown signalled)");
+                    }
+                }
+
+                EthercatDcSync::Off => {
+                    // Free-run (no DC): a blocking into_op works for IO couplers
+                    // / SubDevices that don't need (or can't do) DC. Then a
+                    // fixed-interval tx_rx loop.
+                    let group = match group.into_op(&maindevice).await {
+                        Ok(g) => g,
                         Err(e) => {
-                            note_txrx_failure(&mut health, &e);
-                            bus_ok = false;
-                            sync0
+                            if walk_fail(
+                                first_init,
+                                &init_tx,
+                                &mut reinit_attempt,
+                                format!("into_op (PRE-OP -> OP): {e:?}"),
+                            ) {
+                                return;
+                            }
+                            continue 'supervise;
                         }
                     };
-                    smol::Timer::at(cycle_start + next_wait).await;
-                }
-                // Final flush before teardown: failsafe has zeroed the
-                // output mirror; push it out once more so the drive latches
-                // controlword = 0 (Disable Voltage) before the thread stops,
-                // instead of de-energizing only via its own SyncManager
-                // watchdog once the master goes away.
-                copy_outputs_to_bus!(group, maindevice, pdi);
-                let _ = group.tx_rx_dc(&maindevice).await;
-                tracing::info!("ethercat cyclic loop exiting (shutdown signalled)");
-            }
 
-            EthercatDcSync::Off => {
-                // Free-run (no DC): a blocking into_op works for IO couplers
-                // / SubDevices that don't need (or can't do) DC. Then a
-                // fixed-interval tx_rx loop.
-                let group = match group.into_op(&maindevice).await {
-                    Ok(g) => g,
-                    Err(e) => {
-                        let _ =
-                            init_tx.send(InitResult::Err(format!("into_op (PRE-OP -> OP): {e:?}")));
-                        return;
+                    let discovered = capture_discovery!(group, maindevice, pdi);
+                    if first_init {
+                        let _ = init_tx.send(InitResult::Ok { discovered });
+                        first_init = false;
+                    } else {
+                        tracing::info!(
+                            attempt = reinit_attempt,
+                            reinits = reinits.load(Ordering::Relaxed),
+                            "ethercat bus re-walked to OP; cyclic exchange resuming"
+                        );
                     }
-                };
+                    reinit_attempt = 0;
+                    reinitializing.store(false, Ordering::Relaxed);
 
-                let discovered = capture_discovery!(group, maindevice, pdi);
-                let _ = init_tx.send(InitResult::Ok { discovered });
-
-                let mut tick = smol::Timer::interval(sync0);
-                use smol::stream::StreamExt;
-                let mut health = HealthTracker::with_flag(UNHEALTHY_AFTER_TX_ERRORS, healthy);
-                let mut bus_ok = true;
-                let mut prev_shape: Option<(Vec<ethercrab::SubDeviceState>, u16)> = None;
-                let mut shape_edges: u64 = 0;
-                while !shutdown.load(Ordering::Relaxed) {
-                    cycles.fetch_add(1, Ordering::Relaxed);
-                    copy_outputs_to_bus!(group, maindevice, pdi);
-                    gear_tick!(group, maindevice, engines, bus_ok);
-                    match group.tx_rx(&maindevice).await {
-                        Ok(resp) => {
-                            note_bus_shape(
-                                &mut prev_shape,
-                                &mut shape_edges,
-                                &resp.subdevice_states,
-                                resp.working_counter,
-                            );
-                            if health.record_success() == HealthTransition::Recovered {
-                                tracing::info!("ethercat recovered; cyclic exchange running again");
+                    let mut tick = smol::Timer::interval(sync0);
+                    use smol::stream::StreamExt;
+                    // Health tracker hoisted above the supervise loop.
+                    let mut demoted = false;
+                    let mut bus_ok = true;
+                    let mut prev_shape: Option<(Vec<ethercrab::SubDeviceState>, u16)> = None;
+                    let mut shape_edges: u64 = 0;
+                    while !shutdown.load(Ordering::Relaxed) {
+                        cycles.fetch_add(1, Ordering::Relaxed);
+                        copy_outputs_to_bus!(group, maindevice, pdi);
+                        gear_tick!(group, maindevice, engines, bus_ok);
+                        match group.tx_rx(&maindevice).await {
+                            Ok(resp) => {
+                                note_bus_shape(
+                                    &mut prev_shape,
+                                    &mut shape_edges,
+                                    &resp.subdevice_states,
+                                    resp.working_counter,
+                                );
+                                if resp
+                                    .subdevice_states
+                                    .iter()
+                                    .any(|s| *s != ethercrab::SubDeviceState::Op)
+                                {
+                                    healthy.store(false, Ordering::Relaxed);
+                                    demoted = true;
+                                    break;
+                                }
+                                if health.record_success() == HealthTransition::Recovered {
+                                    tracing::info!(
+                                        "ethercat recovered; cyclic exchange running again"
+                                    );
+                                }
+                                bus_ok = true;
                             }
-                            bus_ok = true;
+                            Err(e) => {
+                                note_txrx_failure(&mut health, &e);
+                                bus_ok = false;
+                            }
                         }
-                        Err(e) => {
-                            note_txrx_failure(&mut health, &e);
-                            bus_ok = false;
-                        }
+                        copy_inputs_from_bus!(group, maindevice, pdi, input_changes);
+                        tick.next().await;
                     }
-                    copy_inputs_from_bus!(group, maindevice, pdi, input_changes);
-                    tick.next().await;
+                    if demoted && !shutdown.load(Ordering::Relaxed) {
+                        tracing::error!(
+                            "subdevice(s) out of OP mid-run — re-walking the bus \
+                         (previously this wedged until a process restart)"
+                        );
+                    } else {
+                        // Final flush before teardown: failsafe has zeroed the
+                        // output mirror; push it out once more so the SubDevices
+                        // latch their safe (zero) outputs before the thread stops.
+                        copy_outputs_to_bus!(group, maindevice, pdi);
+                        let _ = group.tx_rx(&maindevice).await;
+                        tracing::info!("ethercat cyclic loop exiting (shutdown signalled)");
+                    }
                 }
-                // Final flush before teardown: failsafe has zeroed the
-                // output mirror; push it out once more so the SubDevices
-                // latch their safe (zero) outputs before the thread stops.
-                copy_outputs_to_bus!(group, maindevice, pdi);
-                let _ = group.tx_rx(&maindevice).await;
-                tracing::info!("ethercat cyclic loop exiting (shutdown signalled)");
             }
         }
     });
@@ -1237,6 +1449,38 @@ mod tests {
     // The bus-side paths need a real NIC + CAP_NET_RAW, so these exercise
     // the bounded-join logic in isolation — that's the part that has to
     // hold the line on shutdown latency regardless of bus health.
+
+    #[test]
+    fn reinit_backoff_is_immediate_then_capped() {
+        // The walk right after a demotion must be immediate: the common
+        // case is a bus that is back and just needs the ESM walk.
+        assert_eq!(reinit_backoff(0), Duration::ZERO);
+        assert_eq!(reinit_backoff(1), Duration::from_secs(1));
+        assert_eq!(reinit_backoff(2), Duration::from_secs(2));
+        assert_eq!(reinit_backoff(3), Duration::from_secs(4));
+        // Cap: an unplugged cable must not grow the delay unboundedly.
+        assert_eq!(reinit_backoff(4), Duration::from_secs(5));
+        assert_eq!(reinit_backoff(1000), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn walk_fail_aborts_first_init_and_retries_reinit() {
+        let (tx, rx) = mpsc::sync_channel::<InitResult>(1);
+        let mut attempt = 0u64;
+        // First init: abort, and the error reaches the connect handshake.
+        assert!(walk_fail(true, &tx, &mut attempt, "boom".into()));
+        assert!(matches!(rx.try_recv(), Ok(InitResult::Err(m)) if m == "boom"));
+        assert_eq!(attempt, 0, "first-init failure is not a retry");
+        // Re-walk: no abort, no handshake message, attempt counted.
+        assert!(!walk_fail(false, &tx, &mut attempt, "boom again".into()));
+        assert!(
+            rx.try_recv().is_err(),
+            "re-walk failures never touch init_tx"
+        );
+        assert_eq!(attempt, 1);
+        assert!(!walk_fail(false, &tx, &mut attempt, "boom x3".into()));
+        assert_eq!(attempt, 2);
+    }
 
     #[test]
     fn watchdog_step_latches_stall_and_recovery_edges() {
