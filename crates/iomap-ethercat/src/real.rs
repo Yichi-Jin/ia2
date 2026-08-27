@@ -1117,6 +1117,21 @@ fn smol_main(
                                                     ?code,
                                                     "AL status code for demoted subdevice"
                                                 ),
+                                                // A demoted slave with its AL error
+                                                // flag set surfaces the code through
+                                                // state()'s Err path (ethercrab wraps
+                                                // it in Error::SubDevice) — that IS
+                                                // the answer, not a read failure.
+                                                // Seen live 2026-08-27: SafeOp slaves
+                                                // reported SyncManagerWatchdog /
+                                                // SynchronizationError this way.
+                                                Err(ethercrab::error::Error::SubDevice(code)) => {
+                                                    tracing::error!(
+                                                        slave = i,
+                                                        ?code,
+                                                        "AL status code for demoted subdevice (AL error flag set)"
+                                                    )
+                                                }
                                                 Err(e) => tracing::warn!(
                                                     slave = i,
                                                     ?e,
