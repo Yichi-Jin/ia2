@@ -262,9 +262,9 @@ the debug ops).
 | `POST` | `/resume` | Resume free-running. Returns `{ mode }`. |
 | `POST` | `/step` | Advance N cycles while paused. Body: `{ cycles }`. Returns `{ mode }`. |
 | `POST` | `/write` | One-shot write of a variable. Body: `{ name, value }`. Returns the applied value. |
-| `POST` | `/force` | Pin a variable every cycle until released. Body: `{ name, value }`. |
-| `POST` | `/inject-scan-stall` | Fault injection (test primitive): same contract as the server's `/api/runtime/inject-scan-stall` — stall `scans` scans by `stall_ms` each and trip the watchdog for real. Body: `{ stall_ms, scans? }`. |
+| `POST` | `/force` | Pin a variable every cycle until released. Body: `{ name, value }`. Same precedence as the server route: applied before the program runs, so a program-written variable is overwritten by the program and the force never reaches the field. |
 | `POST` | `/unforce` | Release a forced variable. Body: `{ name }`. |
+| `POST` | `/inject-scan-stall` | Fault injection (test primitive): same contract as the server's `/api/runtime/inject-scan-stall` — stall `scans` scans by `stall_ms` each and trip the watchdog for real. Body: `{ stall_ms, scans? }`. |
 | `GET` | `/history` | Downsampled history, same query/response shape as `/api/runtime/history`. Backed by JSONL segments under the edge's state dir — survives restarts AND deploys (state/ sits beside `current`). |
 | `GET` | `/alarms` | Live `AlarmState[]` for the deployed `alarms.toml`, standing-first. `/status` carries the `alarms_standing` count on the panel's existing poll. |
 | `POST` | `/alarms/{id}/ack` | Acknowledge one alarm (operator action from the panel). 404 unknown id. |
