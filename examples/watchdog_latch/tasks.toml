@@ -1,6 +1,9 @@
-# 2 ms matches the weave/motion cadence. The program body cannot finish in
-# 2 ms by construction (see pous/main.st burn_n), so every scan overruns
-# and the watchdog reaches its 5-in-a-row threshold within ~10 ms.
+# 2 ms matches the weave/motion cadence. NOTE: the program body does NOT
+# overrun on its own any more — `burn_n` ships as 0 so a healthy host stays
+# untripped, and that negative control is this fixture's falsifiability
+# guard (a burn loop only proves something on a slow host). The overrun is
+# driven deliberately: `cs sim run scenarios/latch.toml` injects it via
+# POST /api/runtime/inject-scan-stall, or force `burn_n` on the bench.
 [[tasks]]
 name = "motion"
 interval_ms = 2

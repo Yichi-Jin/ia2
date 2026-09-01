@@ -358,6 +358,40 @@ pub async fn unforce_runtime_variable(
     Ok(Json(serde_json::json!({ "name": name, "forced": false })))
 }
 
+/// Body for `POST /api/runtime/inject-scan-stall`.
+#[derive(Deserialize)]
+pub struct InjectScanStallRequest {
+    /// Wall-clock stall per scan, in milliseconds. Pick something
+    /// comfortably over the task interval or nothing overruns.
+    pub stall_ms: u64,
+    /// How many consecutive scans to stall. Defaults to one more than
+    /// the watchdog threshold — enough to trip it.
+    #[serde(default = "default_inject_scans")]
+    pub scans: u32,
+}
+
+fn default_inject_scans() -> u32 {
+    ironplc_bridge::WATCHDOG_OVERRUN_THRESHOLD + 1
+}
+
+/// Fault injection: deliberately stall the next N scans so the scan
+/// watchdog trips through its real code path. This is the test
+/// primitive behind the `inject` scenario step — the only way a
+/// scenario can drive a timing fault deterministically. On a live
+/// plant this drives the runtime into latched failsafe on purpose;
+/// there is no undo other than restarting the program.
+pub async fn inject_scan_stall(
+    State(state): State<AppState>,
+    _project: ProjectName,
+    Json(req): Json<InjectScanStallRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let handle = live_program(&state)?;
+    handle.inject_scan_stall(req.stall_ms, req.scans).await?;
+    Ok(Json(
+        serde_json::json!({ "injected": { "stall_ms": req.stall_ms, "scans": req.scans } }),
+    ))
+}
+
 /// List currently-forced variables. Returns `[]` when nothing's
 /// running (rather than 409) — easier for clients to render.
 pub async fn list_runtime_forces(State(state): State<AppState>) -> Json<Vec<ForceEntry>> {

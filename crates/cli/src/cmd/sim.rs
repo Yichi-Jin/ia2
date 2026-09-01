@@ -27,6 +27,14 @@
 //!
 //! [[steps]]                      # alarms are first-class assertables
 //! expect_alarm = { id = "level_high", active = true, within_ms = 3000 }
+//!
+//! [[steps]]                      # fault injection: stall N scans so the
+//! inject = { scan_stall_ms = 25 } # scan watchdog trips through its real path
+//!
+//! [[steps]]                      # assert on the watchdog latch itself:
+//! expect_watchdog = { tripped = true, within_ms = 3000 }   # reached by deadline
+//! # …or `{ tripped = false, during_ms = 800 }` — HOLDS for the whole window
+//! # (the right shape for a negative control before inject)
 //! ```
 //!
 //! Exit codes follow the CLI contract: 0 = every expectation held,
@@ -63,6 +71,8 @@ struct Step {
     expect: Option<ExpectStep>,
     expect_never: Option<NeverStep>,
     expect_alarm: Option<AlarmStep>,
+    inject: Option<InjectStep>,
+    expect_watchdog: Option<WatchdogStep>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -104,6 +114,37 @@ struct AlarmStep {
     active: bool,
     #[serde(default = "default_within")]
     within_ms: u64,
+}
+
+/// Fault injection: stall each of the next `scans` **ticks** by
+/// `scan_stall_ms` of wall-clock time, so the scan watchdog trips
+/// through its real code path. The only scenario vocabulary that can
+/// drive a timing fault deterministically — a CPU-burn program proves
+/// nothing on a fast host.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InjectStep {
+    scan_stall_ms: u64,
+    /// Defaults server-side to one more than the watchdog threshold.
+    #[serde(default)]
+    scans: Option<u32>,
+}
+
+/// Assert on the scan-watchdog latch (`watchdog_tripped` on
+/// `/api/runtime/status`). Two windows, same split as expect vs
+/// expect_never: `within_ms` = the state is REACHED by the deadline
+/// (eventually); `during_ms` = the state HOLDS for the whole window
+/// (fails on the first counterexample). A negative control before an
+/// inject step must use `during_ms` — with eventually-semantics,
+/// `tripped = false` passes trivially on the first poll and guards
+/// nothing.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WatchdogStep {
+    #[serde(default = "default_true")]
+    tripped: bool,
+    within_ms: Option<u64>,
+    during_ms: Option<u64>,
 }
 
 fn default_within() -> u64 {
@@ -358,7 +399,100 @@ fn run_step(
             std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
         }
     }
-    Err("empty step (write one of: wait_ms / set / expect / expect_never / expect_alarm)".into())
+    if let Some(inj) = &step.inject {
+        let mut body = serde_json::json!({ "stall_ms": inj.scan_stall_ms });
+        if let Some(n) = inj.scans {
+            body["scans"] = serde_json::json!(n);
+        }
+        client
+            .post("/api/runtime/inject-scan-stall", &body)
+            .map_err(|e| format!("inject: {e:#}"))?;
+        return Ok(format!(
+            "inject scan stall {}ms x {}",
+            inj.scan_stall_ms,
+            inj.scans
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "default".into())
+        ));
+    }
+    if let Some(wd) = &step.expect_watchdog {
+        let read_tripped = || -> std::result::Result<bool, String> {
+            let status = client
+                .get("/api/runtime/status")
+                .map_err(|e| format!("expect_watchdog: {e:#}"))?;
+            // A missing field must FAIL, not read as `false`. Against a
+            // runtime that predates the latch, `unwrap_or(false)` turned
+            // `tripped = false` into a hollow pass: the negative control
+            // that guards every scenario below it asserted nothing.
+            let tripped = status
+                .get("watchdog_tripped")
+                .and_then(|v| v.as_bool())
+                .ok_or_else(|| {
+                    "expect_watchdog: /api/runtime/status carries no boolean \
+                     `watchdog_tripped` — this runtime predates the watchdog \
+                     latch, so the step cannot be evaluated (upgrade the \
+                     runtime, or drop the step)"
+                        .to_string()
+                })?;
+            // Nothing running ⇒ the latch means nothing. Without this a
+            // scenario whose program never started still "passed" its
+            // `tripped = false` control.
+            let running = status
+                .get("running")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if !running {
+                return Err("expect_watchdog: no program is running — the \
+                            watchdog state is not meaningful (did the program \
+                            fail to start?)"
+                    .to_string());
+            }
+            Ok(tripped)
+        };
+        let word = |b: bool| {
+            if b {
+                "tripped (latched)"
+            } else {
+                "not tripped"
+            }
+        };
+        if let Some(during_ms) = wd.during_ms {
+            // Hold semantics: the state must match at EVERY poll in the
+            // window. First counterexample fails the step.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(during_ms);
+            loop {
+                let now = read_tripped()?;
+                if now != wd.tripped {
+                    return Err(format!(
+                        "watchdog became {} inside the {during_ms}ms window (required: stays {})",
+                        word(now),
+                        word(wd.tripped),
+                    ));
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Ok(format!("watchdog {} for {during_ms}ms", word(wd.tripped)));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
+            }
+        }
+        // Eventually semantics (default): reached by the deadline.
+        let within_ms = wd.within_ms.unwrap_or_else(default_within);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(within_ms);
+        loop {
+            let last = read_tripped()?;
+            if last == wd.tripped {
+                return Ok(format!("watchdog {}", word(wd.tripped)));
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "watchdog_tripped stayed {last} for {within_ms}ms (expected {})",
+                    wd.tripped
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
+        }
+    }
+    Err("empty step (write one of: wait_ms / set / expect / expect_never / expect_alarm / inject / expect_watchdog)".into())
 }
 
 /// Read one variable's numeric value off /api/runtime/snapshot, and
@@ -431,19 +565,29 @@ fn validate(s: &Scenario) -> Result<()> {
             step.expect.is_some(),
             step.expect_never.is_some(),
             step.expect_alarm.is_some(),
+            step.inject.is_some(),
+            step.expect_watchdog.is_some(),
         ]
         .iter()
         .filter(|b| **b)
         .count();
         if set_fields != 1 {
             bail!(
-                "step {}: exactly one of wait_ms / set / expect / expect_never / expect_alarm (found {set_fields})",
+                "step {}: exactly one of wait_ms / set / expect / expect_never / expect_alarm / inject / expect_watchdog (found {set_fields})",
                 i + 1
             );
         }
         if let Some(e) = &step.expect {
             if matches!(e.op, CmpOp::IsTrue | CmpOp::IsFalse) && e.value != 0.0 {
                 bail!("step {}: `{:?}` takes no value", i + 1, e.op);
+            }
+        }
+        if let Some(w) = &step.expect_watchdog {
+            if w.within_ms.is_some() && w.during_ms.is_some() {
+                bail!(
+                    "step {}: expect_watchdog takes within_ms (reached by deadline) OR during_ms (holds for the window), not both",
+                    i + 1
+                );
             }
         }
     }

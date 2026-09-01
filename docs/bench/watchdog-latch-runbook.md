@@ -197,9 +197,13 @@ server warns `IA2_RUNTIME_BIN is not a Linux ELF`). The hash is the only
 reliable signal. Fix and redeploy; **do not read a verdict off a
 carried-forward binary.**
 
-On this commit the fixture ships with `burn_n = 200000`: every scan
-overruns from the first one, so the trip lands within a few scans of the
-restart that `cs deploy` performs — there is no separate arming step.
+The fixture deploys **healthy** (`burn_n` ships as 0). Arm the overrun
+explicitly — this is the moment the test starts:
+
+```bash
+cs runtime force burn_n 200000 --edge bench
+```
+
 Watch the trip land:
 
 ```bash
@@ -223,8 +227,8 @@ print('scans/s =', round(d['scan_count']/max(d['uptime_secs'],1)))
 print('healthy 2ms would be ~500/s; far below that means the burn is working')"
 ```
 
-If scans/s is still ~500, raise `burn_n` in `pous/main.st` (README
-explains) and redeploy.
+If scans/s is still ~500, force a bigger `burn_n` (README explains) — no
+redeploy needed.
 
 ### Read the verdict — pre-fix
 
@@ -273,6 +277,7 @@ cs ls edges                              # bench still there
 ssh edge 'sha256sum /opt/ia2/current/runtime'      # BEFORE = the prefix hash
 cs deploy bench
 ssh edge 'readlink -f /opt/ia2/current; sha256sum /opt/ia2/current/runtime'   # AFTER = the fixed hash
+cs runtime force burn_n 200000 --edge bench
 ```
 
 Same rule as § 2c: if the AFTER hash did not move to the
@@ -287,7 +292,7 @@ Repeat the 10-sample loop from step 2.
 | P1 | Watchdog trips | `watchdog tripped` in journal (on this build `cs probe bench` also prints `WATCHDOG LATCHED`) |
 | P2 | Statusword leaves Ready-to-switch-on | bit 6 set (Switch on disabled) |
 | P3 | **It stays there** — 10/10 samples over ≥10 s | the loop above |
-| P4 | Restart clears it | `ssh edge 'sudo systemctl restart ia2'`. The latch is process state, so the first `/status` samples after the restart show the drive back at `16#1631` — but this fixture overruns on every scan, so it re-trips within ~40 ms, which is correct. To watch the steady recovery, set `burn_n := 0` in `pous/main.st`, redeploy, and confirm `16#1631` holds at ~500 scans/s |
+| P4 | Restart clears it | `ssh edge 'sudo systemctl restart ia2'` — the restart drops the force too, so the program comes back healthy: statusword returns to `16#1631` and stays |
 
 P3 is the whole test. P4 proves the latch is a latch and not a permanent
 brick.

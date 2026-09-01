@@ -5,15 +5,24 @@ Proves on real hardware what
 a unit test: once the scan watchdog trips, **no non-zero output may reach
 the bus until the program is restarted**.
 
-## Why a fixture is needed
+## Two ways to make it trip
 
 The watchdog fires on a real timing condition — a scan body that cannot
-finish inside its interval. Nothing in the `cs sim` scenario DSL
-(`wait_ms / set / expect / expect_never / expect_alarm`) can inject that,
-so the behaviour cannot be driven from a scenario. This project creates
-the condition structurally instead: `pous/main.st` burns CPU in a `FOR`
-loop that cannot complete within the 2 ms task interval, so **every** scan
-overruns and the 5-in-a-row threshold is reached in ~10 ms.
+finish inside its interval. Two ways to create it, one per environment:
+
+- **sim** — `scenarios/latch.toml` uses the scenario DSL's `inject` step
+  (`POST /api/runtime/inject-scan-stall`): the runtime stalls the next N
+  scans by a chosen wall-clock amount, and the watchdog trips through
+  its real overrun path. Deterministic and host-speed independent:
+
+  ```bash
+  cs sim run scenarios/latch.toml
+  ```
+
+- **bench** — force the CPU burn live: `cs runtime force burn_n 200000
+  --edge <edge>`. Every scan then overruns for real with no HTTP in the
+  loop once armed. `burn_n` ships as 0 so the project deploys healthy;
+  the trip is an explicit action, never a startup race.
 
 ## Safety — this fixture cannot move an axis
 
@@ -55,11 +64,11 @@ nic = "enp2s0"        # was "_sim"
 
 Then follow `docs/bench/watchdog-latch-runbook.md`.
 
-## Tuning `burn_n`
+## Tuning `burn_n` (bench only)
 
-`burn_n` (default 200000) sets the burn length. It is a plain `DINT` in the
-program, so it can be forced at runtime. Raise it until scans actually
-overrun — the check is that `scan_count` stops tracking wall clock:
+`burn_n` (default 0 = harmless) sets the burn length and is forced at
+runtime on the bench. Raise it until scans actually overrun — the check
+is that `scan_count` stops tracking wall clock:
 
 ```bash
 cs get runtime/status     # scan_count should grow far slower than uptime_secs × 500
