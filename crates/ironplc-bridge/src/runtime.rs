@@ -1702,7 +1702,24 @@ async fn run_loop_async(
                         continue;
                     };
                     if let Err(e) = dev.write_channel(&rm.channel, value).await {
-                        tracing::debug!(channel = %rm.channel, %e, "output write failed");
+                        // RTSO-HOLD-0731: debug-level swallowing meant we could
+                        // not know whether control_word writes were erroring
+                        // invisibly during the 2026-08-24 stall. First failure
+                        // per channel per process now lands in the journal.
+                        let first = OUTPUT_WRITE_WARNED
+                            .get_or_init(Default::default)
+                            .lock()
+                            .map(|mut set| set.insert(rm.channel.clone()))
+                            .unwrap_or(false);
+                        if first {
+                            tracing::warn!(
+                                channel = %rm.channel, %e,
+                                "output write failed (first occurrence for this \
+                                 channel; repeats at debug)"
+                            );
+                        } else {
+                            tracing::debug!(channel = %rm.channel, %e, "output write failed");
+                        }
                     }
                 }
             }
@@ -1853,6 +1870,12 @@ async fn run_loop_async(
 fn max_scan_count(clocks: &[UnitClock]) -> u64 {
     clocks.iter().map(|c| c.scan_count).max().unwrap_or(0)
 }
+
+/// RTSO-HOLD-0731: channels whose output-write failure has already been
+/// warned about once this process (repeats drop back to debug level).
+static OUTPUT_WRITE_WARNED: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashSet<String>>,
+> = std::sync::OnceLock::new();
 
 fn value_for_type(raw: u64, type_tag: u8) -> ChannelValue {
     match type_tag {

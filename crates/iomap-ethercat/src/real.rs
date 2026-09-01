@@ -34,7 +34,7 @@
 //!   being touched from a tokio task.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::{mpsc, Mutex};
 use std::thread;
@@ -177,15 +177,22 @@ macro_rules! gear_tick {
 
 /// Post-cycle: snapshot inputs back into our mirror.
 macro_rules! copy_inputs_from_bus {
-    ($group:expr, $maindevice:expr, $pdi:expr) => {{
+    ($group:expr, $maindevice:expr, $pdi:expr, $changes:expr) => {{
         let mut mirror = $pdi.lock().expect("pdi mirror poisoned");
+        let mut changed = false;
         for (offset_idx, sd) in $group.iter(&$maindevice).enumerate() {
             let idx = offset_idx as u16;
             let inputs = sd.inputs_raw();
             if let Some(dst) = mirror.inputs.get_mut(&idx) {
                 let n = inputs.len().min(dst.len());
+                if dst[..n] != inputs[..n] {
+                    changed = true;
+                }
                 dst[..n].copy_from_slice(&inputs[..n]);
             }
+        }
+        if changed {
+            $changes.fetch_add(1, Ordering::Relaxed);
         }
     }};
 }
@@ -246,6 +253,14 @@ struct WorkerShared {
     shutdown: Arc<AtomicBool>,
     stopped: Arc<AtomicBool>,
     healthy: Arc<AtomicBool>,
+    /// RTSO-HOLD-0731 instrumentation: bumped once per cyclic loop
+    /// iteration (Ok or Err). A parked or dead worker stops advancing
+    /// this; the watchdog thread turns that into a journal line.
+    cycles: Arc<AtomicU64>,
+    /// Bumped whenever a post-cycle input snapshot differed from the
+    /// mirror's previous contents — "the bus is delivering genuinely
+    /// fresh bytes", as opposed to byte-identical echoes.
+    input_changes: Arc<AtomicU64>,
     /// In-cycle gear engines (one per configured [[gear]] axis), owned by
     /// the cyclic worker and ticked between the mirror copy and tx_rx.
     engines: Vec<crate::gear::GearEngine>,
@@ -346,6 +361,8 @@ impl RealEthercat {
         let shutdown = Arc::new(AtomicBool::new(false));
         let stopped = Arc::new(AtomicBool::new(false));
         let healthy = Arc::new(AtomicBool::new(true));
+        let cycles = Arc::new(AtomicU64::new(0));
+        let input_changes = Arc::new(AtomicU64::new(0));
         let (init_tx, init_rx) = mpsc::sync_channel::<InitResult>(1);
 
         let nic = config.nic.clone();
@@ -358,6 +375,8 @@ impl RealEthercat {
             shutdown: shutdown.clone(),
             stopped: stopped.clone(),
             healthy: healthy.clone(),
+            cycles: cycles.clone(),
+            input_changes: input_changes.clone(),
             engines,
         };
         let thread_name = format!("ec-{name}");
@@ -429,6 +448,14 @@ impl RealEthercat {
                     discovered = discovered.len(),
                     "ethercat device live"
                 );
+                spawn_cycle_watchdog(
+                    name.clone(),
+                    cycles,
+                    input_changes,
+                    stopped.clone(),
+                    healthy.clone(),
+                    shutdown.clone(),
+                );
                 Ok(Self {
                     name,
                     channels,
@@ -472,7 +499,12 @@ impl IoDevice for RealEthercat {
     /// watchdog tripped); `true` again after the first good exchange.
     /// While unhealthy the PDI mirror serves last-known inputs.
     fn is_healthy(&self) -> bool {
-        self.healthy.load(Ordering::Relaxed)
+        // RTSO-HOLD-0731: a dead worker (DoneGuard flips `stopped` on every
+        // exit path, panic included) used to freeze `healthy` at its last
+        // value forever — only `record_failure` could clear it, and a dead
+        // thread never calls it. Reported observable only; nothing gates
+        // control flow on this.
+        self.healthy.load(Ordering::Relaxed) && !self.stopped.load(Ordering::Relaxed)
     }
 
     async fn read_channel(&mut self, channel: &str) -> Result<ChannelValue, IoError> {
@@ -588,6 +620,81 @@ impl IoDevice for RealEthercat {
     }
 }
 
+/// RTSO-HOLD-0731 instrumentation: one step of the cycle-watchdog latch.
+/// Pure so the stall/recover edge logic is unit-testable. Returns the new
+/// `stalled` state and whether an edge (Some(true)=stalled, Some(false)=
+/// recovered) should be logged this step.
+fn watchdog_step(last: u64, now: u64, was_stalled: bool) -> (bool, Option<bool>) {
+    if now == last && !was_stalled {
+        (true, Some(true))
+    } else if now != last && was_stalled {
+        (false, Some(false))
+    } else {
+        (was_stalled, None)
+    }
+}
+
+/// RTSO-HOLD-0731 instrumentation: an independent std-thread watchdog over
+/// the cyclic worker's cycle counter. Deliberately uses only
+/// `thread::sleep` and relaxed atomics — it must stay alive through the
+/// exact failure modes it instruments (async-io reactor stall, smol
+/// executor wedge, poisoned PDI mutex), so it never locks anything and
+/// never touches the async runtime. At a 2 ms cycle, 1 s of zero advance
+/// is 500 missed cycles — unambiguous. The 60 s heartbeat writes a
+/// bus-side timeline into the journal (the 1 Hz historian only sees the
+/// VM side).
+fn spawn_cycle_watchdog(
+    name: String,
+    cycles: Arc<AtomicU64>,
+    input_changes: Arc<AtomicU64>,
+    stopped: Arc<AtomicBool>,
+    healthy: Arc<AtomicBool>,
+    shutdown: Arc<AtomicBool>,
+) {
+    let _ = thread::Builder::new()
+        .name(format!("ecwd-{name}"))
+        .spawn(move || {
+            let mut last = cycles.load(Ordering::Relaxed);
+            let mut stalled = false;
+            let mut beat: u64 = 0;
+            while !shutdown.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_secs(1));
+                let now = cycles.load(Ordering::Relaxed);
+                let (next, edge) = watchdog_step(last, now, stalled);
+                stalled = next;
+                match edge {
+                    Some(true) => tracing::error!(
+                        device = %name,
+                        cycles = now,
+                        worker_stopped = stopped.load(Ordering::Relaxed),
+                        healthy = healthy.load(Ordering::Relaxed),
+                        input_changes = input_changes.load(Ordering::Relaxed),
+                        "ethercat cyclic worker made ZERO cycles in 1s \
+                         (worker_stopped=true => thread dead; false => parked \
+                         in reactor/timer — capture a stack before restarting)"
+                    ),
+                    Some(false) => tracing::info!(
+                        device = %name,
+                        cycles = now,
+                        "ethercat cyclic worker advancing again"
+                    ),
+                    None => {}
+                }
+                beat += 1;
+                if beat.is_multiple_of(60) {
+                    tracing::info!(
+                        device = %name,
+                        cycles = now,
+                        input_changes = input_changes.load(Ordering::Relaxed),
+                        healthy = healthy.load(Ordering::Relaxed),
+                        "ethercat cyclic heartbeat"
+                    );
+                }
+                last = now;
+            }
+        });
+}
+
 /// Health bookkeeping for one failed cyclic exchange. Exactly one ERROR
 /// per outage (when the threshold is crossed); WARN before that, DEBUG
 /// for the repeats while already unhealthy (a dead bus at a 1 ms cycle
@@ -603,6 +710,49 @@ fn note_txrx_failure<E: std::fmt::Debug>(health: &mut HealthTracker, error: &E) 
         }
         _ if health.is_healthy() => tracing::warn!(?error, "ethercat tx_rx failed"),
         _ => tracing::debug!(?error, "ethercat tx_rx still failing"),
+    }
+}
+
+/// RTSO-HOLD-0731 instrumentation: edge-triggered AL-state/WKC logging.
+/// The per-cycle `TxRxResponse` already carries every subdevice's AL state
+/// and the group working counter; steady state was silently discarding
+/// them. Logs one INFO baseline, then one ERROR per change (including the
+/// recovery back). Flap suppressor: first 10 edges verbatim, then every
+/// 1000th, with the running edge count so nothing is lost statistically.
+/// Returns true when this call logged an edge (callers may fetch AL codes).
+fn note_bus_shape(
+    prev: &mut Option<(Vec<ethercrab::SubDeviceState>, u16)>,
+    edges: &mut u64,
+    states: &[ethercrab::SubDeviceState],
+    wkc: u16,
+) -> bool {
+    match prev {
+        None => {
+            tracing::info!(
+                ?states,
+                wkc,
+                "ethercat bus shape baseline (per-slave AL state + WKC)"
+            );
+            *prev = Some((states.to_vec(), wkc));
+            false
+        }
+        Some((ps, pw)) if ps.as_slice() != states || *pw != wkc => {
+            *edges += 1;
+            let log_it = *edges <= 10 || edges.is_multiple_of(1000);
+            if log_it {
+                tracing::error!(
+                    prev_states = ?ps,
+                    new_states = ?states,
+                    prev_wkc = *pw,
+                    new_wkc = wkc,
+                    edge = *edges,
+                    "ethercat bus shape CHANGED mid-run (AL demotion/promotion or WKC step)"
+                );
+            }
+            *prev = Some((states.to_vec(), wkc));
+            log_it
+        }
+        _ => false,
     }
 }
 
@@ -624,6 +774,8 @@ fn smol_main(
         shutdown,
         stopped,
         healthy,
+        cycles,
+        input_changes,
         mut engines,
     } = shared;
     // Flip `stopped` on EVERY exit path (init failure or loop end) via a
@@ -687,6 +839,21 @@ fn smol_main(
             }
         };
         let _tx_rx_handle = smol::spawn(async move {
+            // RTSO-HOLD-0731: the ERROR below only fires on an Err *return*;
+            // a pump death by panic parks silently in this never-awaited
+            // handle. The drop guard fires on unwind too, closing the one
+            // silent exit path. No spurious fire on clean shutdown: the pump
+            // is detached over leaked PduStorage and never cancelled.
+            struct PumpGuard;
+            impl Drop for PumpGuard {
+                fn drop(&mut self) {
+                    tracing::error!(
+                        "ethercat tx_rx socket pump EXITED (return or panic) — \
+                         every subsequent exchange will time out until restart"
+                    );
+                }
+            }
+            let _g = PumpGuard;
             if let Err(e) = tx_rx.await {
                 tracing::error!(?e, "ethercat tx_rx task exited");
             }
@@ -918,13 +1085,69 @@ fn smol_main(
                 // failed cycle they freeze (no master advance / target held)
                 // and the bus recovers without a one-cycle catch-up step.
                 let mut bus_ok = true;
+                let mut prev_shape: Option<(Vec<ethercrab::SubDeviceState>, u16)> = None;
+                let mut shape_edges: u64 = 0;
                 while !shutdown.load(Ordering::Relaxed) {
+                    cycles.fetch_add(1, Ordering::Relaxed);
                     let cycle_start = std::time::Instant::now();
                     copy_outputs_to_bus!(group, maindevice, pdi);
                     gear_tick!(group, maindevice, engines, bus_ok);
                     let next_wait = match group.tx_rx_dc(&maindevice).await {
                         Ok(resp) => {
-                            copy_inputs_from_bus!(group, maindevice, pdi);
+                            let edge = note_bus_shape(
+                                &mut prev_shape,
+                                &mut shape_edges,
+                                &resp.subdevice_states,
+                                resp.working_counter,
+                            );
+                            if edge {
+                                // Why did it demote? Fetch the AL status code
+                                // for every non-OP subdevice. Edge cycles only
+                                // (1-2 extra PDUs, can push this one cycle past
+                                // its 2 ms slot — accepted: the edge IS the
+                                // diagnostic moment).
+                                for (i, st) in resp.subdevice_states.iter().enumerate() {
+                                    if *st != ethercrab::SubDeviceState::Op {
+                                        let sd = group.subdevice(&maindevice, i);
+                                        match sd {
+                                            Ok(sd) => match sd.status().await {
+                                                Ok((state, code)) => tracing::error!(
+                                                    slave = i,
+                                                    ?state,
+                                                    ?code,
+                                                    "AL status code for demoted subdevice"
+                                                ),
+                                                // A demoted slave with its AL error
+                                                // flag set surfaces the code through
+                                                // state()'s Err path (ethercrab wraps
+                                                // it in Error::SubDevice) — that IS
+                                                // the answer, not a read failure.
+                                                // Seen live 2026-08-27: SafeOp slaves
+                                                // reported SyncManagerWatchdog /
+                                                // SynchronizationError this way.
+                                                Err(ethercrab::error::Error::SubDevice(code)) => {
+                                                    tracing::error!(
+                                                        slave = i,
+                                                        ?code,
+                                                        "AL status code for demoted subdevice (AL error flag set)"
+                                                    )
+                                                }
+                                                Err(e) => tracing::warn!(
+                                                    slave = i,
+                                                    ?e,
+                                                    "AL status code read failed"
+                                                ),
+                                            },
+                                            Err(e) => tracing::warn!(
+                                                slave = i,
+                                                ?e,
+                                                "subdevice ref for AL code failed"
+                                            ),
+                                        }
+                                    }
+                                }
+                            }
+                            copy_inputs_from_bus!(group, maindevice, pdi, input_changes);
                             if health.record_success() == HealthTransition::Recovered {
                                 tracing::info!("ethercat recovered; cyclic exchange running again");
                             }
@@ -969,11 +1192,20 @@ fn smol_main(
                 use smol::stream::StreamExt;
                 let mut health = HealthTracker::with_flag(UNHEALTHY_AFTER_TX_ERRORS, healthy);
                 let mut bus_ok = true;
+                let mut prev_shape: Option<(Vec<ethercrab::SubDeviceState>, u16)> = None;
+                let mut shape_edges: u64 = 0;
                 while !shutdown.load(Ordering::Relaxed) {
+                    cycles.fetch_add(1, Ordering::Relaxed);
                     copy_outputs_to_bus!(group, maindevice, pdi);
                     gear_tick!(group, maindevice, engines, bus_ok);
                     match group.tx_rx(&maindevice).await {
-                        Ok(_) => {
+                        Ok(resp) => {
+                            note_bus_shape(
+                                &mut prev_shape,
+                                &mut shape_edges,
+                                &resp.subdevice_states,
+                                resp.working_counter,
+                            );
                             if health.record_success() == HealthTransition::Recovered {
                                 tracing::info!("ethercat recovered; cyclic exchange running again");
                             }
@@ -984,7 +1216,7 @@ fn smol_main(
                             bus_ok = false;
                         }
                     }
-                    copy_inputs_from_bus!(group, maindevice, pdi);
+                    copy_inputs_from_bus!(group, maindevice, pdi, input_changes);
                     tick.next().await;
                 }
                 // Final flush before teardown: failsafe has zeroed the
@@ -1005,6 +1237,65 @@ mod tests {
     // The bus-side paths need a real NIC + CAP_NET_RAW, so these exercise
     // the bounded-join logic in isolation — that's the part that has to
     // hold the line on shutdown latency regardless of bus health.
+
+    #[test]
+    fn watchdog_step_latches_stall_and_recovery_edges() {
+        // Advancing counter, not stalled: no edge, stays clear.
+        assert_eq!(watchdog_step(10, 11, false), (false, None));
+        // Counter froze: stall edge fires exactly once...
+        assert_eq!(watchdog_step(11, 11, false), (true, Some(true)));
+        // ...and repeats of the frozen state are silent.
+        assert_eq!(watchdog_step(11, 11, true), (true, None));
+        // Counter moves again: recovery edge fires exactly once...
+        assert_eq!(watchdog_step(11, 12, true), (false, Some(false)));
+        // ...and steady advance stays silent again.
+        assert_eq!(watchdog_step(12, 13, false), (false, None));
+    }
+
+    #[test]
+    fn bus_shape_logs_baseline_then_edges_only() {
+        use ethercrab::SubDeviceState as S;
+        let mut prev = None;
+        let mut edges = 0u64;
+        let base = [S::Op, S::Op, S::Op];
+        // First call: baseline, not an edge.
+        assert!(!note_bus_shape(&mut prev, &mut edges, &base, 9));
+        assert_eq!(edges, 0);
+        // Unchanged shape: silent.
+        assert!(!note_bus_shape(&mut prev, &mut edges, &base, 9));
+        // AL demotion: edge.
+        let demoted = [S::Op, S::Op, S::SafeOp];
+        assert!(note_bus_shape(&mut prev, &mut edges, &demoted, 9));
+        assert_eq!(edges, 1);
+        // Same demoted shape again: silent (edge-triggered, not per-cycle).
+        assert!(!note_bus_shape(&mut prev, &mut edges, &demoted, 9));
+        // WKC step alone is also an edge.
+        assert!(note_bus_shape(&mut prev, &mut edges, &demoted, 8));
+        assert_eq!(edges, 2);
+        // Recovery back to baseline is an edge too.
+        assert!(note_bus_shape(&mut prev, &mut edges, &base, 9));
+        assert_eq!(edges, 3);
+    }
+
+    #[test]
+    fn bus_shape_flap_suppressor_caps_logging() {
+        use ethercrab::SubDeviceState as S;
+        let mut prev = None;
+        let mut edges = 0u64;
+        let a = [S::Op];
+        let b = [S::SafeOp];
+        assert!(!note_bus_shape(&mut prev, &mut edges, &a, 1)); // baseline
+        let mut logged = 0;
+        for i in 0..2000 {
+            let shape: &[S] = if i % 2 == 0 { &b } else { &a };
+            if note_bus_shape(&mut prev, &mut edges, shape, 1) {
+                logged += 1;
+            }
+        }
+        assert_eq!(edges, 2000);
+        // First 10 verbatim + every 1000th thereafter: 10 + 2 = 12.
+        assert_eq!(logged, 12);
+    }
 
     #[test]
     fn join_worker_joins_a_thread_that_stops() {
