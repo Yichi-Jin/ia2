@@ -107,6 +107,14 @@ Value encoding for force/write: human notation — `TRUE`/`FALSE`/`1`/`0`
 for BOOL, `50.0` for REAL (the CLI bit-packs by the variable's live
 type). Negative numbers after `--`: `cs runtime force setpoint -- -5`.
 
+Force precedence: the force is applied after the input read and before
+the program runs, so it beats the bus but loses to the program — a
+variable the program assigns every scan (most outputs) is overwritten by
+that assignment and the forced value never reaches the field, while the
+CLI still reports success. Force variables the program only *reads*
+(setpoints, mode requests, jog commands); to override a program-written
+output, give the program an override input it applies last.
+
 ### Simulate (prove behaviour before hardware)
 
 ```
