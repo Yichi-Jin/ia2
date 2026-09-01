@@ -158,7 +158,7 @@ the *deployed* edge runtime, proxy the same ops through
 | `POST` | `/api/runtime/resume` | Resume free-running. Returns `ModeResponse`. |
 | `POST` | `/api/runtime/step` | Advance N cycles while paused. Body: `StepRequest { cycles }` (default 1). Returns `ModeResponse`. |
 | `GET` | `/api/runtime/forces` | List currently-forced variables. Returns `ForceEntry[]` (`[]` when not running). |
-| `POST` | `/api/runtime/forces/{name}` | Pin a variable every cycle until released. Body: `ForceRequest { value }`. Returns `ForceResponse { name, value }`; 404 unknown variable, 409 if stopped. |
+| `POST` | `/api/runtime/forces/{name}` | Pin a variable every cycle until released. Body: `ForceRequest { value }`. Returns `ForceResponse { name, value }`; 404 unknown variable, 409 if stopped. **Precedence:** the force is applied after the input read and *before* the program runs, so it beats the bus but loses to the program — a variable the program assigns every scan (most outputs) is overwritten by that assignment and the forced value never reaches the field. Force is for variables the program only reads. |
 | `DELETE` | `/api/runtime/forces/{name}` | Release a forced variable. Idempotent (200 even if it wasn't forced). |
 
 ## Runtime history & alarms
@@ -261,7 +261,7 @@ the debug ops).
 | `POST` | `/resume` | Resume free-running. Returns `{ mode }`. |
 | `POST` | `/step` | Advance N cycles while paused. Body: `{ cycles }`. Returns `{ mode }`. |
 | `POST` | `/write` | One-shot write of a variable. Body: `{ name, value }`. Returns the applied value. |
-| `POST` | `/force` | Pin a variable every cycle until released. Body: `{ name, value }`. |
+| `POST` | `/force` | Pin a variable every cycle until released. Body: `{ name, value }`. Same precedence as the server route: applied before the program runs, so a program-written variable is overwritten by the program and the force never reaches the field. |
 | `POST` | `/unforce` | Release a forced variable. Body: `{ name }`. |
 | `GET` | `/history` | Downsampled history, same query/response shape as `/api/runtime/history`. Backed by JSONL segments under the edge's state dir — survives restarts AND deploys (state/ sits beside `current`). |
 | `GET` | `/alarms` | Live `AlarmState[]` for the deployed `alarms.toml`, standing-first. `/status` carries the `alarms_standing` count on the panel's existing poll. |
