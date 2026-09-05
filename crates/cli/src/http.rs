@@ -181,6 +181,14 @@ impl Client {
         if let Some(p) = &self.project {
             req = req.set("X-IA2-Project", p);
         }
+        // Attribution convention (ADR-0002): mutating requests carry
+        // their operator's origin so the server's takeover overlay and
+        // the edge's audit ring can tell `cs` apart from unattributed
+        // writers. Inside `cs agent run`, a cs-origin mutating request
+        // also refreshes the session's liveness and the banner stays on
+        // the session label; outside a session the server labels the
+        // action "… — cs (no session)" rather than suppressing it.
+        req = req.set("X-IA2-Origin", "cs");
 
         let outcome = match body {
             Body::None => req.call(),

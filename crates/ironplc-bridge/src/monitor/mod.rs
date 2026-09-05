@@ -100,6 +100,12 @@ pub fn step(handle: &ProgramHandle, cycles: u32) -> ModeResponse {
 ///
 /// This is the single implementation of that safety guarantee — the
 /// IDE server and the edge runtime both call it.
+///
+/// The initial write is governed like any external write; the reset is
+/// the runtime's OWN safety action, not an external write, so it
+/// bypasses governance (same rationale as the force bypass, ADR-0002).
+/// Otherwise a rule with `min > 0` would clamp the reset up to `min`
+/// and silently latch the momentary command forever.
 pub async fn write_with_pulse(
     handle: &ProgramHandle,
     name: &str,
@@ -112,7 +118,7 @@ pub async fn write_with_pulse(
         let n = name.to_string();
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(ms as u64)).await;
-            if let Err(e) = h.write_variable(&n, 0).await {
+            if let Err(e) = h.write_variable_ungoverned(&n, 0).await {
                 // The program may have stopped in the window — that also
                 // clears the variable, so a failed reset is benign then;
                 // log it so a live-program failure is still visible.

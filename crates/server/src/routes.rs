@@ -908,6 +908,196 @@ pub async fn pou_variables(
 //  Devices
 // ============================================================
 
+// ============================================================
+//  Device describe — deterministic per-device agent reference
+// ============================================================
+
+/// One bound variable in the device manifest: the iomap row plus the
+/// optional engineering metadata declared on it.
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export)]
+pub struct DescribedBinding {
+    pub application: String,
+    pub variable: String,
+    pub direction: project::Direction,
+    pub channel: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub unit: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub min: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub max: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub description: Option<String>,
+}
+
+/// The deterministic per-device manifest — IA2's scheme-agnostic answer
+/// to "auto-generated agent reference file" (ADR-0002 Decision 2).
+/// Derived from project truth only; no timestamps, so identical project
+/// state produces byte-identical output.
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export)]
+pub struct DeviceDescription {
+    pub device: String,
+    pub protocol: String,
+    /// Device config as JSON with every credential-pattern key (see
+    /// `SECRET_KEY_PATTERNS`) redacted.
+    #[ts(type = "Record<string, unknown>")]
+    pub config: serde_json::Value,
+    /// Iomap bindings onto this device, sorted by variable.
+    pub bindings: Vec<DescribedBinding>,
+    /// Alarm definitions reading this device's bound variables (bare or
+    /// instance-qualified, matching the snapshot names the alarm engine
+    /// sees), by id.
+    pub alarms: Vec<project::AlarmDef>,
+    /// The project's write mode plus the governance rules that name any
+    /// of this device's bound variables (bare or instance-qualified).
+    pub write_mode: project::WriteMode,
+    pub write_rules: Vec<project::WriteRule>,
+}
+
+/// Credential key patterns for `redact_secrets`: an object key that
+/// case-insensitively CONTAINS one of these has its value replaced.
+/// New protocol configs MUST keep their credential keys inside this
+/// pattern set (`password`, `mqtt_token`, `client_secret`, …) — a
+/// credential field whose name matches none of these leaks through
+/// `/describe` into agent context.
+const SECRET_KEY_PATTERNS: &[&str] = &[
+    "password",
+    "passwd",
+    "secret",
+    "token",
+    "credential",
+    "api_key",
+    "apikey",
+    "private_key",
+];
+
+/// Redact secrets recursively: any object key matching
+/// `SECRET_KEY_PATTERNS` has its value replaced with a visible
+/// placeholder — never silent omission. The manifest is meant to be
+/// pasted into agent context — credentials never leave the box.
+fn redact_secrets(v: &mut serde_json::Value) {
+    match v {
+        serde_json::Value::Object(map) => {
+            for (k, val) in map.iter_mut() {
+                let key = k.to_ascii_lowercase();
+                if SECRET_KEY_PATTERNS.iter().any(|p| key.contains(p)) {
+                    *val = serde_json::Value::String("***".into());
+                } else {
+                    redact_secrets(val);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(redact_secrets),
+        _ => {}
+    }
+}
+
+fn build_device_description(
+    store: &project::ProjectStore,
+    name: &str,
+) -> Result<DeviceDescription, ApiError> {
+    let device = store.read_device(name)?;
+    let mut config = serde_json::to_value(&device.config)
+        .map_err(|e| ApiError::Internal(format!("device config serializes: {e}")))?;
+    redact_secrets(&mut config);
+
+    let iomap = store.read_iomap().unwrap_or_default();
+    let mut bindings: Vec<DescribedBinding> = iomap
+        .mappings
+        .iter()
+        .filter(|m| m.device == name)
+        .map(|m| DescribedBinding {
+            application: m.application.clone(),
+            variable: m.variable.clone(),
+            direction: m.direction,
+            channel: m.channel.clone(),
+            unit: m.unit.clone(),
+            min: m.min,
+            max: m.max,
+            description: m.description.clone(),
+        })
+        .collect();
+    bindings.sort_by(|a, b| {
+        a.variable
+            .cmp(&b.variable)
+            .then(a.application.cmp(&b.application))
+            .then(a.channel.cmp(&b.channel))
+    });
+
+    // Alarm defs read SNAPSHOT names, which are instance-qualified
+    // (`main.level`) when a variable name is shared across program
+    // units — accept both forms, like the write_rules filter below.
+    // Matching stays exact-case to mirror the alarm engine's exact
+    // snapshot-name matching.
+    let bound: std::collections::HashSet<&str> =
+        bindings.iter().map(|b| b.variable.as_str()).collect();
+    let bound_qualified: std::collections::HashSet<String> = bindings
+        .iter()
+        .map(|b| format!("{}.{}", b.application, b.variable))
+        .collect();
+    let mut alarms: Vec<project::AlarmDef> = store
+        .read_alarms()
+        .unwrap_or_default()
+        .alarms
+        .into_iter()
+        .filter(|a| bound.contains(a.variable.as_str()) || bound_qualified.contains(&a.variable))
+        .collect();
+    alarms.sort_by(|a, b| a.id.cmp(&b.id));
+
+    // Same freshness contract as the alarms read above: after a hand-edit
+    // to [governance], this export and the next /api/run must agree. An
+    // invalid on-disk table falls back to the cached copy — /api/run is
+    // the surface that reports it loudly.
+    let governance = store
+        .read_governance()
+        .unwrap_or_else(|_| store.governance().clone());
+    let mut write_rules: Vec<project::WriteRule> = governance
+        .rules
+        .iter()
+        .filter(|r| {
+            let key = r.variable.to_lowercase();
+            bindings.iter().any(|b| {
+                key == b.variable.to_lowercase()
+                    || key
+                        == format!(
+                            "{}.{}",
+                            b.application.to_lowercase(),
+                            b.variable.to_lowercase()
+                        )
+            })
+        })
+        .cloned()
+        .collect();
+    write_rules.sort_by(|a, b| a.variable.cmp(&b.variable));
+
+    Ok(DeviceDescription {
+        device: device.name.clone(),
+        protocol: format!("{:?}", device.config.protocol()).to_lowercase(),
+        config,
+        bindings,
+        alarms,
+        write_mode: governance.write_mode,
+        write_rules,
+    })
+}
+
+pub async fn describe_device(
+    State(state): State<AppState>,
+    project: ProjectName,
+    AxumPath(name): AxumPath<String>,
+) -> Result<Json<DeviceDescription>, ApiError> {
+    with_project(&state, &project, |store| {
+        build_device_description(store, &name)
+    })
+    .map(Json)
+}
+
 pub async fn get_device(
     State(state): State<AppState>,
     project: ProjectName,
@@ -1331,32 +1521,6 @@ pub async fn status_edge_route(
         store.read_edge(&name).map_err(Into::into)
     })?;
     crate::edges::fetch_edge_json(&edge, "/status")
-        .await
-        .map(Json)
-        .map_err(ApiError::Internal)
-}
-
-/// Proxy an online-debug control op to the edge runtime over ssh. `op`
-/// is whitelisted (it's interpolated into the remote curl command). The
-/// request body (if any) is forwarded as the JSON payload — e.g.
-/// `{cycles}` for step, `{name,value}` for write/force.
-pub async fn edge_runtime_route(
-    State(state): State<AppState>,
-    project: ProjectName,
-    AxumPath((name, op)): AxumPath<(String, String)>,
-    body: Option<Json<serde_json::Value>>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    const ALLOWED: [&str; 6] = ["pause", "resume", "step", "write", "force", "unforce"];
-    if !ALLOWED.contains(&op.as_str()) {
-        return Err(ApiError::Internal(format!("unknown runtime op '{op}'")));
-    }
-    let edge = with_project(&state, &project, |store| {
-        store.read_edge(&name).map_err(Into::into)
-    })?;
-    let payload = body
-        .map(|Json(v)| v)
-        .unwrap_or_else(|| serde_json::json!({}));
-    crate::edges::post_edge_runtime(&edge, &op, &payload)
         .await
         .map(Json)
         .map_err(ApiError::Internal)
@@ -1983,12 +2147,33 @@ pub async fn project_variables(
     .map(Json)
 }
 
+/// Governance for THIS run, re-read from disk like tasks/iomap/alarms.
+/// The registry's store caches the manifest at project-open, so using
+/// `store.governance()` here would make a `[governance]` edit invisible
+/// until the project is re-opened — failing OPEN when an agent tightens
+/// open → allowlist between runs (ADR-0002).
+fn fresh_governance(store: &ProjectStore) -> Result<project::WriteGovernance, ApiError> {
+    store.read_governance().map_err(|e| match e {
+        // An invalid [governance] table is the caller's project.toml to
+        // fix — 400, not a 500 the CLI would report as infrastructure.
+        e @ project::StoreError::TomlDe(..) => ApiError::BadRequest(e.to_string()),
+        e => e.into(),
+    })
+}
+
 pub async fn run(
     State(state): State<AppState>,
     project: ProjectName,
+    headers: axum::http::HeaderMap,
     body: Option<Json<RunRequest>>,
 ) -> Result<Json<RunResponse>, ApiError> {
     let req = body.map(|Json(b)| b).unwrap_or_default();
+    // Starting a program IS driving the plant — an unattributed run
+    // flashes the takeover overlay like any other mutating route.
+    state.maybe_attribute_external(
+        crate::runtime_routes::origin_of(&headers).as_deref(),
+        "run".into(),
+    );
 
     // Resolve which project this run targets up front. Multi-project
     // servers route `/api/run` to whichever project the X-IA2-Project
@@ -2027,7 +2212,7 @@ pub async fn run(
     };
     let req_program = req.program.clone();
     let req_file_path = req.file_path.clone();
-    let (units, device_specs, mappings, alarm_defs) =
+    let (units, device_specs, mappings, alarm_defs, governance) =
         tokio::task::spawn_blocking(move || -> Result<_, ApiError> {
             let store = &store;
             let req = RunRequest {
@@ -2091,7 +2276,14 @@ pub async fn run(
                     config: d.config,
                 })
                 .collect::<Vec<_>>();
-            Ok((units, specs, iomap.mappings, alarms))
+            Ok((
+                units,
+                specs,
+                iomap.mappings,
+                alarms,
+                // Per-run freshness, same as tasks/iomap/alarms above.
+                fresh_governance(store)?,
+            ))
         })
         .await
         .map_err(|e| ApiError::Internal(format!("compile task failed: {e}")))??;
@@ -2111,7 +2303,7 @@ pub async fn run(
     // poking values, not for persisted plant state. We leave
     // `state_path = None`; only the headless `ia2-runtime` edge
     // binary points it at a real disk location.
-    let handle = ironplc_bridge::spawn_units(units, device_specs, mappings, None);
+    let handle = ironplc_bridge::spawn_units(units, device_specs, mappings, None, governance);
     let mut rx = handle.subscribe();
     let event_tx = state.event_tx.clone();
     let last_snapshot_cache = state.last_snapshot.clone();
@@ -2219,10 +2411,17 @@ pub async fn run(
     Ok(Json(RunResponse { ok: true }))
 }
 
-pub async fn stop(State(state): State<AppState>) -> Json<RunResponse> {
+pub async fn stop(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> Json<RunResponse> {
     // Global stop — only one program can be running at a time
     // (hardware constraint), so a single `/api/stop` always targets
     // it regardless of which window the request came from.
+    state.maybe_attribute_external(
+        crate::runtime_routes::origin_of(&headers).as_deref(),
+        "stop".into(),
+    );
     if let Some(rp) = state.program.lock().take() {
         rp.handle.stop();
     }
@@ -2846,5 +3045,167 @@ mod path_resolution_tests {
             resolve_user_path("  /abs/path  "),
             PathBuf::from("/abs/path")
         );
+    }
+}
+
+#[cfg(test)]
+mod device_describe_tests {
+    use super::*;
+    use project::ProjectStore;
+
+    #[test]
+    fn device_describe_is_deterministic_and_redacts() {
+        let dir = tempfile::tempdir().unwrap();
+        // Create only scaffolds the project dir; the store used below is
+        // re-opened after the config files land.
+        let _ = ProjectStore::create(dir.path().join("p"), "p").unwrap();
+        let root = dir.path().join("p");
+        std::fs::write(
+            root.join("devices/plc1.toml"),
+            "name = \"plc1\"\nprotocol = \"opcua\"\nendpoint_url = \"opc.tcp://127.0.0.1:4840\"\npoll_interval_ms = 100\n\n[auth]\nkind = \"user_password\"\nusername = \"u\"\npassword = \"s3cret\"\n\n[[channels]]\nname = \"ch0\"\nnode_id = \"ns=2;i=3\"\ndata_type = \"f64\"\naccess = \"write\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("iomap.toml"),
+            "[[mappings]]\napplication = \"main\"\nvariable = \"level\"\ndirection = \"input\"\ndevice = \"plc1\"\nchannel = \"ch0\"\nunit = \"%\"\ndescription = \"Tank level\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("alarms.toml"),
+            "[[alarms]]\nid = \"level_high\"\nvariable = \"level\"\ncondition = \"gt\"\nlimit = 90.0\nmessage = \"Tank level high\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("project.toml"),
+            "name = \"p\"\n\n[governance]\nwrite_mode = \"allowlist\"\n\n[[governance.rules]]\nvariable = \"level\"\nmax = 100.0\n",
+        )
+        .unwrap();
+        let store = ProjectStore::open(root).unwrap();
+
+        let a = build_device_description(&store, "plc1").unwrap();
+        let b = build_device_description(&store, "plc1").unwrap();
+        let ja = serde_json::to_string(&a).unwrap();
+        assert_eq!(ja, serde_json::to_string(&b).unwrap(), "deterministic");
+
+        assert_eq!(a.protocol, "opcua");
+        // Secret redacted everywhere it appears.
+        assert!(!ja.contains("s3cret"), "password must be redacted: {ja}");
+        assert!(ja.contains("***"));
+        // Binding carries the metadata.
+        assert_eq!(a.bindings.len(), 1);
+        assert_eq!(a.bindings[0].unit.as_deref(), Some("%"));
+        assert_eq!(a.bindings[0].description.as_deref(), Some("Tank level"));
+        // Related alarm + applicable governance rule included.
+        assert_eq!(a.alarms.len(), 1);
+        assert_eq!(a.alarms[0].id, "level_high");
+        assert_eq!(a.write_mode, project::WriteMode::Allowlist);
+        assert_eq!(a.write_rules.len(), 1);
+        assert_eq!(a.write_rules[0].max, Some(100.0));
+        // Unknown device → the store error (404 path).
+        assert!(build_device_description(&store, "nope").is_err());
+    }
+
+    /// Alarm defs read SNAPSHOT names, which are instance-qualified
+    /// (`main.level`) when a variable name is shared across program
+    /// units — describe must match those against its bindings the same
+    /// two-key way as write_rules. A qualified alarm on a DIFFERENT
+    /// application must not ride along.
+    #[test]
+    fn describe_matches_instance_qualified_alarm_variables() {
+        let dir = tempfile::tempdir().unwrap();
+        let _ = ProjectStore::create(dir.path().join("p"), "p").unwrap();
+        let root = dir.path().join("p");
+        std::fs::write(
+            root.join("devices/plc1.toml"),
+            "name = \"plc1\"\nprotocol = \"modbus\"\nslave_id = 1\npoll_interval_ms = 100\n\n[transport]\nkind = \"tcp\"\nhost = \"127.0.0.1\"\nport = 502\n\n[[channels]]\nname = \"ch0\"\nkind = \"holding_register\"\naddress = 0\ndata_type = \"u16\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("iomap.toml"),
+            "[[mappings]]\napplication = \"main\"\nvariable = \"level\"\ndirection = \"input\"\ndevice = \"plc1\"\nchannel = \"ch0\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("alarms.toml"),
+            "[[alarms]]\nid = \"level_high_qualified\"\nvariable = \"main.level\"\ncondition = \"gt\"\nlimit = 90.0\nmessage = \"Tank level high\"\n\n[[alarms]]\nid = \"foreign_level_high\"\nvariable = \"other.level\"\ncondition = \"gt\"\nlimit = 90.0\nmessage = \"Someone else's level\"\n",
+        )
+        .unwrap();
+        let store = ProjectStore::open(root).unwrap();
+
+        let d = build_device_description(&store, "plc1").unwrap();
+        let ids: Vec<&str> = d.alarms.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["level_high_qualified"],
+            "qualified alarm on the bound (application, variable) is in; \
+             a foreign application's alarm is out"
+        );
+    }
+
+    /// The redaction key set covers credential-ish keys beyond the
+    /// literal `password` — a protocol config gaining a token/api-key
+    /// field must not leak through describe. Placeholder stays visible,
+    /// never silent omission; non-credential keys pass untouched.
+    #[test]
+    fn redact_secrets_covers_credential_key_patterns() {
+        let mut v = serde_json::json!({
+            "endpoint_url": "opc.tcp://127.0.0.1:4840",
+            "auth": { "kind": "user_password", "username": "u", "password": "p" },
+            "Token": "t0k3n",
+            "api_key": "k1",
+            "broker": {
+                "client_secret": "sh",
+                "tls": { "private_key": "-----BEGIN..." }
+            },
+            "channels": [ { "name": "ch0", "apikey": "k2" } ]
+        });
+        redact_secrets(&mut v);
+        let redacted = serde_json::Value::String("***".into());
+        assert_eq!(v["auth"]["password"], redacted);
+        // Case-insensitive…
+        assert_eq!(v["Token"], redacted);
+        // …and substring: `client_secret` / `private_key` style names.
+        assert_eq!(v["api_key"], redacted);
+        assert_eq!(v["broker"]["client_secret"], redacted);
+        assert_eq!(v["broker"]["tls"]["private_key"], redacted);
+        // Arrays are walked too.
+        assert_eq!(v["channels"][0]["apikey"], redacted);
+        // Non-credential keys survive verbatim.
+        assert_eq!(v["auth"]["username"], "u");
+        assert_eq!(v["endpoint_url"], "opc.tcp://127.0.0.1:4840");
+        assert_eq!(v["channels"][0]["name"], "ch0");
+    }
+}
+
+#[cfg(test)]
+mod governance_freshness_tests {
+    use super::fresh_governance;
+    use project::ProjectStore;
+
+    /// `/api/run` must enforce the `[governance]` table as it is ON DISK
+    /// at spawn time, not the copy cached when the project was opened —
+    /// otherwise tightening open → allowlist between runs silently fails
+    /// open. This pins the helper the run handler's spawn closure uses.
+    #[test]
+    fn run_governance_is_reread_from_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let _ = ProjectStore::create(dir.path().join("p"), "p").unwrap();
+        let root = dir.path().join("p");
+        let cached = ProjectStore::open(root.clone()).unwrap();
+        assert_eq!(cached.governance().write_mode, project::WriteMode::Open);
+
+        // An agent edits project.toml between runs (the documented way
+        // to declare governance — there is no API that writes it).
+        std::fs::write(
+            root.join("project.toml"),
+            "name = \"p\"\n\n[governance]\nwrite_mode = \"allowlist\"\n",
+        )
+        .unwrap();
+
+        // The registry's cached copy is stale by design…
+        assert_eq!(cached.governance().write_mode, project::WriteMode::Open);
+        // …and the run path must not use it.
+        let fresh = fresh_governance(&cached).unwrap();
+        assert_eq!(fresh.write_mode, project::WriteMode::Allowlist);
     }
 }

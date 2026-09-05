@@ -33,6 +33,10 @@ impl ProjectStore {
         }
         let text = fs::read_to_string(&manifest_path)?;
         let manifest: ProjectManifest = toml::from_str(&text)?;
+        // A semantically bad [governance] table (nan/inf bounds, min >
+        // max, empty/duplicate variables) must be a loud load error —
+        // never a policy that silently misbehaves on the scan thread.
+        manifest.governance.validate().map_err(invalid_governance)?;
         let store = Self { root, manifest };
         store.migrate_applications_to_pous()?;
         Ok(store)
@@ -70,6 +74,7 @@ impl ProjectStore {
         let manifest = ProjectManifest {
             name: name.to_string(),
             version: "0.1".into(),
+            governance: crate::types::WriteGovernance::default(),
         };
         fs::write(&manifest_path, toml::to_string_pretty(&manifest)?)?;
         fs::write(
@@ -105,6 +110,28 @@ impl ProjectStore {
 
     pub fn name(&self) -> &str {
         &self.manifest.name
+    }
+
+    /// The project's write-governance policy (`[governance]` in
+    /// project.toml). Defaults to fully open when absent.
+    ///
+    /// This is the copy cached when the project was opened — callers
+    /// that spawn a run should use [`read_governance`](Self::read_governance)
+    /// so a file edit tightening the policy takes effect without
+    /// re-opening the project.
+    pub fn governance(&self) -> &crate::types::WriteGovernance {
+        &self.manifest.governance
+    }
+
+    /// Re-read `[governance]` from project.toml on disk, validated the
+    /// same way [`open`](Self::open) validates it — a bad table is a
+    /// loud error, never a silently-open policy. Same per-call
+    /// freshness contract as `read_tasks` / `read_alarms`.
+    pub fn read_governance(&self) -> Result<crate::types::WriteGovernance, StoreError> {
+        let text = fs::read_to_string(self.root.join("project.toml"))?;
+        let manifest: ProjectManifest = toml::from_str(&text)?;
+        manifest.governance.validate().map_err(invalid_governance)?;
+        Ok(manifest.governance)
     }
 
     /// Project tree without parsed declarations — the server fills those
@@ -1087,6 +1114,18 @@ pub fn is_library_slug(slug: &str) -> bool {
     slug == LIBRARY_SLUG_PREFIX || slug.starts_with("lib/")
 }
 
+/// Wrap a `WriteGovernance::validate` failure as a load error. The
+/// manifest PARSED — the table is semantically invalid — but load time
+/// is the contract boundary, and `TomlDe` is the established
+/// "project.toml is bad" error, so we mint one via serde's custom
+/// constructor rather than widening the error enum.
+fn invalid_governance(msg: String) -> StoreError {
+    use serde::de::Error as _;
+    StoreError::TomlDe(toml::de::Error::custom(format!(
+        "[governance] is invalid: {msg}"
+    )))
+}
+
 /// A single path segment: no separators at all, plus the usual
 /// `validate_path` per-segment rules.
 fn validate_single_segment(name: &str) -> Result<(), StoreError> {
@@ -1495,5 +1534,120 @@ mod tests {
             store.read_hmi("s"),
             Err(StoreError::HmiCorrupt(..))
         ));
+    }
+
+    // ---- governance load validation ------------------------------------
+
+    use crate::types::WriteMode;
+
+    /// Write `body` as the project's manifest, bypassing the typed
+    /// serializer — these tests exercise exactly the "operator edited
+    /// project.toml by hand" path.
+    fn write_manifest(root: &Path, body: &str) {
+        fs::write(root.join("project.toml"), body).unwrap();
+    }
+
+    #[test]
+    fn open_rejects_governance_with_swapped_bounds() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("p");
+        ProjectStore::create(root.clone(), "p").unwrap();
+        write_manifest(
+            &root,
+            "name = \"p\"\n\n[governance]\nwrite_mode = \"allowlist\"\n\n\
+             [[governance.rules]]\nvariable = \"sp\"\nmin = 100.0\nmax = 0.0\n",
+        );
+        let err = ProjectStore::open(root)
+            .err()
+            .expect("open must reject the manifest")
+            .to_string();
+        assert!(err.contains("[governance] is invalid"), "{err}");
+        assert!(err.contains("rule #1 ('sp')"), "{err}");
+        assert!(err.contains("min (100) is greater than max (0)"), "{err}");
+    }
+
+    #[test]
+    fn open_rejects_governance_with_non_finite_bounds() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("p");
+        ProjectStore::create(root.clone(), "p").unwrap();
+        write_manifest(
+            &root,
+            "name = \"p\"\n\n[governance]\nwrite_mode = \"allowlist\"\n\n\
+             [[governance.rules]]\nvariable = \"sp\"\nmin = nan\n",
+        );
+        let err = ProjectStore::open(root)
+            .err()
+            .expect("open must reject the manifest")
+            .to_string();
+        assert!(err.contains("min must be a finite number"), "{err}");
+    }
+
+    #[test]
+    fn open_rejects_governance_with_typoed_key() {
+        // deny_unknown_fields makes this a plain TOML parse error.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("p");
+        ProjectStore::create(root.clone(), "p").unwrap();
+        write_manifest(
+            &root,
+            "name = \"p\"\n\n[governance]\nwritemode = \"allowlist\"\n",
+        );
+        let err = ProjectStore::open(root)
+            .err()
+            .expect("open must reject the manifest")
+            .to_string();
+        assert!(err.contains("unknown field"), "{err}");
+        assert!(err.contains("writemode"), "{err}");
+    }
+
+    #[test]
+    fn open_accepts_valid_governance() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("p");
+        ProjectStore::create(root.clone(), "p").unwrap();
+        write_manifest(
+            &root,
+            "name = \"p\"\n\n[governance]\nwrite_mode = \"allowlist\"\n\n\
+             [[governance.rules]]\nvariable = \"sp\"\nmin = 0.0\nmax = 100.0\n",
+        );
+        let store = ProjectStore::open(root).unwrap();
+        assert_eq!(store.governance().write_mode, WriteMode::Allowlist);
+        assert_eq!(store.governance().rules.len(), 1);
+    }
+
+    #[test]
+    fn read_governance_follows_disk_edits_where_the_cached_copy_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("p");
+        let store = ProjectStore::create(root.clone(), "p").unwrap();
+        assert!(store.governance().is_default());
+        write_manifest(
+            &root,
+            "name = \"p\"\n\n[governance]\nwrite_mode = \"allowlist\"\n\n\
+             [[governance.rules]]\nvariable = \"sp\"\nmax = 10.0\n",
+        );
+        // Fresh read sees the tightened policy…
+        let fresh = store.read_governance().unwrap();
+        assert_eq!(fresh.write_mode, WriteMode::Allowlist);
+        assert_eq!(fresh.rules[0].max, Some(10.0));
+        // …while the cached copy documents why per-run callers must not
+        // rely on it.
+        assert!(store.governance().is_default());
+    }
+
+    #[test]
+    fn read_governance_rejects_an_invalid_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("p");
+        let store = ProjectStore::create(root.clone(), "p").unwrap();
+        write_manifest(
+            &root,
+            "name = \"p\"\n\n[governance]\nwrite_mode = \"allowlist\"\n\n\
+             [[governance.rules]]\nvariable = \"\"\n",
+        );
+        let err = store.read_governance().unwrap_err().to_string();
+        assert!(err.contains("[governance] is invalid"), "{err}");
+        assert!(err.contains("variable must not be empty"), "{err}");
     }
 }

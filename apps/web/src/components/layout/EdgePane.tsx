@@ -149,6 +149,7 @@ function Editor({
         runtime_version: null,
         fieldbus_healthy: null,
         unhealthy_devices: [],
+        watchdog_tripped: null,
         error: String(e),
       })
     } finally {

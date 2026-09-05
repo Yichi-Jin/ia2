@@ -86,6 +86,7 @@ read-only device-template catalog used to pre-fill devices from a bus scan.
 | `GET` | `/api/devices/{name}` | Read a device. Returns `Device`. |
 | `PUT` | `/api/devices/{name}` | Update full device config. Body: `Device`. |
 | `DELETE` | `/api/devices/{name}` | Delete. |
+| `GET` | `/api/devices/{name}/describe` | Deterministic per-device agent reference file (ADR-0002), derived from project truth — no timestamps, identical state → identical output. Returns `DeviceDescription { device, protocol, config, bindings, alarms, write_mode, write_rules }`: the device config as JSON with every credential-bearing key (case-insensitive pattern set: `password`, `passwd`, `secret`, `token`, `api_key`/`apikey`, `credential`, `private_key`) redacted to `***`, the iomap bindings onto this device sorted by variable (with their `unit`/`min`/`max`/`description` metadata), the alarm definitions reading those variables, and the project's write mode plus the governance rules naming them. CLI: `cs get devices/<n>/describe`. |
 | `POST` | `/api/devices/{name}/esi-assemble` | Assemble a modular EtherCAT coupler's channels from its ESI file + the modules it reports. Body: `EsiAssembleRequest { detected: u32[] }` (module idents in slot order). Requires the device to be EtherCAT with `bringup = esi_modular`; the assembled channels **replace** the device's channel list. Returns the updated `Device`. |
 | `POST` | `/api/devices/{name}/opcua-browse` | Live-browse one level of an OPC UA device's address space using its own endpoint/auth config. Body: `OpcuaBrowseRequest { node_id? }` (omitted = ObjectsFolder). Returns `OpcuaBrowseNode[]` — NodeId, display name, node class, and for Variables the UA data type plus the channel `data_type` that fits. Backs the editor's NodeId picker; CLI: `cs api POST /api/devices/<n>/opcua-browse`. |
 
@@ -104,7 +105,8 @@ read-only device-template catalog used to pre-fill devices from a bus scan.
 | `GET` | `/api/edges/{name}/discover` | Per-device connect status + discovered EtherCAT topology from the edge, so PDO maps can be authored against the real bus. Returns JSON. |
 | `GET` | `/api/edges/{name}/system` | Edge interfaces / serial ports / arch — for authoring device configs against real edge facts. Returns JSON. |
 | `GET` | `/api/edges/{name}/status` | Proxy the edge runtime's `/status` (project + scan count + debug mode/forces + last snapshot). Returns JSON. |
-| `POST` | `/api/edges/{name}/runtime/{op}` | Proxy an online-debug op to the *deployed* edge runtime over ssh. `op` ∈ {`pause`,`resume`,`step`,`write`,`force`,`unforce`}; body forwarded as the remote payload (e.g. `{cycles}` for step, `{name,value}` for write/force). |
+| `GET` | `/api/edges/{name}/audit` | Proxy the edge runtime's `/audit` write ring (who claimed to write what: self-declared origin, op, requested/applied values, outcome — see the edge table below). Backs `cs get edges/<n>/audit`. Returns JSON. |
+| `POST` | `/api/edges/{name}/runtime/{op}` | Proxy an online-debug op to the *deployed* edge runtime over ssh. `op` ∈ {`pause`,`resume`,`step`,`write`,`force`,`unforce`}; body forwarded as the remote payload (e.g. `{cycles}` for step, `{name,value}` for write/force). The edge's own answer passes through with its original status and body verbatim — a governance denial on the edge is a 403 here too, a stopped runtime a 409; only ssh/transport faults are this server's own 500s. |
 | `POST` | `/api/edges/{name}/deploy` | Tar project + runtime binary + web assets (when this server has a `--static-dir`; they land at `current/web` for the edge's HMI panel), ssh to edge, atomic symlink swap, restart unit. Returns `DeployReport`. |
 | `POST` | `/api/edges/{name}/attach` | Open `ssh -N -L` tunnel to the edge runtime port. Returns `AttachInfo { local_port }`. |
 | `POST` | `/api/edges/{name}/detach` | Close the tunnel. |
@@ -141,7 +143,7 @@ read-only device-template catalog used to pre-fill devices from a bus scan.
 | `POST` | `/api/stop` | Stop the running program (cooperative; scan loop drains). |
 | `GET` | `/api/runtime/status` | Synchronous overview of the runtime. Returns `RuntimeStatus { running, project, program_instances, devices, device_health, watchdog_tripped, scan_count, last_snapshot_us, last_error, running_info, mode, forces }`; `last_error` carries the VM-trap / panic message when a run dies (also emitted as SSE `error` + `stopped`), `null` after a clean run. `devices` lists the project's configured device names, while `device_health` reports whether each one's transport is actually live — a `false` entry means that device's inputs are frozen at last-known values and its outputs are dropped, even though `running` stays `true` and the scan count keeps climbing. `watchdog_tripped` is `true` once the scan watchdog latched: the program lost real-time guarantees, every output was zeroed and the output phase stays off until a restart — check it before reading any variable value as plant state, because the VM keeps computing and `scan_count` keeps climbing after a trip. | One-shot, agent-friendly
 | `GET` | `/api/runtime/snapshot` | Latest `VarSnapshot` or `null`. | No SSE needed for one-off queries
-| `POST` | `/api/runtime/variables/{name}` | Write a variable while running. Body: `WriteVariableRequest { value: <i32-coerceable> }`. Returns the new value. | Critical for debugging closed loops
+| `POST` | `/api/runtime/variables/{name}` | Write a variable while running. Body: `WriteVariableRequest { value: <i32-coerceable> }`. Returns the new value. Subject to the project's `[governance]` (project.toml): in `allowlist` mode a write to an unlisted variable is 403, and a rule's `min`/`max` clamp the written value (the response echoes the clamped value). A write no honest clamp exists for is denied 403 instead: `NaN` to a min/max-ruled REAL, or a rule range containing no representable value of the variable's type. | Critical for debugging closed loops
 | `GET` | `/api/events` | SSE stream of `AppEvent` (`snapshot` / `started` / `stopped` / `error`). | For long-running IDE clients
 | `GET` | `/api/project/variables` | Flat list of every variable across every POU in the project. Returns `ProjectVariables { variables: [...] }`. | Cross-POU index for agents
 | `GET` | `/api/project/pous` | Every IEC POU declared anywhere in the project (parser-driven). Returns `ProjectPous { pous: [{ application, name, kind }] }` — `kind` ∈ `program` / `function_block` / `function`. | Source of truth for "what's schedulable" — multi-POU files (one .st declaring PROGRAM + FB + FUNCTION) are correctly enumerated, unlike `application.kind` which is a heuristic |
@@ -184,6 +186,33 @@ below, same get→edit→set shape as iomap); alarm STATE lives here.
 Drives the IDE's "an agent is operating" overlay. See
 `crates/server/src/events.rs` for the protocol. Read-only `cs` commands
 don't call these.
+
+**Attribution beyond `cs` (ADR-0002).** Mutating requests may declare
+`X-IA2-Origin: <operator>` (`gui`, `cs`, `hmi`, `mqtt`, …). The web IDE
+sends `gui`, the `cs` CLI sends `cs`, the operator panel sends `hmi`.
+The label is self-declared — a convention, not authentication: the
+server trusts it as given, so a request that *claims* `gui` is treated
+as the console. It is sanitized before use (kept charset
+`[A-Za-z0-9._-]`, capped at 64 chars; a label that sanitizes to
+nothing counts as absent; a mangled label is cleaned up, never
+silently dropped). On every mutating runtime route
+(`/api/runtime/variables/{name}`, `/api/runtime/forces/{name}`,
+pause/resume/step, alarm ack, `/api/run`, `/api/stop`,
+`/api/runtime/inject-scan-stall`, and the
+`/api/edges/{name}/runtime/{op}` proxy) the server auto-attributes by
+origin: `gui` is suppressed (the IDE user drives the banner UI
+itself); `cs` refreshes the open agent session's liveness and is
+suppressed exactly while that session is open, flashing
+`<op> — cs (no session)` otherwise; any other declared label flashes
+`<op> — <origin> (self-declared)` — always, even during an active
+session; no usable label flashes `<op> (unattributed)`. The guarantee
+is exactly as strong as the convention: unlabelled writers and
+self-labelled non-`gui` writers always surface in the overlay (`cs`
+folding into the session banner only while an agent session is open) —
+but a writer that falsely claims to be the IDE does not. What no label
+can dodge is the record: the edge proxy forwards the (sanitized)
+origin header to the runtime, where every write — whatever it claimed
+— lands in the runtime's audit ring (`GET /audit`, below).
 
 | Method | Path | Purpose |
 |---|---|---|
@@ -261,10 +290,11 @@ the debug ops).
 | `POST` | `/pause` | Freeze the scan loop (last outputs hold). Returns `{ mode }`. |
 | `POST` | `/resume` | Resume free-running. Returns `{ mode }`. |
 | `POST` | `/step` | Advance N cycles while paused. Body: `{ cycles }`. Returns `{ mode }`. |
-| `POST` | `/write` | One-shot write of a variable. Body: `{ name, value }`. Returns the applied value. |
-| `POST` | `/force` | Pin a variable every cycle until released. Body: `{ name, value }`. Same precedence as the server route: applied before the program runs, so a program-written variable is overwritten by the program and the force never reaches the field. |
+| `POST` | `/write` | One-shot write of a variable. Body: `{ name, value }`. Returns the applied value. Subject to the deployed project's `[governance]` (project.toml): `write_mode = "allowlist"` rejects writes to variables with no matching `[[governance.rules]]` entry (403), and a rule's `min`/`max` clamp the value (the response echoes the clamped value — a clamp is also logged and lands in `/audit` as `result: "clamped"` with both `requested` and `applied`, never silent). A write no honest clamp exists for is denied 403 instead: `NaN` to a min/max-ruled REAL, or a rule range containing no representable value of the variable's type. |
+| `POST` | `/force` | Pin a variable every cycle until released. Body: `{ name, value }`. Same precedence as the server route: applied before the program runs, so a program-written variable is overwritten by the program and the force never reaches the field. Force is the debug override: it **bypasses governance** by explicit decision (ADR-0002) and is never exported on any northbound surface. |
 | `POST` | `/unforce` | Release a forced variable. Body: `{ name }`. |
 | `POST` | `/inject-scan-stall` | Fault injection (test primitive): same contract as the server's `/api/runtime/inject-scan-stall` — stall `scans` scans by `stall_ms` each and trip the watchdog for real. Body: `{ stall_ms, scans? }`. |
+| `GET` | `/audit` | The write-audit ring (bounded at 256, oldest first): every `/write`·`/force`·`/unforce` and MQTT northbound write with `ts_unix_secs`, `origin` (`X-IA2-Origin` header, `mqtt`, or `anonymous`), `op`, `name`, bit-packed `requested` and `applied` values (an `unforce` entry carries neither — there is no value to release to), and `result` — `ok`, `clamped` (governance altered the value; `requested`/`applied` show both sides), or the error text (denied writes are recorded too, with the denial reason; `applied` is then absent). In-memory only — cleared when the runtime process restarts (a redeploy restarts it), and under steady write traffic the 256-entry window covers only the recent past; `/history` is the surface that survives restarts. Also readable through the IDE as `GET /api/edges/{name}/audit` / `cs get edges/<n>/audit`. |
 | `GET` | `/history` | Downsampled history, same query/response shape as `/api/runtime/history`. Backed by JSONL segments under the edge's state dir — survives restarts AND deploys (state/ sits beside `current`). |
 | `GET` | `/alarms` | Live `AlarmState[]` for the deployed `alarms.toml`, standing-first. `/status` carries the `alarms_standing` count on the panel's existing poll. |
 | `POST` | `/alarms/{id}/ack` | Acknowledge one alarm (operator action from the panel). 404 unknown id. |

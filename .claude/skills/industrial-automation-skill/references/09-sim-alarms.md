@@ -136,3 +136,27 @@ wall-clock — correlate via "now".
 Post-event drill: `cs get runtime/alarms-journal` for WHEN and WHAT →
 `cs get runtime/history --query vars=<alarm variable>` around it for
 WHY → read the POU → fix → `cs sim run` to prove the fix.
+
+---
+
+## Write governance — who may write what, within which bounds
+
+Declared in `project.toml` (no new config file), enforced in the scan thread so **every** write path is covered — IDE server, edge runtime HTTP, IDE→edge proxy, and MQTT northbound writes alike:
+
+```toml
+[governance]
+write_mode = "allowlist"    # default "open" = legacy: everything writable
+
+[[governance.rules]]
+variable = "level_sp"       # monitor name: bare or instance.variable
+min = 0.0
+max = 100.0
+```
+
+- `open` (default, and what old projects parse to) applies no checks.
+- `allowlist` rejects writes to any variable no rule names. HTTP writes (the IDE's `/api/runtime/variables/{name}`, the edge's `/write`, the HMI panel) get a **403** with the reason in the body; a denied MQTT northbound write is dropped and logged, with the denial recorded in the edge audit ring (`GET /audit`) — MQTT is a data path with no reply channel, so there is no 403 to receive. A rule without `min`/`max` allows any value; with them, out-of-range values are **clamped to the bound** and the response echoes the clamped value — nothing silent: clamps are logged everywhere, and on a deployed edge they land in the audit ring (the IDE server keeps no ring; its record is the takeover overlay plus the server log).
+- Clamping happens in the written value's own domain: integer writes clamp to the integers inside `[min, max]`, REAL writes stay within the declared bounds even after float rounding. A write that *can't* be honestly clamped is **denied** instead of guessed at: `NaN` to a min/max-ruled REAL, a rule whose bounds don't form a valid range, or a range containing no writable value (e.g. `min = 10.2, max = 10.8` on an INT). Range rules are meaningful for REAL and signed-integer setpoints — bit-string types (DWORD, TIME) compare as the raw signed slot value, so don't put ranges on those.
+- The table is **validated at project load** (server and deployed edge alike): unknown keys (`writemode`, `mim`), empty or duplicate `variable`s, non-finite bounds, and `min > max` fail the load with an error naming the offending rule. The one typo TOML can't catch is the *section name itself* — `[governence]` parses as an unrelated table and governance silently stays at its default `open`, so eyeball the section header after editing.
+- **`force` bypasses governance by explicit decision** (ADR-0002): it stays the pure debug override and is never exported on any northbound surface. Mechanically, force only sticks on variables the program *reads* — which includes setpoints (see 02's force-precedence note) — but in a governed project, drive governed setpoints through writes so the clamps apply. Forcing a governed variable is a deliberate ungoverned override: it is attributed on the takeover overlay like any other mutating call, recorded in the edge audit ring, and belongs to commissioning/debug, not to normal operation.
+- Sim scenarios can assert governance directly: a `set` step to an unlisted variable fails the step with the 403 reason, and a `set` past a rule's bound followed by an `expect` reads back the clamped bound (the `set` itself discards the response) — both deterministic offline proofs.
+- Variable `unit`/`min`/`max`/`description` **metadata** (iomap.toml `[[mappings]]`, see `06-devices-iomap-tasks.md`) is documentation for generated surfaces; the `[governance]` rules here are the enforcement. Keep them consistent when both exist.

@@ -8,10 +8,175 @@ pub struct ProjectManifest {
     pub name: String,
     #[serde(default = "default_version")]
     pub version: String,
+    /// Write governance for the monitor `/write` path. Absent = `open`,
+    /// which is exactly the pre-governance behaviour (any declared
+    /// variable writable, any value).
+    #[serde(default, skip_serializing_if = "WriteGovernance::is_default")]
+    pub governance: WriteGovernance,
 }
 
 fn default_version() -> String {
     "0.1".into()
+}
+
+// ---------------- Write governance (project.toml [governance]) ----------------
+//
+// The monitor write path (`/write`, HMI actions, MQTT northbound writes)
+// accepts any value on any variable unless the project says otherwise.
+// Governance is declared in project.toml — not a new config file:
+//
+//   [governance]
+//   write_mode = "allowlist"
+//
+//   [[governance.rules]]
+//   variable = "level_sp"        # monitor name: bare or instance.variable
+//   min = 0.0
+//   max = 100.0
+//
+// `open` (default) applies no checks. `allowlist` rejects writes to
+// variables with no matching rule and clamps out-of-range values to the
+// rule's min/max (the response echoes the clamped value — nothing is
+// silent). `/force` deliberately bypasses governance: it is the pure
+// debug override and is never exported on any northbound surface
+// (ADR-0002).
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "snake_case")]
+pub enum WriteMode {
+    /// Legacy behaviour: every declared variable is writable, no clamps.
+    #[default]
+    Open,
+    /// Only variables named by a `[[governance.rules]]` entry are
+    /// writable; min/max on the rule clamp the written value.
+    Allowlist,
+}
+
+// `deny_unknown_fields` on both governance structs: a typo'd key
+// (`writemode`, `mim`) must be a loud parse error, not a silently-open
+// policy / silently-unenforced bound. The table is new, so no legacy
+// project.toml can carry extra keys here. `ProjectManifest` itself stays
+// tolerant of unknown top-level tables (e.g. `[libraries]`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(deny_unknown_fields)]
+pub struct WriteRule {
+    /// Monitor variable name — bare (`level_sp`) or instance-qualified
+    /// (`main.level_sp`). Matching is case-insensitive, like the IEC.
+    pub variable: String,
+    /// Inclusive lower bound; values below are clamped up to it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub min: Option<f64>,
+    /// Inclusive upper bound; values above are clamped down to it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub max: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(deny_unknown_fields)]
+pub struct WriteGovernance {
+    #[serde(default)]
+    pub write_mode: WriteMode,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rules: Vec<WriteRule>,
+}
+
+impl WriteGovernance {
+    /// True when governance carries no behaviour — used to keep
+    /// untouched project.tomls round-tripping byte-identical.
+    pub fn is_default(&self) -> bool {
+        self.write_mode == WriteMode::Open && self.rules.is_empty()
+    }
+
+    /// Sanity-check the governance table. TOML 1.0 happily parses
+    /// `min = nan`, `min = inf`, swapped bounds, and empty or repeated
+    /// variable names — all of which would make enforcement misbehave
+    /// on the scan thread. `ProjectStore::open` calls this wherever the
+    /// manifest is parsed so a bad table is a loud load error, never a
+    /// silently wrong policy. Every problem found is reported (joined
+    /// with "; "), each naming the offending rule.
+    pub fn validate(&self) -> Result<(), String> {
+        use std::collections::HashMap;
+
+        let mut errors: Vec<String> = Vec::new();
+        // Lowercased variable → 1-based index of the first rule naming
+        // it. Rule matching is case-insensitive, so duplicates are too.
+        let mut first_use: HashMap<String, usize> = HashMap::new();
+
+        for (i, rule) in self.rules.iter().enumerate() {
+            let n = i + 1;
+            let label = if rule.variable.trim().is_empty() {
+                format!("governance rule #{n}")
+            } else {
+                format!("governance rule #{n} ('{}')", rule.variable)
+            };
+
+            if rule.variable.trim().is_empty() {
+                errors.push(format!("{label}: variable must not be empty"));
+            }
+            for (bound, value) in [("min", rule.min), ("max", rule.max)] {
+                if let Some(v) = value {
+                    if !v.is_finite() {
+                        errors.push(format!(
+                            "{label}: {bound} must be a finite number (got {v})"
+                        ));
+                    }
+                }
+            }
+            if let (Some(min), Some(max)) = (rule.min, rule.max) {
+                if min > max {
+                    errors.push(format!("{label}: min ({min}) is greater than max ({max})"));
+                }
+            }
+
+            let key = rule.variable.to_lowercase();
+            if let Some(&first) = first_use.get(&key) {
+                errors.push(format!(
+                    "{label}: duplicate of rule #{first} — each variable may appear in one rule only"
+                ));
+            } else {
+                first_use.insert(key, n);
+            }
+        }
+
+        // A bare rule matches its variable in EVERY program instance, so
+        // it always overlaps a qualified rule for the same leaf name.
+        // Enforcement would take whichever rule is listed first — an
+        // ambiguity, not a precedence feature — so reject the pair.
+        for i in 0..self.rules.len() {
+            for j in (i + 1)..self.rules.len() {
+                let a = self.rules[i].variable.to_lowercase();
+                let b = self.rules[j].variable.to_lowercase();
+                if a == b {
+                    continue; // already reported as an exact duplicate
+                }
+                let overlap = match (a.split_once('.'), b.split_once('.')) {
+                    (None, Some((_, leaf))) => leaf == a,
+                    (Some((_, leaf)), None) => leaf == b,
+                    _ => false,
+                };
+                if overlap {
+                    errors.push(format!(
+                        "governance rule #{} ('{}') and rule #{} ('{}') govern the same \
+                         variable (a bare name matches it in every program instance) — keep one",
+                        i + 1,
+                        self.rules[i].variable,
+                        j + 1,
+                        self.rules[j].variable
+                    ));
+                }
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
+    }
 }
 
 // ---------------- POUs (Program Organization Units) ----------------
@@ -1135,6 +1300,31 @@ pub struct Mapping {
     pub direction: Direction,
     pub device: String,
     pub channel: String,
+    /// Engineering unit of the mapped variable (e.g. "°C", "%", "mbar").
+    /// Optional metadata for agent/operator reference files — never
+    /// interpreted by the runtime.
+    ///
+    /// `#[ts(optional)]` on these four fields keeps the generated TS
+    /// honest about the wire format: serialization OMITS the keys when
+    /// `None` (skip_serializing_if), so a JSON consumer sees `undefined`
+    /// — `unit?: string`, not `unit: string | null` — and pre-metadata
+    /// `Mapping` literals keep typechecking.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub unit: Option<String>,
+    /// Low end of the variable's meaningful engineering range.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub min: Option<f64>,
+    /// High end of the variable's meaningful engineering range.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub max: Option<f64>,
+    /// Natural-language description of what this variable means in the
+    /// plant ("reactor level setpoint"). Feeds generated reference files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
@@ -1403,4 +1593,282 @@ pub struct ProjectListing {
     pub name: String,
     pub path: String,
     pub is_last_opened: bool,
+}
+
+#[cfg(test)]
+mod mapping_metadata_compat_tests {
+    use super::*;
+
+    /// A v0 iomap.toml without any metadata fields still parses, every
+    /// metadata field defaults to None, and re-serializing keeps the
+    /// keys absent — untouched project files round-trip byte-identical.
+    #[test]
+    fn legacy_mapping_without_metadata_roundtrips_clean() {
+        let toml_src = r#"
+[[mappings]]
+application = "main"
+variable = "level"
+direction = "input"
+device = "plc1"
+channel = "ch0"
+"#;
+        let map: IoMap = toml::from_str(toml_src).unwrap();
+        assert_eq!(map.mappings.len(), 1);
+        let m = &map.mappings[0];
+        assert_eq!(m.unit, None);
+        assert_eq!(m.min, None);
+        assert_eq!(m.max, None);
+        assert_eq!(m.description, None);
+        let back = toml::to_string_pretty(&map).unwrap();
+        assert!(!back.contains("unit"));
+        assert!(!back.contains("min"));
+        assert!(!back.contains("max"));
+        assert!(!back.contains("description"));
+    }
+
+    /// Explicit metadata survives a TOML round-trip.
+    #[test]
+    fn metadata_roundtrips_when_set() {
+        let toml_src = r#"
+[[mappings]]
+application = "main"
+variable = "level_sp"
+direction = "output"
+device = "plc1"
+channel = "ch1"
+unit = "%"
+min = 0.0
+max = 100.0
+description = "Tank level setpoint"
+"#;
+        let map: IoMap = toml::from_str(toml_src).unwrap();
+        let m = &map.mappings[0];
+        assert_eq!(m.unit.as_deref(), Some("%"));
+        assert_eq!(m.min, Some(0.0));
+        assert_eq!(m.max, Some(100.0));
+        assert_eq!(m.description.as_deref(), Some("Tank level setpoint"));
+        let back: IoMap = toml::from_str(&toml::to_string_pretty(&map).unwrap()).unwrap();
+        assert_eq!(back.mappings[0].max, Some(100.0));
+    }
+}
+
+#[cfg(test)]
+mod governance_compat_tests {
+    use super::*;
+
+    /// A v0 project.toml without [governance] parses fully open, and
+    /// re-serializing keeps the section absent — untouched manifests
+    /// round-trip byte-identical.
+    #[test]
+    fn legacy_manifest_without_governance_roundtrips_clean() {
+        let m: ProjectManifest = toml::from_str("name = \"p\"\n").unwrap();
+        assert_eq!(m.version, "0.1");
+        assert!(m.governance.is_default());
+        let back = toml::to_string_pretty(&m).unwrap();
+        assert!(!back.contains("governance"));
+    }
+
+    /// The documented TOML shape parses: mode + rules with min/max.
+    #[test]
+    fn governance_section_parses() {
+        let src = r#"
+name = "p"
+
+[governance]
+write_mode = "allowlist"
+
+[[governance.rules]]
+variable = "level_sp"
+min = 0.0
+max = 100.0
+
+[[governance.rules]]
+variable = "main.valve_cmd"
+"#;
+        let m: ProjectManifest = toml::from_str(src).unwrap();
+        assert_eq!(m.governance.write_mode, WriteMode::Allowlist);
+        assert_eq!(m.governance.rules.len(), 2);
+        assert_eq!(m.governance.rules[0].variable, "level_sp");
+        assert_eq!(m.governance.rules[0].min, Some(0.0));
+        assert_eq!(m.governance.rules[0].max, Some(100.0));
+        assert_eq!(m.governance.rules[1].min, None);
+        m.governance.validate().expect("documented shape is valid");
+    }
+}
+
+#[cfg(test)]
+mod governance_validation_tests {
+    use super::*;
+
+    fn rule(variable: &str, min: Option<f64>, max: Option<f64>) -> WriteRule {
+        WriteRule {
+            variable: variable.into(),
+            min,
+            max,
+        }
+    }
+
+    fn allowlist(rules: Vec<WriteRule>) -> WriteGovernance {
+        WriteGovernance {
+            write_mode: WriteMode::Allowlist,
+            rules,
+        }
+    }
+
+    // ---- unknown keys are parse errors (deny_unknown_fields) -----------
+
+    /// `writemode` (typo'd `write_mode`) must not parse as a
+    /// default-Open policy — governance silently OFF is exactly the
+    /// failure mode the deny is there to prevent.
+    #[test]
+    fn typoed_governance_key_fails_parse() {
+        let src = "name = \"p\"\n\n[governance]\nwritemode = \"allowlist\"\n";
+        let err = toml::from_str::<ProjectManifest>(src)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("writemode"), "{err}");
+        assert!(err.contains("unknown field"), "{err}");
+    }
+
+    /// `mim` (typo'd `min`) must not parse as a rule with no lower
+    /// bound — the intended clamp would be silently unenforced.
+    #[test]
+    fn typoed_rule_key_fails_parse() {
+        let src = "name = \"p\"\n\n[governance]\nwrite_mode = \"allowlist\"\n\n\
+                   [[governance.rules]]\nvariable = \"sp\"\nmim = 0.0\nmax = 100.0\n";
+        let err = toml::from_str::<ProjectManifest>(src)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("mim"), "{err}");
+        assert!(err.contains("unknown field"), "{err}");
+    }
+
+    /// Manifest-level tolerance is unchanged: unknown TOP-LEVEL tables
+    /// (e.g. `[libraries]`) still parse — only the governance structs
+    /// deny unknown keys.
+    #[test]
+    fn unknown_top_level_table_still_parses() {
+        let src = "name = \"p\"\n\n[libraries]\nfb_util = \"1.0\"\n";
+        let m: ProjectManifest = toml::from_str(src).unwrap();
+        assert!(m.governance.is_default());
+    }
+
+    // ---- validate(): bounds ---------------------------------------------
+
+    /// TOML 1.0 accepts `nan` / `inf` float literals; validate() must
+    /// reject them, naming the offending rule.
+    #[test]
+    fn validate_rejects_non_finite_bounds() {
+        let src = "name = \"p\"\n\n[governance]\nwrite_mode = \"allowlist\"\n\n\
+                   [[governance.rules]]\nvariable = \"sp\"\nmin = nan\n";
+        let m: ProjectManifest = toml::from_str(src).expect("nan parses as TOML");
+        let err = m.governance.validate().unwrap_err();
+        assert!(err.contains("rule #1 ('sp')"), "{err}");
+        assert!(err.contains("min must be a finite number"), "{err}");
+
+        let err = allowlist(vec![rule("sp", None, Some(f64::INFINITY))])
+            .validate()
+            .unwrap_err();
+        assert!(err.contains("max must be a finite number"), "{err}");
+    }
+
+    #[test]
+    fn validate_rejects_min_greater_than_max() {
+        let err = allowlist(vec![rule("sp", Some(2.0), Some(1.0))])
+            .validate()
+            .unwrap_err();
+        assert!(err.contains("rule #1 ('sp')"), "{err}");
+        assert!(err.contains("min (2) is greater than max (1)"), "{err}");
+    }
+
+    #[test]
+    fn validate_accepts_equal_bounds_and_half_open_rules() {
+        // min == max pins the variable to one value — legal.
+        allowlist(vec![
+            rule("pin", Some(5.0), Some(5.0)),
+            rule("floor_only", Some(0.0), None),
+            rule("ceiling_only", None, Some(10.0)),
+            rule("bare_allow", None, None),
+        ])
+        .validate()
+        .expect("degenerate-but-ordered bounds are valid");
+    }
+
+    // ---- validate(): variable names --------------------------------------
+
+    #[test]
+    fn validate_rejects_empty_variable() {
+        let err = allowlist(vec![rule("", Some(0.0), Some(1.0))])
+            .validate()
+            .unwrap_err();
+        assert!(err.contains("governance rule #1"), "{err}");
+        assert!(err.contains("variable must not be empty"), "{err}");
+        // Whitespace-only is just as dead a rule.
+        let err = allowlist(vec![rule("  ", None, None)])
+            .validate()
+            .unwrap_err();
+        assert!(err.contains("variable must not be empty"), "{err}");
+    }
+
+    /// Duplicates are case-insensitive, because rule matching is.
+    #[test]
+    fn validate_rejects_duplicate_variables() {
+        let err = allowlist(vec![rule("sp", None, None), rule("SP", Some(0.0), None)])
+            .validate()
+            .unwrap_err();
+        assert!(err.contains("rule #2 ('SP')"), "{err}");
+        assert!(err.contains("duplicate of rule #1"), "{err}");
+    }
+
+    /// A bare rule matches the variable in every instance, so bare `sp`
+    /// and qualified `main.sp` govern the same variable — first-match
+    /// precedence would silently decide which bounds apply.
+    #[test]
+    fn validate_rejects_bare_and_qualified_rules_for_same_variable() {
+        let err = allowlist(vec![
+            rule("sp", Some(0.0), Some(10.0)),
+            rule("main.sp", Some(0.0), Some(100.0)),
+        ])
+        .validate()
+        .unwrap_err();
+        assert!(err.contains("rule #1 ('sp')"), "{err}");
+        assert!(err.contains("rule #2 ('main.sp')"), "{err}");
+        assert!(err.contains("govern the same variable"), "{err}");
+    }
+
+    /// Qualified rules for the same leaf under DIFFERENT instances are
+    /// distinct variables — no conflict.
+    #[test]
+    fn validate_accepts_same_leaf_under_different_instances() {
+        allowlist(vec![
+            rule("line_a.sp", Some(0.0), Some(10.0)),
+            rule("line_b.sp", Some(0.0), Some(20.0)),
+        ])
+        .validate()
+        .expect("distinct qualified variables are fine");
+    }
+
+    /// Every problem is reported in one pass, each naming its rule.
+    #[test]
+    fn validate_reports_all_errors_at_once() {
+        let err = allowlist(vec![
+            rule("a", Some(5.0), Some(1.0)),
+            rule("", Some(f64::NAN), None),
+            rule("A", None, None),
+        ])
+        .validate()
+        .unwrap_err();
+        assert!(err.contains("min (5) is greater than max (1)"), "{err}");
+        assert!(err.contains("variable must not be empty"), "{err}");
+        assert!(err.contains("min must be a finite number"), "{err}");
+        assert!(err.contains("duplicate of rule #1"), "{err}");
+    }
+
+    /// The default (open, no rules) table is trivially valid.
+    #[test]
+    fn validate_accepts_default() {
+        WriteGovernance::default()
+            .validate()
+            .expect("default is valid");
+    }
 }

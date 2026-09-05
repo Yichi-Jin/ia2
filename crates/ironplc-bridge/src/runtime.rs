@@ -29,7 +29,7 @@ use ironplc_container::Container;
 use ironplc_container::VarIndex;
 use ironplc_container::STRING_HEADER_BYTES;
 use ironplc_vm::{Vm, VmBuffers, VmRunning};
-use project::{Direction, Mapping, ProtocolConfig};
+use project::{Direction, Mapping, ProtocolConfig, WriteGovernance, WriteMode};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use ts_rs::TS;
@@ -128,6 +128,12 @@ pub enum RuntimeWriteError {
     Disconnected,
     #[error("vm trap during write: {0}")]
     Vm(String),
+    /// Denied by the project's `[governance]` table. The payload is the
+    /// variable name followed by the specific reason in parentheses —
+    /// the HTTP layers wrap it verbatim, so the caller always learns
+    /// WHY (no rule, degenerate rule bounds, unclampable value, …).
+    #[error("write to '{0}' rejected by project governance")]
+    GovernanceDenied(String),
 }
 
 /// Out-of-band commands the scan loop drains between rounds. Used so
@@ -140,10 +146,13 @@ pub enum RuntimeWriteError {
 enum RuntimeCommand {
     /// One-shot variable write — applied once, may be overwritten by
     /// the program in subsequent scans. Use `ForceVariable` to keep a
-    /// value pinned.
+    /// value pinned. `governed: false` marks the runtime's OWN internal
+    /// writes (the monitor's pulse reset), which bypass the project's
+    /// write governance — see `ProgramHandle::write_variable_ungoverned`.
     WriteVariable {
         name: String,
         value: i32,
+        governed: bool,
         ack: tokio::sync::oneshot::Sender<Result<i32, RuntimeWriteError>>,
     },
     /// Pin a variable's value: every scan begins by writing `value`
@@ -308,11 +317,37 @@ impl ProgramHandle {
     /// `instance.variable` targets that PROGRAM instance explicitly
     /// (instance match is case-insensitive).
     pub async fn write_variable(&self, name: &str, value: i32) -> Result<i32, RuntimeWriteError> {
+        self.send_write(name, value, true).await
+    }
+
+    /// One-shot write that BYPASSES the project's write governance.
+    /// For the runtime's OWN internal semantics only — today that is
+    /// the monitor's pulse reset, whose write-0-back is the safety half
+    /// of the `pulse_ms` contract and must land even when a rule's
+    /// `min` would clamp 0 away. Same rationale as the force bypass
+    /// (ADR-0002): a runtime-internal action is not an external write.
+    /// Deliberately `pub(crate)` — never wired to any HTTP or
+    /// northbound surface.
+    pub(crate) async fn write_variable_ungoverned(
+        &self,
+        name: &str,
+        value: i32,
+    ) -> Result<i32, RuntimeWriteError> {
+        self.send_write(name, value, false).await
+    }
+
+    async fn send_write(
+        &self,
+        name: &str,
+        value: i32,
+        governed: bool,
+    ) -> Result<i32, RuntimeWriteError> {
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
         self.cmd_tx
             .send(RuntimeCommand::WriteVariable {
                 name: name.to_string(),
                 value,
+                governed,
                 ack: ack_tx,
             })
             .map_err(|_| RuntimeWriteError::Disconnected)?;
@@ -540,12 +575,14 @@ pub fn spawn_units(
     device_specs: Vec<DeviceSpec>,
     mappings: Vec<Mapping>,
     state_path: Option<PathBuf>,
+    governance: WriteGovernance,
 ) -> ProgramHandle {
     spawn_units_inner(
         units,
         DeviceSource::Specs(device_specs),
         mappings,
         state_path,
+        governance,
     )
 }
 
@@ -585,6 +622,7 @@ fn spawn_units_inner(
     device_source: DeviceSource,
     mappings: Vec<Mapping>,
     state_path: Option<PathBuf>,
+    governance: WriteGovernance,
 ) -> ProgramHandle {
     let stop = Arc::new(AtomicBool::new(false));
     let (snapshot_tx, _) = broadcast::channel(64);
@@ -713,6 +751,7 @@ fn spawn_units_inner(
                 units,
                 &mut devices,
                 mappings,
+                governance,
                 stop_clone,
                 snapshot_tx_clone,
                 cmd_rx,
@@ -1265,6 +1304,150 @@ fn resolve_var(
     var_index_by_name[i].get(rest).map(|&idx| (i, idx))
 }
 
+/// Apply the project's write governance to a resolved `/write`. Returns
+/// the value to actually write — clamped to the matching rule's
+/// min/max when declared — or a governance denial.
+///
+/// Enforcement never panics: this runs on the scan thread, where a
+/// panic kills the whole run, so a rule whose bounds don't form a valid
+/// range (min > max, or a NaN bound that slipped past load validation)
+/// DENIES the write instead — `f64::clamp` would panic on exactly those
+/// bounds and is never used here. Clamping happens in the written
+/// value's own domain so the applied value is always within [min, max]:
+/// the integer lane clamps to ceil(min)..=floor(max) (denying when that
+/// range is empty), the REAL lane steps an f32 bound one ULP inward
+/// when f64→f32 rounding would escape it.
+///
+/// Force/unforce deliberately never come through here: force is the
+/// pure debug override and stays ungoverned (ADR-0002 records the
+/// decision; a governed force would no longer be a debug override, and
+/// an ungoverned exported force would be a hole — so force is simply
+/// never exported on any northbound surface). The monitor's pulse
+/// reset bypasses too, via `write_variable_ungoverned`: it is the
+/// runtime's own safety action, not an external write.
+fn enforce_write_governance(
+    governance: &WriteGovernance,
+    name: &str,
+    unit: usize,
+    var_index: u16,
+    value: i32,
+    instances: &[String],
+    debug_maps: &[HashMap<u16, VarDebugInfo>],
+) -> Result<i32, RuntimeWriteError> {
+    if governance.write_mode == WriteMode::Open {
+        return Ok(value);
+    }
+    // Candidate rule keys: the qualified `instance.variable` form and
+    // the bare debug name — matching is case-insensitive, like the IEC.
+    let bare = debug_maps[unit]
+        .get(&var_index)
+        .map(|d| d.name.to_lowercase())
+        .unwrap_or_default();
+    let qualified = format!("{}.{}", instances[unit].to_lowercase(), bare);
+    let rule = governance.rules.iter().find(|r| {
+        let key = r.variable.to_lowercase();
+        key == bare || key == qualified
+    });
+    let Some(rule) = rule else {
+        return Err(RuntimeWriteError::GovernanceDenied(format!(
+            "{name} (write_mode = allowlist, no rule allows it)"
+        )));
+    };
+    if rule.min.is_none() && rule.max.is_none() {
+        return Ok(value);
+    }
+    let lo = rule.min.unwrap_or(f64::NEG_INFINITY);
+    let hi = rule.max.unwrap_or(f64::INFINITY);
+    // Degenerate bounds should be rejected at project load; if a bad
+    // rule slips through anyway, deny rather than guess a range the
+    // author never declared.
+    if lo > hi || lo.is_nan() || hi.is_nan() {
+        return Err(RuntimeWriteError::GovernanceDenied(format!(
+            "{name} (rule bounds min {lo} / max {hi} do not form a valid range — fix project.toml)"
+        )));
+    }
+    // REAL is IEEE-754 bits in the i32 slot. Everything else — LREAL
+    // included — compares as a plain integer: every writer that can
+    // reach governance (HTTP i32 body, northbound numeric lane)
+    // encodes LREAL as a plain number, nothing produces f32 bits for
+    // it, and the 64-bit engineering path (iomap inputs) uses
+    // `write_variable_raw` and never comes through here. Clamping the
+    // value the writer actually sent keeps governed and ungoverned
+    // LREAL writes consistent.
+    let is_real = debug_maps[unit]
+        .get(&var_index)
+        .map(|d| d.type_name.to_ascii_uppercase().starts_with("REAL"))
+        .unwrap_or(false);
+    if is_real {
+        let current = f32::from_bits(value as u32);
+        if current.is_nan() {
+            // NaN is unorderable: it cannot be clamped, and writing it
+            // through would void the min/max envelope while the log
+            // claimed "clamped". Deny, honestly.
+            return Err(RuntimeWriteError::GovernanceDenied(format!(
+                "{name} (value NaN cannot be checked against the rule's min/max)"
+            )));
+        }
+        // Convert the f64 bounds to f32 INWARD, so round-to-nearest
+        // can never let the written f32 escape the declared [min, max].
+        let mut lo_f = lo as f32;
+        if (lo_f as f64) < lo {
+            lo_f = lo_f.next_up();
+        }
+        let mut hi_f = hi as f32;
+        if (hi_f as f64) > hi {
+            hi_f = hi_f.next_down();
+        }
+        // A finite bound past f32 range saturates to ±inf on the far
+        // side (inward stepping can't reach it): the rule admits no
+        // representable REAL, and "clamping" would write literal
+        // infinity into the scan. Deny, like the integer lane.
+        if (lo.is_finite() && lo_f == f32::INFINITY)
+            || (hi.is_finite() && hi_f == f32::NEG_INFINITY)
+            || lo_f > hi_f
+        {
+            return Err(RuntimeWriteError::GovernanceDenied(format!(
+                "{name} (rule range [{lo}, {hi}] contains no representable REAL value)"
+            )));
+        }
+        let clamped = current.max(lo_f).min(hi_f);
+        if clamped == current {
+            return Ok(value);
+        }
+        warn_clamped(name, current as f64, clamped as f64);
+        Ok(clamped.to_bits() as i32)
+    } else {
+        // Integer lane: clamp to the integers inside [min, max] —
+        // rounding the clamped f64 could otherwise step OUTSIDE a
+        // fractional bound (e.g. max = 10.6 rounding up to 11).
+        let lo_i = lo.ceil().max(i32::MIN as f64);
+        let hi_i = hi.floor().min(i32::MAX as f64);
+        if lo_i > hi_i {
+            return Err(RuntimeWriteError::GovernanceDenied(format!(
+                "{name} (rule range [{lo}, {hi}] contains no writable integer value)"
+            )));
+        }
+        let current = value as f64;
+        let clamped = current.max(lo_i).min(hi_i);
+        if clamped == current {
+            return Ok(value);
+        }
+        warn_clamped(name, current, clamped);
+        Ok(clamped as i32)
+    }
+}
+
+/// Clamps are loud, not silent: the log says what was asked vs written,
+/// and the write's ack echoes the clamped value.
+fn warn_clamped(name: &str, requested: f64, written: f64) {
+    tracing::warn!(
+        variable = %name,
+        requested,
+        written,
+        "write clamped to the governance rule's range"
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_loop_async(
     units: Vec<ProgramUnit>,
@@ -1273,6 +1456,7 @@ async fn run_loop_async(
     // block).
     devices: &mut Vec<Box<dyn IoDevice>>,
     mappings: Vec<Mapping>,
+    governance: WriteGovernance,
     stop: Arc<AtomicBool>,
     snapshot_tx: broadcast::Sender<VarSnapshot>,
     mut cmd_rx: tokio::sync::mpsc::UnboundedReceiver<RuntimeCommand>,
@@ -1615,12 +1799,36 @@ async fn run_loop_async(
         // poke values without scanning.
         while let Ok(cmd) = cmd_rx.try_recv() {
             match cmd {
-                RuntimeCommand::WriteVariable { name, value, ack } => {
+                RuntimeCommand::WriteVariable {
+                    name,
+                    value,
+                    governed,
+                    ack,
+                } => {
                     let result = match resolve_var(&name, &instances, &var_index_by_name) {
                         Some((u, idx)) => {
-                            match runnings[u].write_variable(VarIndex::new(idx), value) {
-                                Ok(()) => Ok(value),
-                                Err(trap) => Err(RuntimeWriteError::Vm(format!("{trap:?}"))),
+                            // Internal runtime writes (the pulse reset)
+                            // bypass governance by design — see
+                            // `write_variable_ungoverned`.
+                            let allowed = if governed {
+                                enforce_write_governance(
+                                    &governance,
+                                    &name,
+                                    u,
+                                    idx,
+                                    value,
+                                    &instances,
+                                    &debug_maps,
+                                )
+                            } else {
+                                Ok(value)
+                            };
+                            match allowed {
+                                Ok(v) => match runnings[u].write_variable(VarIndex::new(idx), v) {
+                                    Ok(()) => Ok(v),
+                                    Err(trap) => Err(RuntimeWriteError::Vm(format!("{trap:?}"))),
+                                },
+                                Err(e) => Err(e),
                             }
                         }
                         None => Err(RuntimeWriteError::UnknownVariable(name)),
@@ -2357,6 +2565,7 @@ mod tests {
             DeviceSource::Prebuilt(devices),
             Vec::new(),
             None,
+            WriteGovernance::default(),
         );
         // Let a few scans run so we're stopping a live loop, not a cold one.
         tokio::time::sleep(Duration::from_millis(40)).await;
@@ -2424,6 +2633,10 @@ mod tests {
             direction: Direction::Input,
             device: "pm".into(),
             channel: "hr0".into(),
+            unit: None,
+            min: None,
+            max: None,
+            description: None,
         };
         // `y := x` so the input mapping's value is observable unmodified.
         let container = crate::compile(
@@ -2439,6 +2652,7 @@ mod tests {
             DeviceSource::Specs(vec![spec]),
             vec![mapping],
             None,
+            WriteGovernance::default(),
         );
 
         // Startup outcome: configured but down, and visibly so.
@@ -2508,6 +2722,7 @@ mod tests {
             DeviceSource::Prebuilt(vec![Box::new(dev)]),
             Vec::new(),
             None,
+            WriteGovernance::default(),
         );
 
         // Wait for the connect pass to seed the health list.
@@ -2605,6 +2820,10 @@ mod tests {
                 direction: project::Direction::Input,
                 device: "mock".into(),
                 channel: "ain".into(),
+                unit: None,
+                min: None,
+                max: None,
+                description: None,
             },
             project::Mapping {
                 application: "main".into(),
@@ -2612,6 +2831,10 @@ mod tests {
                 direction: project::Direction::Output,
                 device: "mock".into(),
                 channel: "aout".into(),
+                unit: None,
+                min: None,
+                max: None,
+                description: None,
             },
         ];
 
@@ -2620,6 +2843,7 @@ mod tests {
             DeviceSource::Prebuilt(devices),
             mappings,
             None,
+            WriteGovernance::default(),
         );
         tokio::time::sleep(Duration::from_millis(80)).await;
         tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
@@ -2713,6 +2937,10 @@ mod tests {
             direction: project::Direction::Output,
             device: "mock".into(),
             channel: "aout".into(),
+            unit: None,
+            min: None,
+            max: None,
+            description: None,
         }];
 
         let handle = spawn_units_inner(
@@ -2720,6 +2948,7 @@ mod tests {
             DeviceSource::Prebuilt(devices),
             mappings,
             None,
+            WriteGovernance::default(),
         );
         // ~5 stalled scans trip the watchdog; the rest of the window is the
         // part that matters — it is where a non-latching build writes again.
@@ -2767,6 +2996,10 @@ mod tests {
             direction: project::Direction::Output,
             device: "mock".into(),
             channel: "aout".into(),
+            unit: None,
+            min: None,
+            max: None,
+            description: None,
         }];
 
         let handle = spawn_units_inner(
@@ -2774,6 +3007,7 @@ mod tests {
             DeviceSource::Prebuilt(devices),
             mappings,
             None,
+            WriteGovernance::default(),
         );
         assert!(
             !handle.watchdog_tripped(),
@@ -2827,6 +3061,10 @@ mod tests {
             direction: project::Direction::Output,
             device: "mock".into(),
             channel: "aout".into(),
+            unit: None,
+            min: None,
+            max: None,
+            description: None,
         }];
 
         let handle = spawn_units_inner(
@@ -2834,6 +3072,7 @@ mod tests {
             DeviceSource::Prebuilt(devices),
             mappings,
             None,
+            WriteGovernance::default(),
         );
 
         // Negative control: with no injection the run must stay healthy.
@@ -2898,6 +3137,7 @@ mod tests {
             DeviceSource::Prebuilt(Vec::new()),
             Vec::new(),
             None,
+            WriteGovernance::default(),
         );
 
         // Negative control: two idle units must not trip on their own,
@@ -2948,6 +3188,7 @@ mod tests {
             DeviceSource::Prebuilt(Vec::new()),
             Vec::new(),
             None,
+            WriteGovernance::default(),
         );
 
         // Ask for the maximum the clamp allows, many times over.
@@ -2978,6 +3219,7 @@ mod tests {
             DeviceSource::Prebuilt(devices),
             Vec::new(),
             None,
+            WriteGovernance::default(),
         );
 
         handle.shutdown().await;
@@ -3017,6 +3259,7 @@ mod tests {
             DeviceSource::Prebuilt(Vec::new()),
             Vec::new(),
             None,
+            WriteGovernance::default(),
         );
         let mut rx = handle.subscribe();
         let snap = last_snapshot_within(&mut rx, Duration::from_millis(250)).await;
@@ -3092,6 +3335,10 @@ mod tests {
             direction: project::Direction::Input,
             device: "mock".into(),
             channel: "ain".into(),
+            unit: None,
+            min: None,
+            max: None,
+            description: None,
         }];
 
         let handle = spawn_units_inner(
@@ -3099,6 +3346,7 @@ mod tests {
             DeviceSource::Prebuilt(devices),
             mappings,
             None,
+            WriteGovernance::default(),
         );
         let mut rx = handle.subscribe();
         let snap = last_snapshot_within(&mut rx, Duration::from_millis(150)).await;
@@ -3140,6 +3388,7 @@ mod tests {
             DeviceSource::Prebuilt(Vec::new()),
             Vec::new(),
             None,
+            WriteGovernance::default(),
         );
         let mut rx = handle.subscribe();
         let snap = last_snapshot_within(&mut rx, Duration::from_millis(250)).await;
@@ -3148,5 +3397,574 @@ mod tests {
             .expect("shutdown joins");
 
         assert_eq!(var_value(&snap, "operating_mode"), "'STARTUP'");
+    }
+
+    // ---- Write governance (project.toml [governance]) ----
+
+    fn governance(mode: WriteMode, rules: Vec<project::WriteRule>) -> WriteGovernance {
+        WriteGovernance {
+            write_mode: mode,
+            rules,
+        }
+    }
+
+    /// Allowlist mode rejects a write to any variable no rule names —
+    /// the write never reaches the VM, and the caller gets an explicit
+    /// GovernanceDenied, not a silent skip.
+    #[tokio::test]
+    async fn governance_allowlist_denies_unlisted_write() {
+        let handle = spawn_units_inner(
+            vec![single_unit(trivial_container(), 10)],
+            DeviceSource::Prebuilt(Vec::new()),
+            Vec::new(),
+            None,
+            governance(
+                WriteMode::Allowlist,
+                vec![project::WriteRule {
+                    variable: "somebody_else".into(),
+                    min: None,
+                    max: None,
+                }],
+            ),
+        );
+        let err = handle
+            .write_variable("x", 5)
+            .await
+            .expect_err("unlisted variable must be denied");
+        // The payload names the variable AND the reason, so the HTTP
+        // layers' "write to '{payload}' rejected" wrap stays specific.
+        assert!(
+            matches!(&err, RuntimeWriteError::GovernanceDenied(n)
+                if n.starts_with("x ") && n.contains("no rule allows it")),
+            "unexpected error: {err:?}"
+        );
+        tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
+            .await
+            .expect("shutdown");
+    }
+
+    /// A listed variable writes freely inside its rule's range; outside
+    /// it the value is clamped to the bound and the ack echoes the
+    /// clamped value (REAL travels as IEEE-754 bits in the i32 slot).
+    #[tokio::test]
+    async fn governance_clamps_real_write_to_rule_range() {
+        let prog = crate::compile(
+            "PROGRAM main\n\
+                VAR sp : REAL := 0.0; END_VAR\n\
+                sp := sp + 0.0;\n\
+            END_PROGRAM",
+        )
+        .expect("real program compiles");
+        let handle = spawn_units_inner(
+            vec![single_unit(prog, 10)],
+            DeviceSource::Prebuilt(Vec::new()),
+            Vec::new(),
+            None,
+            governance(
+                WriteMode::Allowlist,
+                vec![project::WriteRule {
+                    variable: "sp".into(),
+                    min: Some(0.0),
+                    max: Some(100.0),
+                }],
+            ),
+        );
+        let bits = |f: f32| f.to_bits() as i32;
+        // Inside the range: written as asked.
+        let v = handle.write_variable("sp", bits(42.5)).await.unwrap();
+        assert_eq!(v, bits(42.5));
+        // Above max: clamped to 100, and the ack says so.
+        let v = handle.write_variable("sp", bits(150.0)).await.unwrap();
+        assert_eq!(v, bits(100.0));
+        // Below min: clamped to 0.
+        let v = handle.write_variable("sp", bits(-3.0)).await.unwrap();
+        assert_eq!(v, bits(0.0));
+        tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
+            .await
+            .expect("shutdown");
+    }
+
+    /// Integer variables clamp through the integer lane.
+    #[tokio::test]
+    async fn governance_clamps_int_write() {
+        let handle = spawn_units_inner(
+            vec![single_unit(trivial_container(), 10)],
+            DeviceSource::Prebuilt(Vec::new()),
+            Vec::new(),
+            None,
+            governance(
+                WriteMode::Allowlist,
+                vec![project::WriteRule {
+                    variable: "main.x".into(), // qualified rule key also matches
+                    min: Some(0.0),
+                    max: Some(10.0),
+                }],
+            ),
+        );
+        let v = handle.write_variable("x", 99).await.unwrap();
+        assert_eq!(v, 10);
+        tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
+            .await
+            .expect("shutdown");
+    }
+
+    /// Force is the debug override: it bypasses governance entirely
+    /// (ADR-0002) — the allowlist doesn't gate it (forcing an unlisted
+    /// variable succeeds) and a rule's min/max don't clamp it: forcing
+    /// a value OUTSIDE the rule's range pins that value unclamped,
+    /// while a plain write of the same value is clamped to the bound.
+    #[tokio::test]
+    async fn governance_does_not_constrain_force() {
+        // `y := x` never writes x, so the forced value is observable
+        // in snapshots instead of being overwritten each scan.
+        let prog = crate::compile(
+            "PROGRAM main\n\
+                VAR x : INT; y : INT; END_VAR\n\
+                y := x;\n\
+            END_PROGRAM",
+        )
+        .expect("program compiles");
+        let handle = spawn_units_inner(
+            vec![single_unit(prog, 10)],
+            DeviceSource::Prebuilt(Vec::new()),
+            Vec::new(),
+            None,
+            governance(
+                WriteMode::Allowlist,
+                vec![project::WriteRule {
+                    variable: "x".into(),
+                    min: Some(0.0),
+                    max: Some(10.0),
+                }],
+            ),
+        );
+        // Baseline: a plain write of 77 IS clamped to the rule's max.
+        assert_eq!(handle.write_variable("x", 77).await.unwrap(), 10);
+        // Unlisted variable: write denied, force allowed.
+        handle
+            .write_variable("y", 5)
+            .await
+            .expect_err("y has no rule — plain write must be denied");
+        assert_eq!(handle.force_variable("y", 5).await.unwrap(), 5);
+        handle.unforce_variable("y").await.unwrap();
+        // Force of the same out-of-range value: unclamped…
+        let v = handle.force_variable("x", 77).await.unwrap();
+        assert_eq!(v, 77, "force must bypass the rule's min/max");
+        // …and actually pinned at 77 in the VM, not just echoed.
+        let mut rx = handle.subscribe();
+        let snap = last_snapshot_within(&mut rx, Duration::from_millis(300)).await;
+        let bits = snap
+            .vars
+            .iter()
+            .find(|v| v.name == "x")
+            .expect("x in snapshot")
+            .bits;
+        assert_eq!(
+            bits as u32 as i32, 77,
+            "forced value must survive scans unclamped"
+        );
+        handle.unforce_variable("x").await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
+            .await
+            .expect("shutdown");
+    }
+
+    /// A degenerate rule (min > max, or a NaN bound — TOML 1.0 accepts
+    /// `nan`) that slipped past load validation must DENY the write,
+    /// never panic the scan thread (`f64::clamp` panics on exactly
+    /// these bounds, and a scan-thread panic kills the whole run). The
+    /// loop stays ALIVE: a well-ruled write on the same run still lands.
+    #[tokio::test]
+    async fn governance_degenerate_rule_denies_write_and_scan_loop_survives() {
+        let prog = crate::compile(
+            "PROGRAM main\n\
+                VAR a : INT; b : INT; c : INT; END_VAR\n\
+                c := c;\n\
+            END_PROGRAM",
+        )
+        .expect("program compiles");
+        let handle = spawn_units_inner(
+            vec![single_unit(prog, 10)],
+            DeviceSource::Prebuilt(Vec::new()),
+            Vec::new(),
+            None,
+            governance(
+                WriteMode::Allowlist,
+                vec![
+                    project::WriteRule {
+                        variable: "a".into(),
+                        min: Some(5.0), // swapped-bounds typo
+                        max: Some(1.0),
+                    },
+                    project::WriteRule {
+                        variable: "b".into(),
+                        min: Some(f64::NAN),
+                        max: Some(10.0),
+                    },
+                    project::WriteRule {
+                        variable: "c".into(),
+                        min: None,
+                        max: None,
+                    },
+                ],
+            ),
+        );
+        let err = handle
+            .write_variable("a", 3)
+            .await
+            .expect_err("swapped bounds must deny, not clamp or panic");
+        assert!(
+            matches!(&err, RuntimeWriteError::GovernanceDenied(n) if n.contains("valid range")),
+            "unexpected error: {err:?}"
+        );
+        let err = handle
+            .write_variable("b", 3)
+            .await
+            .expect_err("NaN bound must deny");
+        assert!(
+            matches!(&err, RuntimeWriteError::GovernanceDenied(_)),
+            "unexpected error: {err:?}"
+        );
+        // Not Disconnected above, and this ack proves the drain still
+        // runs: the denials left the scan loop alive.
+        assert_eq!(handle.write_variable("c", 9).await.unwrap(), 9);
+        assert!(handle.fault().is_none(), "no fault may be recorded");
+        tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
+            .await
+            .expect("shutdown");
+    }
+
+    /// Writing NaN to a min/max-ruled REAL is DENIED: NaN is
+    /// unorderable, so it cannot be clamped, and passing it through
+    /// would void the envelope while the log claimed "clamped".
+    #[tokio::test]
+    async fn governance_denies_nan_write_to_ruled_real() {
+        let prog = crate::compile(
+            "PROGRAM main\n\
+                VAR sp : REAL := 0.0; END_VAR\n\
+                sp := sp + 0.0;\n\
+            END_PROGRAM",
+        )
+        .expect("real program compiles");
+        let handle = spawn_units_inner(
+            vec![single_unit(prog, 10)],
+            DeviceSource::Prebuilt(Vec::new()),
+            Vec::new(),
+            None,
+            governance(
+                WriteMode::Allowlist,
+                vec![project::WriteRule {
+                    variable: "sp".into(),
+                    min: Some(0.0),
+                    max: Some(100.0),
+                }],
+            ),
+        );
+        let err = handle
+            .write_variable("sp", f32::NAN.to_bits() as i32)
+            .await
+            .expect_err("NaN write must be denied, not 'clamped'");
+        assert!(
+            matches!(&err, RuntimeWriteError::GovernanceDenied(n) if n.contains("NaN")),
+            "unexpected error: {err:?}"
+        );
+        // Envelope intact and loop alive: a finite write still works
+        // and the VM value is that write, not NaN.
+        let bits = |f: f32| f.to_bits() as i32;
+        assert_eq!(
+            handle.write_variable("sp", bits(42.5)).await.unwrap(),
+            bits(42.5)
+        );
+        let mut rx = handle.subscribe();
+        let snap = last_snapshot_within(&mut rx, Duration::from_millis(300)).await;
+        let sp = snap
+            .vars
+            .iter()
+            .find(|v| v.name == "sp")
+            .expect("sp in snapshot");
+        assert_eq!(f32::from_bits(sp.bits as u32), 42.5);
+        tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
+            .await
+            .expect("shutdown");
+    }
+
+    /// Fractional bounds clamp in the INTEGER domain, so the applied
+    /// value is always within [min, max] — `.round()` on the clamped
+    /// f64 would otherwise step outside (10.6 → 11, 0.4 → 0).
+    #[tokio::test]
+    async fn governance_integer_clamp_never_exceeds_fractional_bounds() {
+        let handle = spawn_units_inner(
+            vec![single_unit(trivial_container(), 10)],
+            DeviceSource::Prebuilt(Vec::new()),
+            Vec::new(),
+            None,
+            governance(
+                WriteMode::Allowlist,
+                vec![project::WriteRule {
+                    variable: "x".into(),
+                    min: Some(0.4),
+                    max: Some(10.6),
+                }],
+            ),
+        );
+        // Above: floor(10.6) = 10, never 11.
+        assert_eq!(handle.write_variable("x", 99).await.unwrap(), 10);
+        // Below: ceil(0.4) = 1, never 0.
+        assert_eq!(handle.write_variable("x", -5).await.unwrap(), 1);
+        // Inside: untouched.
+        assert_eq!(handle.write_variable("x", 5).await.unwrap(), 5);
+        tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
+            .await
+            .expect("shutdown");
+    }
+
+    /// A rule range containing no integer (min 10.2 / max 10.8 on an
+    /// INT lane) cannot produce an in-range value — the write is
+    /// denied, not rounded to a value outside the declared bounds. The
+    /// scan loop survives the denial.
+    #[tokio::test]
+    async fn governance_denies_int_write_when_rule_range_has_no_integer() {
+        let prog = crate::compile(
+            "PROGRAM main\n\
+                VAR x : INT; y : INT; END_VAR\n\
+                y := y;\n\
+            END_PROGRAM",
+        )
+        .expect("program compiles");
+        let handle = spawn_units_inner(
+            vec![single_unit(prog, 10)],
+            DeviceSource::Prebuilt(Vec::new()),
+            Vec::new(),
+            None,
+            governance(
+                WriteMode::Allowlist,
+                vec![
+                    project::WriteRule {
+                        variable: "x".into(),
+                        min: Some(10.2),
+                        max: Some(10.8),
+                    },
+                    project::WriteRule {
+                        variable: "y".into(),
+                        min: None,
+                        max: None,
+                    },
+                ],
+            ),
+        );
+        let err = handle
+            .write_variable("x", 5)
+            .await
+            .expect_err("empty integer range must deny");
+        assert!(
+            matches!(&err, RuntimeWriteError::GovernanceDenied(n) if n.contains("integer")),
+            "unexpected error: {err:?}"
+        );
+        // Loop alive after the denial.
+        assert_eq!(handle.write_variable("y", 7).await.unwrap(), 7);
+        tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
+            .await
+            .expect("shutdown");
+    }
+
+    /// f64 bounds convert to f32 INWARD: the f32 nearest to 0.1 is
+    /// strictly ABOVE 0.1, so a max = 0.1 clamp target steps one ULP
+    /// down (and a min = 0.1 target stays above) — the written f32
+    /// never escapes the declared f64 range.
+    #[tokio::test]
+    async fn governance_real_clamp_stays_inside_f64_bounds() {
+        let prog = crate::compile(
+            "PROGRAM main\n\
+                VAR hi_sp : REAL := 0.0; lo_sp : REAL := 0.0; END_VAR\n\
+                hi_sp := hi_sp + 0.0;\n\
+            END_PROGRAM",
+        )
+        .expect("real program compiles");
+        let handle = spawn_units_inner(
+            vec![single_unit(prog, 10)],
+            DeviceSource::Prebuilt(Vec::new()),
+            Vec::new(),
+            None,
+            governance(
+                WriteMode::Allowlist,
+                vec![
+                    project::WriteRule {
+                        variable: "hi_sp".into(),
+                        min: None,
+                        max: Some(0.1),
+                    },
+                    project::WriteRule {
+                        variable: "lo_sp".into(),
+                        min: Some(0.1),
+                        max: None,
+                    },
+                ],
+            ),
+        );
+        let bits = |f: f32| f.to_bits() as i32;
+        let v = handle.write_variable("hi_sp", bits(0.5)).await.unwrap();
+        let f = f32::from_bits(v as u32);
+        assert!(
+            (f as f64) <= 0.1,
+            "applied value {f} escapes the declared max 0.1"
+        );
+        assert!((f as f64) > 0.09, "clamp target should stay near the bound");
+        let v = handle.write_variable("lo_sp", bits(0.0)).await.unwrap();
+        let f = f32::from_bits(v as u32);
+        assert!(
+            (f as f64) >= 0.1,
+            "applied value {f} escapes the declared min 0.1"
+        );
+        assert!((f as f64) < 0.11, "clamp target should stay near the bound");
+        tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
+            .await
+            .expect("shutdown");
+    }
+
+    /// A finite f64 bound past f32 range (e.g. `min = 1.0e39`) admits no
+    /// representable REAL — the conversion saturates to +inf on the far
+    /// side, where inward stepping can't reach. The write must be denied
+    /// like the integer lane's empty range, never "clamped" to literal
+    /// infinity; and a NEAR-side out-of-range bound (min = -1.0e39, which
+    /// every f32 satisfies) must keep behaving as no bound at all.
+    #[tokio::test]
+    async fn governance_denies_real_rule_beyond_f32_range() {
+        let prog = crate::compile(
+            "PROGRAM main\n\
+                VAR far_sp : REAL := 0.0; near_sp : REAL := 0.0; END_VAR\n\
+                far_sp := far_sp + 0.0;\n\
+            END_PROGRAM",
+        )
+        .expect("real program compiles");
+        let handle = spawn_units_inner(
+            vec![single_unit(prog, 10)],
+            DeviceSource::Prebuilt(Vec::new()),
+            Vec::new(),
+            None,
+            governance(
+                WriteMode::Allowlist,
+                vec![
+                    project::WriteRule {
+                        variable: "far_sp".into(),
+                        min: Some(1.0e39),
+                        max: None,
+                    },
+                    project::WriteRule {
+                        variable: "near_sp".into(),
+                        min: Some(-1.0e39),
+                        max: None,
+                    },
+                ],
+            ),
+        );
+        let bits = |f: f32| f.to_bits() as i32;
+        let err = handle
+            .write_variable("far_sp", bits(5.0))
+            .await
+            .expect_err("a rule no REAL can satisfy must deny, not clamp to inf");
+        assert!(
+            err.to_string().contains("no representable REAL value"),
+            "unexpected denial reason: {err}"
+        );
+        let v = handle.write_variable("near_sp", bits(-5.0)).await.unwrap();
+        assert_eq!(
+            f32::from_bits(v as u32),
+            -5.0,
+            "a lower bound below -f32::MAX admits every REAL — write passes unclamped"
+        );
+        tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
+            .await
+            .expect("shutdown");
+    }
+
+    /// LREAL rides the integer lane, like every writer that can reach
+    /// governance: HTTP bodies and the northbound numeric lane send a
+    /// plain number, and nothing encodes LREAL as f32 bits. Governance
+    /// must clamp the value the writer actually sent — not a
+    /// reinterpretation of its bits.
+    #[tokio::test]
+    async fn governance_clamps_lreal_write_in_the_writers_encoding() {
+        let prog = crate::compile(
+            "PROGRAM main\n\
+                VAR sp : LREAL := 0.0; END_VAR\n\
+                sp := sp + 0.0;\n\
+            END_PROGRAM",
+        )
+        .expect("lreal program compiles");
+        let handle = spawn_units_inner(
+            vec![single_unit(prog, 10)],
+            DeviceSource::Prebuilt(Vec::new()),
+            Vec::new(),
+            None,
+            governance(
+                WriteMode::Allowlist,
+                vec![project::WriteRule {
+                    variable: "sp".into(),
+                    min: Some(0.0),
+                    max: Some(100.0),
+                }],
+            ),
+        );
+        // In range: passes through numerically unchanged (the f32-bits
+        // decode would have read 50 as 7e-44 and "clamped" it).
+        assert_eq!(handle.write_variable("sp", 50).await.unwrap(), 50);
+        // Out of range: clamped in the numeric domain the writer used.
+        assert_eq!(handle.write_variable("sp", 150).await.unwrap(), 100);
+        assert_eq!(handle.write_variable("sp", -5).await.unwrap(), 0);
+        tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
+            .await
+            .expect("shutdown");
+    }
+
+    /// The pulse reset is the runtime's own safety action, not an
+    /// external write: it bypasses governance, so a rule with min > 0
+    /// still releases the momentary command to 0 instead of silently
+    /// latching it at the clamp floor forever.
+    #[tokio::test]
+    async fn pulse_reset_bypasses_governance_and_still_resets_to_zero() {
+        // `y := x` never writes x, so the reset's 0 persists.
+        let prog = crate::compile(
+            "PROGRAM main\n\
+                VAR x : INT; y : INT; END_VAR\n\
+                y := x;\n\
+            END_PROGRAM",
+        )
+        .expect("program compiles");
+        let handle = spawn_units_inner(
+            vec![single_unit(prog, 10)],
+            DeviceSource::Prebuilt(Vec::new()),
+            Vec::new(),
+            None,
+            governance(
+                WriteMode::Allowlist,
+                vec![project::WriteRule {
+                    variable: "x".into(),
+                    min: Some(1.0),
+                    max: Some(100.0),
+                }],
+            ),
+        );
+        // The operator's write itself is governed and in range.
+        let v = crate::monitor::write_with_pulse(&handle, "x", 50, Some(30))
+            .await
+            .expect("initial pulse write");
+        assert_eq!(v, 50);
+        // Give the pulse task and a few scans time to land the reset.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let mut rx = handle.subscribe();
+        let snap = last_snapshot_within(&mut rx, Duration::from_millis(300)).await;
+        let bits = snap
+            .vars
+            .iter()
+            .find(|v| v.name == "x")
+            .expect("x in snapshot")
+            .bits;
+        assert_eq!(
+            bits as u32 as i32, 0,
+            "pulse reset must land 0 — a min = 1 rule must not latch the command"
+        );
+        tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
+            .await
+            .expect("shutdown");
     }
 }

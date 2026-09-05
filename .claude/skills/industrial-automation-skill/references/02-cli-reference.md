@@ -48,7 +48,8 @@ names are fine (`pous/lib/pid/fb_pid`).
 | `pous/<slug>/variables` | declared variables of one POU | — | |
 | `devices/<name>` | full JSON config | `--from cfg.json`; create needs `--protocol modbus\|ethercat\|opcua\|canopen` (or `protocol` in the body) | get → edit → set is THE device workflow |
 | `edges/<name>` | edge config | `--from cfg.json`; create needs `--host user@box` | |
-| `edges/<n>/probe·status·logs·scan·system` | sub-reads over ssh | — | `--query tail=500` on logs |
+| `edges/<n>/probe·status·logs·scan·system·audit` | sub-reads over ssh | — | `--query tail=500` on logs; `audit` = the edge's write-audit ring (who claimed to write what — see 03) |
+| `devices/<n>/describe` | deterministic agent reference file: config (passwords redacted), bindings + metadata, related alarms, governance rules | — | read-only; identical project state → identical output |
 | `hmi/<slug>` | full screen document | `--from doc.json`; create takes `--title` | incremental edits: `cs hmi op` (below) |
 | `iomap` · `tasks` · `northbound` · `alarms` | the single config doc | `--from f\|-` (whole-doc replace) | shapes in 06 / 09 |
 | `library` | — (`cs ls library`) | — | `cs rm library/<name>` removes an import |
@@ -107,13 +108,26 @@ Value encoding for force/write: human notation — `TRUE`/`FALSE`/`1`/`0`
 for BOOL, `50.0` for REAL (the CLI bit-packs by the variable's live
 type). Negative numbers after `--`: `cs runtime force setpoint -- -5`.
 
+Governed projects (`[governance]` in `project.toml` — see 09): in
+`allowlist` mode a write to an unlisted variable exits 2 with the
+server's 403 reason on stderr, and a rule's `min`/`max` **clamp** the
+value — the echoed value is the applied bound, which may differ from
+what you asked for. A write that can't be honestly clamped (NaN to a
+min/max-ruled REAL, or a rule range containing no representable value
+of the variable's type) is denied like an unlisted one — exit 2, 403
+reason on stderr (see 09). `force` is not governed (deliberate debug
+bypass — 09 again).
+
 Force precedence: the force is applied after the input read and before
 the program runs, so it beats the bus but loses to the program — a
 variable the program assigns every scan (most outputs) is overwritten by
 that assignment and the forced value never reaches the field, while the
 CLI still reports success. Force variables the program only *reads*
 (setpoints, mode requests, jog commands); to override a program-written
-output, give the program an override input it applies last.
+output, give the program an override input it applies last. In a
+governed project, remember force bypasses `[governance]` by design (see
+09) — drive governed setpoints with `cs runtime write` so the clamps
+apply, and keep force for commissioning/debug overrides.
 
 ### Simulate (prove behaviour before hardware)
 

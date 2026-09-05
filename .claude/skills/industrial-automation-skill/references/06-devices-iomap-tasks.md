@@ -143,6 +143,8 @@ Nine parameter channels carry the slow plane and bind in `iomap` — seven PLC�
 
 **Five fields, all required:** `application` (POU the variable lives in — **skipping it is the #1 422**), `variable` (IEC name in that POU), `device` (a name from `cs ls devices`), `channel` (a channel on it), `direction` (`input` = channel→variable, read before run_round | `output` = variable→channel, written after). Bindings that name an unknown device/variable/channel warn-skip at run time (they don't fail the run); a wrong *shape* 422s the `set`.
 
+**Four optional metadata fields** (omit them and old files round-trip byte-identical): `unit` (engineering unit, e.g. `"%"`), `min` / `max` (meaningful engineering range), `description` (natural-language meaning, e.g. `"Tank level setpoint"`). The runtime never interprets them; they feed generated surfaces — `cs hmi generate` inherits them (setpoint inputs get the range, value nodes get the unit, descriptions become labels) and `cs get devices/<n>/describe` exports them into the agent reference file. Nonsense metadata is caught at validate time: `/api/project/validate` (`cs api POST /api/project/validate`) errors on non-finite bounds or `min > max` (naming the mapping index) and warns when a range is attached to a boolean channel. Write-range *enforcement* is a separate mechanism (`[governance]` in `project.toml` — see `09-sim-alarms.md`).
+
 ---
 
 ## Tasks (tasks.toml)

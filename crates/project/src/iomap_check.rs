@@ -20,8 +20,9 @@ use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
 use crate::types::{
-    CanopenAccess, CanopenTransport, Device, Direction, EthercatPdoDirection, IoMap, Mapping,
-    ModbusChannelKind, OpcuaAccess, ProtocolConfig,
+    CanopenAccess, CanopenDataType, CanopenTransport, Device, Direction, EthercatDataType,
+    EthercatPdoDirection, IoMap, Mapping, ModbusChannelKind, OpcuaAccess, OpcuaDataType,
+    ProtocolConfig,
 };
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, TS)]
@@ -79,10 +80,22 @@ fn warning(mapping_index: usize, message: String) -> IomapIssue {
 ///    (device, channel) — last-writer-wins fights, always a bug;
 /// 5. one variable bound as `Output` to several distinct channels —
 ///    legitimate fan-out, flagged as a warning so it's a visible choice.
+///
+/// Plus metadata sanity, per mapping:
+/// 6. `min`/`max` engineering-range metadata must be finite and ordered
+///    (`min <= max`) — errors, because the values flow verbatim into
+///    generated HMI SetValue bounds and device describe exports; range
+///    metadata on a boolean channel is a warning (booleans carry only
+///    0/1, so a range there usually means the row targets the wrong
+///    channel).
 pub fn validate_iomap(iomap: &IoMap, devices: &[Device]) -> Vec<IomapIssue> {
     let mut issues = Vec::new();
 
     for (index, mapping) in iomap.mappings.iter().enumerate() {
+        // Metadata sanity is device-independent — check it even when the
+        // device lookup below fails, so one broken row reports both
+        // problems in a single validate pass.
+        check_metadata(index, mapping, &mut issues);
         let Some(device) = devices.iter().find(|d| d.name == mapping.device) else {
             issues.push(error(
                 index,
@@ -107,9 +120,65 @@ pub fn validate_iomap(iomap: &IoMap, devices: &[Device]) -> Vec<IomapIssue> {
     issues
 }
 
+/// Rule 6 (error half): `min`/`max` metadata must be finite and ordered.
+/// TOML accepts `nan`/`inf` literals and swapped bounds; catching them
+/// here gives the caller a `mapping_index`, instead of the bad value
+/// flowing verbatim into generated HMI SetValue bounds (where the HMI
+/// validator rejects it at the wrong layer) or into describe exports as
+/// authoritative-looking range data.
+fn check_metadata(index: usize, mapping: &Mapping, issues: &mut Vec<IomapIssue>) {
+    for (bound, value) in [("min", mapping.min), ("max", mapping.max)] {
+        if let Some(v) = value {
+            if !v.is_finite() {
+                issues.push(error(
+                    index,
+                    format!(
+                        "mapping '{app}.{var}': {bound} must be a finite number (got {v})",
+                        app = mapping.application,
+                        var = mapping.variable
+                    ),
+                ));
+            }
+        }
+    }
+    if let (Some(min), Some(max)) = (mapping.min, mapping.max) {
+        if min > max {
+            issues.push(error(
+                index,
+                format!(
+                    "mapping '{app}.{var}': min ({min}) is greater than max ({max})",
+                    app = mapping.application,
+                    var = mapping.variable
+                ),
+            ));
+        }
+    }
+}
+
+/// Rule 6 (warning half): range metadata on a boolean channel. Legal,
+/// but the value lane only ever carries 0/1 — a min/max there almost
+/// always means the row points at the wrong channel.
+fn warn_range_on_bool_channel(index: usize, mapping: &Mapping, issues: &mut Vec<IomapIssue>) {
+    if mapping.min.is_none() && mapping.max.is_none() {
+        return;
+    }
+    issues.push(warning(
+        index,
+        format!(
+            "mapping '{app}.{var}': min/max range metadata on boolean channel '{ch}' of \
+             device '{dev}' — a boolean carries only 0/1, so the range cannot apply",
+            app = mapping.application,
+            var = mapping.variable,
+            ch = mapping.channel,
+            dev = mapping.device
+        ),
+    ));
+}
+
 /// Rules 2 + 3: channel existence and direction compatibility, dispatched
 /// on the device's protocol so the message can cite the channel's actual
-/// kind/direction/access.
+/// kind/direction/access. Also hosts rule 6's boolean-channel warning,
+/// since this is where the channel's data type is resolved.
 fn check_channel(index: usize, mapping: &Mapping, device: &Device, issues: &mut Vec<IomapIssue>) {
     let unknown_channel = |issues: &mut Vec<IomapIssue>| {
         issues.push(error(
@@ -130,6 +199,12 @@ fn check_channel(index: usize, mapping: &Mapping, device: &Device, issues: &mut 
                 unknown_channel(issues);
                 return;
             };
+            if matches!(
+                ch.kind,
+                ModbusChannelKind::Coil | ModbusChannelKind::DiscreteInput
+            ) {
+                warn_range_on_bool_channel(index, mapping, issues);
+            }
             // Every Modbus kind is readable (FC 1/2/3/4), so Input is
             // always satisfiable; only writes are kind-restricted.
             let writable = matches!(
@@ -156,6 +231,9 @@ fn check_channel(index: usize, mapping: &Mapping, device: &Device, issues: &mut 
                 unknown_channel(issues);
                 return;
             };
+            if ch.data_type == EthercatDataType::Bool {
+                warn_range_on_bool_channel(index, mapping, issues);
+            }
             match (mapping.direction, ch.direction) {
                 (Direction::Input, EthercatPdoDirection::RxPdo) => {
                     issues.push(error(
@@ -193,6 +271,9 @@ fn check_channel(index: usize, mapping: &Mapping, device: &Device, issues: &mut 
                 unknown_channel(issues);
                 return;
             };
+            if ch.data_type == OpcuaDataType::Bool {
+                warn_range_on_bool_channel(index, mapping, issues);
+            }
             // Output strictly needs access=write (the adapter rejects
             // writes to read tags). Input is fine on either access: the
             // poll task mirrors every channel, write tags included.
@@ -215,6 +296,9 @@ fn check_channel(index: usize, mapping: &Mapping, device: &Device, issues: &mut 
                 unknown_channel(issues);
                 return;
             };
+            if ch.data_type == CanopenDataType::Bool {
+                warn_range_on_bool_channel(index, mapping, issues);
+            }
             // Same contract as OPC UA: the adapter mirrors every channel
             // (SDO polls, TPDO frames, RPDO shadows), so Input always
             // works; Output needs access=write. Additionally a TPDO is
@@ -475,6 +559,10 @@ mod tests {
             direction,
             device: device.into(),
             channel: channel.into(),
+            unit: None,
+            min: None,
+            max: None,
+            description: None,
         }
     }
 
@@ -766,6 +854,114 @@ mod tests {
             mapping("v", Direction::Input, "plc", "ir_temp"),
             mapping("v", Direction::Input, "plc", "di_estop"),
         ]);
+        assert!(validate_iomap(&map, &devices).is_empty());
+    }
+
+    // ---- rule 6: engineering-range metadata -------------------------------
+
+    fn with_range(mut m: Mapping, min: Option<f64>, max: Option<f64>) -> Mapping {
+        m.min = min;
+        m.max = max;
+        m
+    }
+
+    #[test]
+    fn metadata_min_greater_than_max_is_an_error() {
+        let devices = vec![modbus_device("plc")];
+        let map = iomap(vec![with_range(
+            mapping("sp", Direction::Output, "plc", "hr_setpoint"),
+            Some(200.0),
+            Some(0.0),
+        )]);
+        let issues = validate_iomap(&map, &devices);
+        assert_eq!(errors(&issues).len(), 1, "{issues:?}");
+        assert_eq!(issues[0].mapping_index, 0);
+        assert!(
+            issues[0]
+                .message
+                .contains("min (200) is greater than max (0)"),
+            "{}",
+            issues[0].message
+        );
+    }
+
+    #[test]
+    fn metadata_non_finite_bounds_are_errors() {
+        // TOML happily parses `min = nan` / `max = inf`; both bounds on
+        // one row report independently.
+        let devices = vec![modbus_device("plc")];
+        let map = iomap(vec![with_range(
+            mapping("sp", Direction::Output, "plc", "hr_setpoint"),
+            Some(f64::NAN),
+            Some(f64::INFINITY),
+        )]);
+        let issues = validate_iomap(&map, &devices);
+        let errs = errors(&issues);
+        assert_eq!(errs.len(), 2, "{issues:?}");
+        assert!(
+            errs[0].message.contains("min must be a finite number"),
+            "{}",
+            errs[0].message
+        );
+        assert!(
+            errs[1].message.contains("max must be a finite number"),
+            "{}",
+            errs[1].message
+        );
+    }
+
+    #[test]
+    fn metadata_is_checked_even_when_the_device_is_unknown() {
+        let devices = vec![modbus_device("plc")];
+        let map = iomap(vec![with_range(
+            mapping("sp", Direction::Output, "ghost", "x"),
+            Some(1.0),
+            Some(0.0),
+        )]);
+        let issues = validate_iomap(&map, &devices);
+        let errs = errors(&issues);
+        assert_eq!(errs.len(), 2, "{issues:?}");
+        assert!(errs.iter().any(|e| e.message.contains("unknown device")));
+        assert!(errs
+            .iter()
+            .any(|e| e.message.contains("min (1) is greater than max (0)")));
+    }
+
+    #[test]
+    fn range_metadata_on_boolean_channels_is_a_warning() {
+        // Modbus Coil and EtherCAT Bool PDO — the two most common
+        // boolean lanes; OPC UA / CANopen Bool tags follow the same
+        // helper.
+        let devices = vec![modbus_device("plc"), ethercat_device("ec")];
+        let map = iomap(vec![
+            with_range(
+                mapping("pump", Direction::Output, "plc", "coil_pump"),
+                Some(0.0),
+                Some(1.0),
+            ),
+            with_range(
+                mapping("status", Direction::Input, "ec", "tx_status"),
+                None,
+                Some(1.0),
+            ),
+        ]);
+        let issues = validate_iomap(&map, &devices);
+        assert!(errors(&issues).is_empty(), "{issues:?}");
+        let warns = warnings(&issues);
+        assert_eq!(warns.len(), 2, "{issues:?}");
+        for w in warns {
+            assert!(w.message.contains("boolean channel"), "{}", w.message);
+        }
+    }
+
+    #[test]
+    fn valid_range_metadata_is_clean() {
+        let devices = vec![modbus_device("plc")];
+        let map = iomap(vec![with_range(
+            mapping("sp", Direction::Output, "plc", "hr_setpoint"),
+            Some(0.0),
+            Some(100.0),
+        )]);
         assert!(validate_iomap(&map, &devices).is_empty());
     }
 

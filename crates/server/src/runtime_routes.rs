@@ -77,8 +77,12 @@ pub async fn runtime_alarms(
 /// Acknowledge one alarm. 404 for an unknown id.
 pub async fn runtime_alarm_ack(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<ironplc_bridge::monitor::AlarmState>, ApiError> {
+    // Masking a standing alarm is a mutating operator action —
+    // attributed like every other mutating runtime route (ADR-0002).
+    state.maybe_attribute_external(origin_of(&headers).as_deref(), format!("ack {id}"));
     let now_us = ironplc_bridge::monitor::wall_now_us();
     state
         .alarms
@@ -257,6 +261,7 @@ pub struct WriteVariableResponse {
 pub async fn write_runtime_variable(
     State(state): State<AppState>,
     _project: ProjectName,
+    headers: axum::http::HeaderMap,
     AxumPath(name): AxumPath<String>,
     Json(req): Json<WriteVariableRequest>,
 ) -> Result<Json<WriteVariableResponse>, ApiError> {
@@ -267,6 +272,7 @@ pub async fn write_runtime_variable(
     // mutex so we don't hold a sync lock across the .await below — see
     // the bridge::ProgramHandle docs.
     let handle: ProgramHandle = live_program(&state)?;
+    state.maybe_attribute_external(origin_of(&headers).as_deref(), format!("write {name}"));
     // The momentary-pulse reset guarantee lives in the shared monitor
     // core — one implementation for IDE server and edge runtime.
     let value =
@@ -292,6 +298,22 @@ pub struct ForceRequest {
     pub value: i32,
 }
 
+/// Origin of a mutating request for attribution (ADR-0002): the
+/// sanitized `X-IA2-Origin` header value (`gui`, `cs`, `hmi`, `mqtt`,
+/// …). The label is self-declared — NOT authentication — so it is
+/// sanitized (`state::sanitize_origin`: charset + length cap) rather
+/// than trusted or silently dropped. `None` means no usable label
+/// arrived: an unattributed external writer, for which the server
+/// flashes the takeover overlay. This is the server crate's ONE
+/// header-reading implementation — route handlers must not re-read
+/// the header themselves.
+pub(crate) fn origin_of(headers: &axum::http::HeaderMap) -> Option<String> {
+    headers
+        .get("x-ia2-origin")
+        .and_then(|v| v.to_str().ok())
+        .and_then(crate::state::sanitize_origin)
+}
+
 /// Look up the live program handle or return 409. Used by every
 /// debug-control endpoint below. The handle is global (one PROGRAM
 /// runs at a time, hardware constraint), so this helper doesn't take
@@ -306,22 +328,32 @@ fn live_program(state: &AppState) -> Result<ProgramHandle, ApiError> {
         .ok_or(ApiError::Conflict("no program running".into()))
 }
 
-pub async fn runtime_pause(State(state): State<AppState>) -> Result<Json<ModeResponse>, ApiError> {
+pub async fn runtime_pause(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<ModeResponse>, ApiError> {
     let handle = live_program(&state)?;
+    state.maybe_attribute_external(origin_of(&headers).as_deref(), "pause".into());
     Ok(Json(ironplc_bridge::monitor::pause(&handle)))
 }
 
-pub async fn runtime_resume(State(state): State<AppState>) -> Result<Json<ModeResponse>, ApiError> {
+pub async fn runtime_resume(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<ModeResponse>, ApiError> {
     let handle = live_program(&state)?;
+    state.maybe_attribute_external(origin_of(&headers).as_deref(), "resume".into());
     Ok(Json(ironplc_bridge::monitor::resume(&handle)))
 }
 
 pub async fn runtime_step(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     body: Option<Json<StepRequest>>,
 ) -> Result<Json<ModeResponse>, ApiError> {
     let handle = live_program(&state)?;
     let cycles = body.map(|Json(r)| r.cycles).unwrap_or(1);
+    state.maybe_attribute_external(origin_of(&headers).as_deref(), format!("step {cycles}"));
     Ok(Json(ironplc_bridge::monitor::step(&handle, cycles)))
 }
 
@@ -338,10 +370,12 @@ pub struct ForceResponse {
 pub async fn force_runtime_variable(
     State(state): State<AppState>,
     _project: ProjectName,
+    headers: axum::http::HeaderMap,
     AxumPath(name): AxumPath<String>,
     Json(req): Json<ForceRequest>,
 ) -> Result<Json<ForceResponse>, ApiError> {
     let handle = live_program(&state)?;
+    state.maybe_attribute_external(origin_of(&headers).as_deref(), format!("force {name}"));
     let value = handle.force_variable(&name, req.value).await?;
     Ok(Json(ForceResponse { name, value }))
 }
@@ -351,9 +385,11 @@ pub async fn force_runtime_variable(
 pub async fn unforce_runtime_variable(
     State(state): State<AppState>,
     _project: ProjectName,
+    headers: axum::http::HeaderMap,
     AxumPath(name): AxumPath<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let handle = live_program(&state)?;
+    state.maybe_attribute_external(origin_of(&headers).as_deref(), format!("unforce {name}"));
     handle.unforce_variable(&name).await?;
     Ok(Json(serde_json::json!({ "name": name, "forced": false })))
 }
@@ -383,9 +419,14 @@ fn default_inject_scans() -> u32 {
 pub async fn inject_scan_stall(
     State(state): State<AppState>,
     _project: ProjectName,
+    headers: axum::http::HeaderMap,
     Json(req): Json<InjectScanStallRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let handle = live_program(&state)?;
+    // Deliberately latching the runtime into failsafe is the LAST
+    // mutating route that may run in silence — attributed like the
+    // rest (ADR-0002; api.md's "every mutating runtime route" claim).
+    state.maybe_attribute_external(origin_of(&headers).as_deref(), "inject-scan-stall".into());
     handle.inject_scan_stall(req.stall_ms, req.scans).await?;
     Ok(Json(
         serde_json::json!({ "injected": { "stall_ms": req.stall_ms, "scans": req.scans } }),
@@ -402,4 +443,131 @@ pub async fn list_runtime_forces(State(state): State<AppState>) -> Json<Vec<Forc
         .map(|rp| ironplc_bridge::monitor::force_entries(&rp.handle))
         .unwrap_or_default();
     Json(forces)
+}
+
+// ============================================================
+//  Edge runtime proxy — the same debug ops, on a deployed edge
+// ============================================================
+
+/// Proxy an online-debug control op to the edge runtime over ssh. `op`
+/// is whitelisted (it's interpolated into the remote curl command). The
+/// request body (if any) is forwarded as the JSON payload — e.g.
+/// `{cycles}` for step, `{name,value}` for write/force.
+///
+/// The edge's own answer passes through with its ORIGINAL status and
+/// body (a governance denial on the edge is a 403 here too, with the
+/// edge's error text verbatim — not a 500). ADR-0002's "unlisted
+/// writes are 403" must hold on every one of the four write paths,
+/// and the CLI's exit-code contract (4xx = caller-fixable, 5xx =
+/// infra) depends on the status surviving the ssh hop. Only transport
+/// failures (ssh, curl, an unparseable response) are this server's own
+/// 500s.
+pub async fn edge_runtime_route(
+    State(state): State<AppState>,
+    project: ProjectName,
+    headers: axum::http::HeaderMap,
+    AxumPath((name, op)): AxumPath<(String, String)>,
+    body: Option<Json<serde_json::Value>>,
+) -> Result<axum::response::Response, ApiError> {
+    const ALLOWED: [&str; 6] = ["pause", "resume", "step", "write", "force", "unforce"];
+    if !ALLOWED.contains(&op.as_str()) {
+        return Err(ApiError::BadRequest(format!("unknown runtime op '{op}'")));
+    }
+    let origin = origin_of(&headers);
+    // An unattributed writer reaching the plant THROUGH the IDE still
+    // flashes the takeover overlay (ADR-0002).
+    state.maybe_attribute_external(origin.as_deref(), format!("{op} on edge {name}"));
+    let edge = crate::routes::with_project(&state, &project, |store| {
+        store.read_edge(&name).map_err(Into::into)
+    })?;
+    let payload = body
+        .map(|Json(v)| v)
+        .unwrap_or_else(|| serde_json::json!({}));
+    let result = crate::edges::proxy_edge_runtime_op(&edge, &op, &payload, origin.as_deref()).await;
+    edge_proxy_response(result)
+}
+
+/// Map the typed proxy result onto the HTTP response: 2xx JSON is
+/// re-served as JSON, a non-2xx edge answer is replayed status+body
+/// verbatim, and only transport faults become this server's own 500.
+/// Split out of the handler so the passthrough is unit-testable.
+fn edge_proxy_response(
+    result: Result<serde_json::Value, crate::edges::EdgeRuntimeError>,
+) -> Result<axum::response::Response, ApiError> {
+    use axum::response::IntoResponse as _;
+    match result {
+        Ok(v) => Ok(Json(v).into_response()),
+        Err(crate::edges::EdgeRuntimeError::Status { code, body }) => {
+            let status = axum::http::StatusCode::from_u16(code)
+                .unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
+            Ok((status, body).into_response())
+        }
+        Err(crate::edges::EdgeRuntimeError::Transport(e)) => Err(ApiError::Internal(e)),
+    }
+}
+
+/// Proxy the edge runtime's write-audit ring (`GET /audit`). The ring
+/// is the agent-facing "who wrote what" record and the edge binds
+/// localhost-only — without this proxy (and the matching
+/// `cs get edges/<n>/audit` path) the one resource built FOR
+/// auditability would be the only edge read requiring a hand-rolled
+/// ssh tunnel.
+pub async fn edge_audit_route(
+    State(state): State<AppState>,
+    project: ProjectName,
+    AxumPath(name): AxumPath<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let edge = crate::routes::with_project(&state, &project, |store| {
+        store.read_edge(&name).map_err(Into::into)
+    })?;
+    crate::edges::fetch_edge_json(&edge, "/audit")
+        .await
+        .map(Json)
+        .map_err(ApiError::Internal)
+}
+
+#[cfg(test)]
+mod edge_proxy_tests {
+    use super::*;
+    use crate::edges::EdgeRuntimeError;
+
+    /// The edge's governance 403 must survive the proxy hop with its
+    /// status and body intact — a 500 here would misreport a policy
+    /// denial as an infrastructure failure (and flip the CLI's exit
+    /// code from 2 to 3).
+    #[tokio::test]
+    async fn edge_4xx_passes_through_with_status_and_body_verbatim() {
+        let denied = edge_proxy_response(Err(EdgeRuntimeError::Status {
+            code: 403,
+            body: "write to 'x' rejected by project governance".into(),
+        }))
+        .expect("a status answer is a response, not an ApiError");
+        assert_eq!(denied.status(), axum::http::StatusCode::FORBIDDEN);
+        let bytes = axum::body::to_bytes(denied.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(bytes, "write to 'x' rejected by project governance");
+
+        let conflict = edge_proxy_response(Err(EdgeRuntimeError::Status {
+            code: 409,
+            body: "no program running".into(),
+        }))
+        .unwrap();
+        assert_eq!(conflict.status(), axum::http::StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn edge_success_is_served_as_json() {
+        let ok = edge_proxy_response(Ok(serde_json::json!({ "ok": true }))).unwrap();
+        assert_eq!(ok.status(), axum::http::StatusCode::OK);
+    }
+
+    #[test]
+    fn transport_failures_stay_this_servers_own_500() {
+        let err = edge_proxy_response(Err(EdgeRuntimeError::Transport(
+            "ssh to pi failed: connection refused".into(),
+        )))
+        .expect_err("transport faults map to ApiError");
+        assert!(matches!(err, ApiError::Internal(msg) if msg.contains("ssh to pi failed")));
+    }
 }

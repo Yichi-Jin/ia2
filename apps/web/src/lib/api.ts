@@ -67,16 +67,18 @@ export function currentProject(): string | null {
 }
 
 /** `fetch` with the `X-IA2-Project` header injected automatically.
- * Use this instead of bare `fetch` for every API call. */
+ * Use this instead of bare `fetch` for every API call. Also declares
+ * `X-IA2-Origin: gui` so the server can tell the human at the console
+ * apart from unattributed writers on mutating routes (ADR-0002). */
 export async function apiFetch(input: string, init?: RequestInit): Promise<Response> {
-  const project = currentProject()
-  if (!project) {
-    return fetch(input, init)
-  }
   // Merge with any caller-supplied headers; the caller wins if they
   // explicitly set X-IA2-Project (unusual, but supported).
   const headers = new Headers(init?.headers)
-  if (!headers.has("X-IA2-Project")) {
+  if (!headers.has("X-IA2-Origin")) {
+    headers.set("X-IA2-Origin", "gui")
+  }
+  const project = currentProject()
+  if (project && !headers.has("X-IA2-Project")) {
     headers.set("X-IA2-Project", project)
   }
   return fetch(input, { ...init, headers })

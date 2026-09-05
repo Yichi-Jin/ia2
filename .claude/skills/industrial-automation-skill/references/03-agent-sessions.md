@@ -9,6 +9,14 @@ When an agent drives IA2, the human watches the IDE. The IDE shows a green "AGEN
 
 **For any workflow longer than a single command, you MUST use a session.** This is the difference between "the agent is thrashing my screen" and "the agent is doing "Building bottling line" and I can see exactly that".
 
+## Attribution beyond `cs` (ADR-0002)
+
+The banner is no longer `cs`-only. Every mutating request may carry `X-IA2-Origin: <operator>` — the IDE sends `gui`, `cs` sends `cs`, the operator panel sends `hmi`, MQTT northbound writes are recorded as `mqtt`; any other declared value is recorded as given (the IDE's edge proxy sanitizes labels to `[A-Za-z0-9._-]`, max 64 chars, before forwarding), and only a request with no header (or an empty one) is recorded as `anonymous`. Three things to know:
+
+- **Origin is a self-declared header, not authentication.** The overlay and the audit trust the label as given — a writer claiming `gui` is treated as the console. The mechanism catches accidents and keeps honest tooling visible; it does not stop an adversary from lying about who they are.
+- **Driving the runtime without `cs` still shows up.** On every mutating runtime route (write / force / unforce / pause / resume / step, alarm ack, run / stop, inject-scan-stall, and the edge proxy) the server auto-attributes by origin: no usable label flashes `<op> (unattributed)`; a declared non-`gui` label flashes `<op> — <origin> (self-declared)` — always, even while someone else's session is open; `cs` outside a session flashes `<op> — cs (no session)` (inside a session it just refreshes the session's liveness). So bypassing the session pattern doesn't make you invisible — it makes you look like an unidentified script. Wrap your work in `cs agent run` so the banner says *what* you are, not "(unattributed)".
+- **Every edge write is audited.** The runtime keeps a bounded ring (256 entries) of every write attempt — HTTP and MQTT alike — with origin, the requested *and* applied values, and the outcome (`ok` / `clamped` / the denial reason; governance denials are recorded too). Read it as `cs get edges/<n>/audit` (or `GET /api/edges/{name}/audit`; on the box itself, `curl -s http://127.0.0.1:13001/audit`). When a plant behaves unexpectedly, that's the first place to look for *who claimed to write what* — remembering the origin column records the writer's claim, not a verified identity. The ring is in-memory only: it is wiped when the edge runtime restarts (a redeploy restarts it) and rolls over quickly under steady write traffic, so read it early; durable history lives in `/history`.
+
 ## The one command you reach for: `cs agent run`
 
 ```bash

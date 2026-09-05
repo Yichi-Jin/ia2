@@ -137,6 +137,12 @@ pub struct AgentActivityState {
     /// distinct from the session id below. Lets us tell "one agent
     /// running fast" apart from "many agents".
     pub session_hint: Option<String>,
+    /// When `maybe_attribute_external` last flashed an external-writer
+    /// label. Kept separate from `last_heartbeat` because a session's
+    /// 1 s keep-alive pings refresh `last_heartbeat` forever — the
+    /// watchdog needs this independent clock to age an external flash
+    /// back out to the session's own banner.
+    pub external_flash_at: Option<Instant>,
     /// Long-running session, if the agent opened one with
     /// `/api/agent/session/start`. None when no session is active.
     pub session: Option<AgentSession>,
@@ -295,10 +301,18 @@ impl AppState {
     /// Otherwise, fall into the legacy "transient" path: refresh the
     /// per-heartbeat command + age out after TRANSIENT_TTL.
     ///
+    /// The heartbeat protocol is the `cs` CLI's announcement channel
+    /// (`cs`'s announce.rs is its only writer), so the stored banner
+    /// label carries the `cs ` prefix HERE — the web renders labels
+    /// verbatim and never invents the prefix itself (ADR-0002:
+    /// truthfulness on every surface; externally-attributed writers get
+    /// their labels from `maybe_attribute_external` instead).
+    ///
     /// The leading-edge AgentActivity event fires when overall
     /// activity transitions from inactive → active; the trailing
     /// edge is the watchdog's job.
     pub fn record_agent_heartbeat(&self, command: Option<String>, session_id: Option<String>) {
+        let command = command.map(|c| format!("cs {c}"));
         let edge = {
             let mut s = self.agent.lock();
             let was_active = s.active;
@@ -340,6 +354,84 @@ impl AppState {
                 since_ms: 0,
             }));
         }
+    }
+
+    /// Auto-attribution for mutating requests (ADR-0002: any non-`cs`
+    /// operator must surface through the attribution mechanism, or a
+    /// surface does not ship). `action` is the bare operation label
+    /// ("write x", "pause", "write on edge pi") — the origin decoration
+    /// is appended HERE, in the one place that knows the rules:
+    ///
+    /// - `gui` → suppressed. The IDE user drives the banner UI itself;
+    ///   their own clicks never take the banner.
+    /// - `cs` → refreshes the open agent session's liveness (a long
+    ///   `cs sim run` inside `cs agent run` must not age out mid-
+    ///   scenario) and is suppressed exactly while that session is
+    ///   open. Outside a session the banner says so truthfully:
+    ///   `<action> — cs (no session)`.
+    /// - any other non-empty label → banner ALWAYS, even during an
+    ///   active session: `<action> — <origin> (self-declared)`. The
+    ///   declared label is rendered verbatim (sanitized), never
+    ///   discarded — mislabelling a self-attributed writer as
+    ///   "unattributed" would be a lie on the operator surface.
+    /// - no usable label → banner ALWAYS: `<action> (unattributed)`.
+    ///
+    /// Origins are self-declared strings, NOT authentication; they are
+    /// sanitized (charset + length) before display.
+    pub fn maybe_attribute_external(&self, origin: Option<&str>, action: String) {
+        match origin.and_then(sanitize_origin).as_deref() {
+            Some("gui") => {}
+            Some("cs") => {
+                let session_refreshed = {
+                    let mut s = self.agent.lock();
+                    match s.session.as_mut() {
+                        Some(sess) => {
+                            let now = Instant::now();
+                            sess.last_heartbeat = now;
+                            s.last_heartbeat = Some(now);
+                            true
+                        }
+                        None => false,
+                    }
+                };
+                if !session_refreshed {
+                    self.flash_external(format!("{action} — cs (no session)"));
+                }
+            }
+            Some(origin) => self.flash_external(format!("{action} — {origin} (self-declared)")),
+            None => self.flash_external(format!("{action} (unattributed)")),
+        }
+    }
+
+    /// Flash the takeover banner with an external-writer label. Unlike
+    /// a heartbeat, this ALWAYS emits an AgentActivity event — an
+    /// external writer must be visible even while a session (or an
+    /// earlier flash) already holds `active` true, otherwise a
+    /// concurrent writer is silently misattributed to whatever the
+    /// banner happened to show. The watchdog ages the flash back out:
+    /// to banner-off when no session is open, or back to the session's
+    /// own label when one is.
+    fn flash_external(&self, label: String) {
+        let event = {
+            let mut s = self.agent.lock();
+            let now = Instant::now();
+            s.last_heartbeat = Some(now);
+            s.external_flash_at = Some(now);
+            s.command = Some(label.clone());
+            s.active = true;
+            AgentActivity {
+                active: true,
+                command: Some(label),
+                session: s
+                    .session
+                    .as_ref()
+                    .map(|sess| sess.id.clone())
+                    .or_else(|| s.session_hint.clone()),
+                session_label: s.session.as_ref().map(|sess| sess.label.clone()),
+                since_ms: 0,
+            }
+        };
+        let _ = self.event_tx.send(AppEvent::AgentActivity(event));
     }
 
     /// Open an explicit agent takeover session. The IDE overlay
@@ -402,6 +494,7 @@ impl AppState {
                     s.last_heartbeat = None;
                     s.command = None;
                     s.session_hint = None;
+                    s.external_flash_at = None;
                     s.active = false;
                     true
                 }
@@ -436,10 +529,18 @@ impl AppState {
             .map(|t| t.elapsed().as_millis() as u64)
             .unwrap_or(0);
         match s.session.as_ref() {
-            // An open session wins — its label is what the banner shows.
+            // An open session wins — its label is what the banner
+            // shows. One exception: a still-fresh external-writer
+            // flash (`maybe_attribute_external`) rides along as
+            // `command` so a late-joining window sees the concurrent
+            // writer too, exactly like a live subscriber did.
             Some(sess) => AgentActivity {
                 active: true,
-                command: None,
+                command: s
+                    .external_flash_at
+                    .is_some()
+                    .then(|| s.command.clone())
+                    .flatten(),
                 session: Some(sess.id.clone()),
                 session_label: Some(sess.label.clone()),
                 since_ms,
@@ -486,6 +587,23 @@ impl AppState {
     }
 }
 
+/// Sanitize a self-declared `X-IA2-Origin` label for display and for
+/// forwarding: keep only `[A-Za-z0-9._-]`, cap at 64 chars; a label
+/// that sanitizes to nothing counts as absent. The ONE sanitizer for
+/// the attribution contract — the banner labels and the edge proxy's
+/// forwarded header both go through here, so a mangled-but-non-empty
+/// label is cleaned up rather than silently dropped (dropping it would
+/// make the server's overlay and the edge's audit ring disagree about
+/// the same write).
+pub(crate) fn sanitize_origin(raw: &str) -> Option<String> {
+    let cleaned: String = raw
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        .take(64)
+        .collect();
+    (!cleaned.is_empty()).then_some(cleaned)
+}
+
 /// Wall-clock microseconds since the UNIX epoch. Used for session
 /// `started_us` so the frontend can render "started 12 s ago". We
 /// don't use `Instant` because that's a monotonic-clock-only type
@@ -495,4 +613,155 @@ fn now_unix_us() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_micros() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod attribution_tests {
+    use super::*;
+
+    fn state() -> AppState {
+        AppState::new(DemoSlave::new(), "127.0.0.1:5502".into(), None, None)
+    }
+
+    #[test]
+    fn gui_origin_never_takes_the_banner() {
+        let s = state();
+        s.maybe_attribute_external(Some("gui"), "write x".into());
+        assert!(!s.agent.lock().active);
+    }
+
+    #[test]
+    fn absent_origin_flashes_as_unattributed() {
+        let s = state();
+        s.maybe_attribute_external(None, "write x".into());
+        let g = s.agent.lock();
+        assert!(g.active);
+        assert_eq!(g.command.as_deref(), Some("write x (unattributed)"));
+    }
+
+    /// A writer that dutifully declares a label must be shown under
+    /// that label (marked self-declared), never as "unattributed" —
+    /// discarding the label it gave us would be a lie on the operator
+    /// surface.
+    #[test]
+    fn declared_origin_is_rendered_verbatim_and_marked_self_declared() {
+        let s = state();
+        s.maybe_attribute_external(Some("openai-agent"), "write x".into());
+        let g = s.agent.lock();
+        assert!(g.active);
+        assert_eq!(
+            g.command.as_deref(),
+            Some("write x — openai-agent (self-declared)")
+        );
+    }
+
+    /// Origin labels are self-declared header strings: hostile or
+    /// mangled values are sanitized (charset + 64-char cap), not
+    /// trusted and not silently dropped.
+    #[test]
+    fn origin_labels_are_sanitized_not_dropped() {
+        assert_eq!(sanitize_origin("my bridge"), Some("mybridge".into()));
+        assert_eq!(sanitize_origin("a'b$(x)`c"), Some("abxc".into()));
+        assert_eq!(sanitize_origin(&"x".repeat(70)), Some("x".repeat(64)));
+        assert_eq!(sanitize_origin("!!!"), None);
+        assert_eq!(sanitize_origin(""), None);
+
+        let s = state();
+        s.maybe_attribute_external(Some("my bridge"), "write x".into());
+        assert_eq!(
+            s.agent.lock().command.as_deref(),
+            Some("write x — mybridge (self-declared)")
+        );
+        // Sanitizes to nothing → treated as absent, i.e. unattributed.
+        let s2 = state();
+        s2.maybe_attribute_external(Some("¡™£"), "write x".into());
+        assert_eq!(
+            s2.agent.lock().command.as_deref(),
+            Some("write x (unattributed)")
+        );
+    }
+
+    /// cs-origin mutating requests keep the open session alive (a long
+    /// `cs sim run` under `cs agent run` must not age out mid-scenario)
+    /// and are suppressed exactly while that session is open.
+    #[test]
+    fn cs_origin_refreshes_session_liveness_and_is_suppressed() {
+        let s = state();
+        s.start_agent_session("s1".into(), "rebuilding tank".into());
+        let before = s.agent.lock().session.as_ref().unwrap().last_heartbeat;
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        s.maybe_attribute_external(Some("cs"), "write x".into());
+        let g = s.agent.lock();
+        // Suppressed: the session label still owns the banner…
+        assert!(g.command.is_none());
+        assert_eq!(g.session.as_ref().unwrap().label, "rebuilding tank");
+        // …and the session watchdog was fed.
+        assert!(g.session.as_ref().unwrap().last_heartbeat > before);
+    }
+
+    /// Outside a session, cs writes are labelled truthfully instead of
+    /// being suppressed by heartbeat timing (the old fresh-heartbeat
+    /// rule falsely relabelled mid-scenario `cs sim run` writes as
+    /// "(unattributed)" once the single pre-dispatch heartbeat aged out).
+    #[test]
+    fn cs_without_session_flashes_no_session_label() {
+        let s = state();
+        s.record_agent_heartbeat(Some("sim run fill.toml".into()), None);
+        s.maybe_attribute_external(Some("cs"), "write inlet_cmd".into());
+        assert_eq!(
+            s.agent.lock().command.as_deref(),
+            Some("write inlet_cmd — cs (no session)")
+        );
+    }
+
+    /// A fresh heartbeat must NOT swallow a different concurrent
+    /// writer — the second writer stays observable under its own label
+    /// instead of being misattributed to the first one's banner.
+    #[test]
+    fn fresh_heartbeat_does_not_mask_a_foreign_writer() {
+        let s = state();
+        s.record_agent_heartbeat(Some("runtime write".into()), None);
+        s.maybe_attribute_external(None, "write y".into());
+        assert_eq!(
+            s.agent.lock().command.as_deref(),
+            Some("write y (unattributed)")
+        );
+    }
+
+    /// Non-cs writers surface even while an agent session is active:
+    /// the flash always emits an AgentActivity event carrying the
+    /// writer's label alongside the (preserved) session label.
+    #[test]
+    fn foreign_writer_flashes_even_during_a_session() {
+        let s = state();
+        let mut rx = s.event_tx.subscribe();
+        s.start_agent_session("s1".into(), "rebuilding tank".into());
+        let _ = rx.try_recv(); // drain the session-start event
+        s.maybe_attribute_external(Some("mqtt"), "write x".into());
+        let ev = rx.try_recv().expect("flash must emit an event");
+        match ev {
+            AppEvent::AgentActivity(a) => {
+                assert!(a.active);
+                assert_eq!(a.command.as_deref(), Some("write x — mqtt (self-declared)"));
+                assert_eq!(a.session_label.as_deref(), Some("rebuilding tank"));
+            }
+            other => panic!("expected AgentActivity, got {other:?}"),
+        }
+        // The session itself is untouched — the flash is a flash, not
+        // a takeover of the session's narrative.
+        assert!(s.agent.lock().session.is_some());
+    }
+
+    /// The heartbeat channel is `cs`'s announcement path — the server
+    /// stamps the `cs ` prefix on the banner label so the web can
+    /// render labels verbatim without hardcoding the CLI's name.
+    #[test]
+    fn heartbeat_labels_carry_the_cs_prefix_server_side() {
+        let s = state();
+        s.record_agent_heartbeat(Some("runtime write".into()), None);
+        assert_eq!(s.agent.lock().command.as_deref(), Some("cs runtime write"));
+        // A command-less keep-alive doesn't blank the label.
+        s.record_agent_heartbeat(None, Some("sess-1".into()));
+        assert_eq!(s.agent.lock().command.as_deref(), Some("cs runtime write"));
+    }
 }

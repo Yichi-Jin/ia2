@@ -33,10 +33,13 @@ pub(crate) const KINDS: &[(&str, &str)] = &[
         "pous",
         "POU source files (get prints source; set writes it)",
     ),
-    ("devices", "field devices (JSON config docs)"),
+    (
+        "devices",
+        "field devices (JSON config docs; + devices/<n>/describe)",
+    ),
     (
         "edges",
-        "deploy targets (+ edges/<n>/probe|status|logs|scan|system)",
+        "deploy targets (+ edges/<n>/probe|status|logs|scan|system|audit)",
     ),
     ("hmi", "operator screens (JSON docs; see also `cs hmi op`)"),
     ("iomap", "variable ↔ device.channel bindings (one doc)"),
@@ -56,7 +59,12 @@ pub(crate) const KINDS: &[(&str, &str)] = &[
 /// API sub-route. Names can't collide because these segments are
 /// reserved within their kind (an edge literally named `logs` would
 /// need `cs api`).
-const EDGE_SUBREADS: &[&str] = &["probe", "status", "logs", "scan", "system"];
+const EDGE_SUBREADS: &[&str] = &["probe", "status", "logs", "scan", "system", "audit"];
+
+/// Sub-reads for devices — reserved segments like `EDGE_SUBREADS`.
+/// `describe` is the deterministic per-device agent reference file
+/// (ADR-0002); a device literally named `describe` would need `cs api`.
+const DEVICE_SUBREADS: &[&str] = &["describe"];
 
 /// What a quartet verb resolved to. The caller (cmd/quartet.rs) turns
 /// this into HTTP + rendering.
@@ -220,9 +228,18 @@ pub(crate) fn resolve_get(path: &str) -> Result<Plan> {
             if rest.is_empty() {
                 bail!("name a device: `cs get devices/<name>` (list with `cs ls devices`)");
             }
-            Plan::Get {
-                path: format!("/api/devices/{}", url_encode(&joined)),
-                render: Render::Json,
+            let last = rest.last().map(String::as_str).unwrap_or_default();
+            if rest.len() > 1 && DEVICE_SUBREADS.contains(&last) {
+                let name = rest[..rest.len() - 1].join("/");
+                Plan::Get {
+                    path: format!("/api/devices/{}/{last}", url_encode(&name)),
+                    render: Render::Json,
+                }
+            } else {
+                Plan::Get {
+                    path: format!("/api/devices/{}", url_encode(&joined)),
+                    render: Render::Json,
+                }
             }
         }
         "edges" => {
@@ -374,7 +391,18 @@ mod tests {
         assert_eq!(get_url("runtime/snapshot"), "/api/runtime/snapshot");
         assert_eq!(get_url("edges/pi/logs"), "/api/edges/pi/logs");
         assert_eq!(get_url("edges/pi/scan"), "/api/edges/pi/discover");
+        // The write-audit ring reads through the quartet too (ADR-0002).
+        assert_eq!(get_url("edges/pi/audit"), "/api/edges/pi/audit");
         assert_eq!(get_url("devices/plc1"), "/api/devices/plc1");
+        assert_eq!(
+            get_url("devices/plc1/describe"),
+            "/api/devices/plc1/describe"
+        );
+        // Nested device names keep their slashes through the subread.
+        assert_eq!(
+            get_url("devices/plant a/plc1/describe"),
+            "/api/devices/plant%20a%2Fplc1/describe"
+        );
         assert_eq!(get_url("hmi/overview"), "/api/hmi/overview");
     }
 

@@ -52,5 +52,5 @@ pub use types::{
     ModbusWordOrder, MqttNorthbound, NorthboundConfig, OpcuaAccess, OpcuaAuth, OpcuaChannel,
     OpcuaConfig, OpcuaDataType, Pou, PouDecl, PouFile, PouFileSource, PouLanguage, PouType,
     ProgramInstance, ProjectListing, ProjectManifest, ProjectTree, ProjectTreeSkeleton, Protocol,
-    ProtocolConfig, Task, Tasks,
+    ProtocolConfig, Task, Tasks, WriteGovernance, WriteMode, WriteRule,
 };

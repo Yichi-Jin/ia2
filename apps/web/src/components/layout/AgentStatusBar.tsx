@@ -2,7 +2,11 @@ import { useEffect } from "react"
 import { Bot } from "lucide-react"
 
 import { apiFetch } from "@/lib/api"
-import { agentActivityStore, useAgentActivity } from "@/state/agent-activity"
+import {
+  activityLabel,
+  agentActivityStore,
+  useAgentActivity,
+} from "@/state/agent-activity"
 import { useRuntime } from "@/state/runtime"
 
 /**
@@ -57,9 +61,9 @@ export function AgentStatusBar() {
 
   if (!active) return null
 
-  const activity =
-    agent.sessionLabel ??
-    (agent.command ? `cs ${agent.command}` : (agent.recent[0]?.command ?? "working"))
+  // Rendered verbatim from the event payload — the server owns the
+  // label (incl. any `cs` prefix); see `activityLabel`.
+  const activity = activityLabel(agent)
   // Scan period comes from the first configured task — the same number
   // the Monitor pill shows, so the two never disagree.
   const interval = tasks.tasks[0]?.interval_ms

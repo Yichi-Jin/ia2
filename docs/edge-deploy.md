@@ -92,6 +92,10 @@ prompts — the IDE runs `ssh -o BatchMode=yes`).
      success with a footnote;
    - a missing `VERSION=` line from the remote script fails the deploy
      (script drift = state unknown);
+   - a project whose `[governance]` table is invalid (unknown key,
+     `min > max`, non-finite bound) fails at edge runtime start with a
+     loud load error — governance is validated on load, never silently
+     ignored;
    - install_dir vs systemd-unit drift stays a deploy-level `warning`
      field in the report (structured, plus a WARNING line in the log) —
      the files land, but the service will not see them until you
