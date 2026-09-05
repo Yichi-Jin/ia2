@@ -25,7 +25,7 @@ IA2 is built so a coding agent drives it (Claude Code, Cursor, Codex…). **Two 
 npx skills add https://github.com/supcon-international/ia2/tree/main/.claude/skills/industrial-automation-skill
 ```
 
-That's the [vercel-labs/skills](https://github.com/vercel-labs/skills) installer — it drops the skill **and its `references/` + `checklists/`** into `.claude/skills/` (add `-g` for every project, `-a claude-code` to pin the agent).
+That's the [vercel-labs/skills](https://github.com/vercel-labs/skills) installer — it drops the skill **and its `references/` + `checklists/`** where your agent looks: `.claude/skills/` for Claude Code, the [Agent Skills](https://agentskills.io) standard `.agents/skills/` for most others (add `-g` for every project; `-a claude-code`, `-a codex`, `-a kimi-code-cli`, `-a cursor`… to pin the agent).
 
 ### The binaries — `cs` + `ia2-server`
 
@@ -37,6 +37,10 @@ cd ia2 && ./scripts/install-skill.sh
 ```
 
 `scripts/install-skill.sh` builds `cs` + `ia2-server` (plus its `lsp-launcher` sidecar for editor language support) into `~/.local/bin` (it also installs the skill, so it doubles as a no-`npx`, do-everything one-shot). Then:
+
+Already have a clone and only want local agent discovery, with no build or network access? Run `./scripts/install-skill.sh --skill-only`. It copies the complete skill and creates the Codex-native `~/.agents/skills/industrial-automation-skill` discovery link without touching binaries or hardware.
+
+For repository work in Codex, open the **IA2 Git root** as the workspace, or launch with `codex --cd /path/to/ia2`. Codex discovers `AGENTS.md` and repository skills by walking from its current directory up to the Git root; launching from a parent folder that merely contains the nested `ia2` checkout will not load IA2's repository contract.
 
 1. **Start the server:** `ia2-server --bind 127.0.0.1:3001 &`
 2. **Restart your agent session** so it discovers the skill.
@@ -211,23 +215,42 @@ changed port (or a stopped service) gives a clear answer instead of a
 blind failure. A transient EtherCAT bring-up timeout is retried rather
 than left dead until a manual restart. See `docs/edge-deploy.md`.
 
-## Claude Code skill
+## Agent skill (Claude Code · Codex · Kimi Code · Cursor · …)
 
-The repo ships an agent skill at **`.claude/skills/industrial-automation-skill/`**.
-When you open this project in Claude Code, the skill auto-loads on
-PLC/automation work (triggers on "ironplc", "modbus", "structured
-text", "PLC", "cs CLI", etc.) and teaches the agent the whole `cs`
-workflow: the meta-primitive mental model (`ls/get/set/rm` + `api`),
+The repo ships an [Agent Skills](https://agentskills.io)-format skill at
+**`.claude/skills/industrial-automation-skill/`** (canonical copy),
+mirrored at **`.agents/skills/industrial-automation-skill`** — the
+standard path [Codex](https://developers.openai.com/codex/skills), Kimi Code, Cursor, Gemini CLI and others scan.
+The mirror is a committed symlink, so it needs a symlink-capable
+checkout (on Windows: `core.symlinks=true` / Developer Mode) —
+without one, point your agent at the canonical `.claude/skills/`
+copy, which always works.
+Repo-root **`AGENTS.md`** (which `CLAUDE.md` imports) is the working
+contract for changing this repo and points agents whose harness doesn't
+scan skill directories at the skill by hand.
+
+In Claude Code the skill auto-loads on PLC/automation work matching the
+skill's description (words like "IEC 61131-3", "PLC", "Modbus",
+"EtherCAT", "cs CLI"); in
+Codex / Kimi Code it's discovered from `.agents/skills` (implicitly by
+description match, or explicitly as `$industrial-automation-skill` in
+Codex, or `/skill:industrial-automation-skill` in hosts that use that
+syntax). Either way it teaches the agent
+the whole `cs` workflow: the meta-primitive mental model (`ls/get/set/rm` + `api`),
 the mandatory `cs agent run` session pattern, end-to-end recipes
 including scenario simulation and alarms/history, the exact
 device/iomap/tasks/alarms JSON shapes, IEC 61131-3 quirks ironplc
-actually accepts, and a troubleshooting table. It also carries two checklists —
-`first-contact` (find the server port, see what's open) and `handoff`
-(compile clean, release forces, report state) — so an agent starts and
-finishes a task the right way.
+actually accepts, and a troubleshooting table. It also carries three
+checklists: `first-contact` (find the local server port, see what's
+open), `offline-readiness` (separate simulation proof from bench
+evidence), and `handoff` (compile clean, release forces, report state)
+— so an agent starts and finishes a task the right way.
 
 It's committed (not gitignored) so every contributor and CI agent gets
-the same playbook. Skim `SKILL.md` to see what an agent is told.
+the same playbook. Skim `SKILL.md` to see what an agent is told. Run
+`./scripts/check-agent-adaptation.sh` for an offline contract check of
+`AGENTS.md`, skill metadata, repository discovery, and the skill-only
+installer; the check never contacts a server, network, or hardware.
 
 ## Design principles
 
