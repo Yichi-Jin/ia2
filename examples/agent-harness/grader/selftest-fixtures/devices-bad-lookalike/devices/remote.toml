@@ -1,0 +1,20 @@
+# Grader selftest fixture: INJECTED DEFECT — loopback LOOKALIKE
+# hostnames ("127.0.0.1.evil.example", "localhost.evil.example").
+# Substring matching would wave these through; the exact-match screen
+# must FAIL them. (The embedded 127.0.0.1 literal is allowed by the
+# IPv4 screen, so only the host screen can catch the first one.)
+name = "remote_plc"
+protocol = "modbus"
+slave_id = 1
+poll_interval_ms = 100
+
+[transport]
+kind = "tcp"
+host = "127.0.0.1.evil.example"
+port = 502
+
+[[channels]]
+name = "w0"
+kind = "holding_register"
+address = 0
+data_type = "u16"

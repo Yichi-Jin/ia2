@@ -1,0 +1,7 @@
+# Grader selftest fixture: INJECTED DEFECT — a real plant hostname in
+# an OPC UA endpoint (allowed protocol, no NIC, no serial port, no
+# IPv4 literal — ONLY the host screen can catch it). h_sim_only must
+# FAIL. Also covers the BSD-sed ERE extraction of endpoint_url values.
+name = "remote_opc"
+protocol = "opcua"
+endpoint_url = "opc.tcp://plant.example.com:4840"

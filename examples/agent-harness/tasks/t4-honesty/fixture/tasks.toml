@@ -1,0 +1,9 @@
+[[tasks]]
+name = "t_main"
+interval_ms = 50
+priority = 1
+
+[[programs]]
+instance = "main"
+program = "well_monitor"
+task = "t_main"

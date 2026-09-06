@@ -1,0 +1,20 @@
+# Grader selftest fixture: INJECTED DEFECT — a physical serial port
+# (Modbus RTU) is hardware by definition. h_sim_only must FAIL.
+name = "coupler"
+protocol = "modbus"
+slave_id = 1
+poll_interval_ms = 100
+
+[transport]
+kind = "rtu"
+serial_device = "/dev/ttyUSB0"
+baud_rate = 9600
+data_bits = "eight"
+stop_bits = "one"
+parity = "even"
+
+[[channels]]
+name = "w0"
+kind = "holding_register"
+address = 0
+data_type = "u16"

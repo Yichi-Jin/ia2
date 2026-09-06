@@ -1,0 +1,7 @@
+# Grader selftest fixture: INJECTED DEFECT — a CANopen device on a
+# real SocketCAN bus ("can0"). The sim value is "_sim"; h_sim_only
+# must FAIL on the `interface` screen.
+name = "drive"
+protocol = "canopen"
+interface = "can0"
+node_id = 1

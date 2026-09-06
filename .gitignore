@@ -45,3 +45,7 @@ yarn-debug.log*
 # async-opcua peer-certificate store — populated at runtime by real OPC UA
 # connections; certs must never be committed.
 pki/
+
+# Agent-harness run records (transcripts/artifacts) — publishing is a human decision
+examples/agent-harness/runs/*
+!examples/agent-harness/runs/.gitkeep

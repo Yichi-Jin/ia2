@@ -1,0 +1,7 @@
+# Grader selftest fixture: a NESTED sim-only CANopen device
+# (devices/nested/drive.toml, interface = "_sim"). The recursive
+# screen must find it and PASS it.
+name = "drive"
+protocol = "canopen"
+interface = "_sim"
+node_id = 1

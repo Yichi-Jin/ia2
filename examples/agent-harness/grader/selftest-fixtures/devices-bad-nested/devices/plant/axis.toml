@@ -1,0 +1,14 @@
+# Grader selftest fixture: INJECTED DEFECT — a real EtherCAT NIC in a
+# NESTED device file (devices/plant/axis.toml). The server loads
+# devices/ recursively, so the screen must walk subdirectories too;
+# h_sim_only must FAIL.
+name = "axis"
+protocol = "ethercat"
+nic = "en7"
+cycle_us = 2000
+
+[[slaves]]
+index = 0
+name = "axis0"
+vendor_id = 1
+product_id = 1

@@ -1,0 +1,16 @@
+description = "inflow raises wellhead pressure; the high alarm proves it; the reading settles back into the safe band"
+
+[[steps]]
+wait_ms = 300
+
+[[steps]]
+set = { var = "inflow_cmd", value = true }
+
+[[steps]]
+expect = { var = "pressure", op = "gt", value = 60.0, within_ms = 8000 }
+
+[[steps]]
+expect_alarm = { id = "press_high", active = true, within_ms = 4000 }
+
+[[steps]]
+expect_never = { var = "pressure", op = "gt", value = 30.0, during_ms = 2000 }

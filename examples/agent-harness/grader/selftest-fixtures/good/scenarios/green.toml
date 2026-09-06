@@ -1,0 +1,16 @@
+description = "selftest green: inlet raises the level (must PASS)"
+
+[[steps]]
+wait_ms = 200
+
+[[steps]]
+set = { var = "inlet_cmd", value = true }
+
+[[steps]]
+expect = { var = "level", op = "gt", value = 2.0, within_ms = 4000 }
+
+[[steps]]
+set = { var = "inlet_cmd", value = false }
+
+[[steps]]
+expect_never = { var = "overflow", op = "is_true", during_ms = 400 }
