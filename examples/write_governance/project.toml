@@ -1,0 +1,10 @@
+name = "write_governance"
+version = "0.1"
+
+[governance]
+write_mode = "allowlist"
+
+[[governance.rules]]
+variable = "setpoint"
+min = 0.0
+max = 100.0

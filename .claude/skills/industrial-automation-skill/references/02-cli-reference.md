@@ -49,7 +49,7 @@ names are fine (`pous/lib/pid/fb_pid`).
 | `devices/<name>` | full JSON config | `--from cfg.json`; create needs `--protocol modbus\|ethercat\|opcua\|canopen` (or `protocol` in the body) | get → edit → set is THE device workflow |
 | `edges/<name>` | edge config | `--from cfg.json`; create needs `--host user@box` | |
 | `edges/<n>/probe·status·logs·scan·system·audit` | sub-reads over ssh | — | `--query tail=500` on logs; `audit` = the edge's write-audit ring (who claimed to write what — see 03) |
-| `devices/<n>/describe` | deterministic agent reference file: config (passwords redacted), bindings + metadata, related alarms, governance rules | — | read-only; identical project state → identical output |
+| `devices/<n>/describe` | deterministic agent reference file: config (passwords redacted), bindings + metadata, related alarms, governance rules | — | read-only; invalid on-disk config returns an error, never cached rules or empty data |
 | `hmi/<slug>` | full screen document | `--from doc.json`; create takes `--title` | incremental edits: `cs hmi op` (below) |
 | `iomap` · `tasks` · `northbound` · `alarms` | the single config doc | `--from f\|-` (whole-doc replace) | shapes in 06 / 09 |
 | `library` | — (`cs ls library`) | — | `cs rm library/<name>` removes an import |
@@ -191,4 +191,3 @@ cs project open <path> | close
 cs agent run --label "..." -- bash -c '...'    # REQUIRED wrapper for multi-step work
 cs agent enter --label "..." / cs agent leave  # script-managed session variant
 ```
-
