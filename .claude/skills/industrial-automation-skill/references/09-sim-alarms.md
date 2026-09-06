@@ -69,6 +69,11 @@ at the first failed step (later steps depend on earlier state).
 The reference example lives at `examples/sim_smoke/` (tank integrator +
 alarm + scenario); it also runs as a cargo e2e test.
 
+`examples/write_governance/scenarios/clamp.toml` proves governed writes
+above, below and inside the allowed range against a device-free program.
+Scenario `set` uses the governed write path; assert the applied value,
+which may differ from the requested value after clamping.
+
 Pattern for closed-loop plants: the scenario IS the plant for simple
 cases (set inputs, watch outputs). For richer dynamics, add a second
 PROGRAM that computes sensor values from actuator state and schedule it

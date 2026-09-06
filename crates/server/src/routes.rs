@@ -1007,7 +1007,7 @@ fn build_device_description(
         .map_err(|e| ApiError::Internal(format!("device config serializes: {e}")))?;
     redact_secrets(&mut config);
 
-    let iomap = store.read_iomap().unwrap_or_default();
+    let iomap = store.read_iomap()?;
     let mut bindings: Vec<DescribedBinding> = iomap
         .mappings
         .iter()
@@ -1042,21 +1042,16 @@ fn build_device_description(
         .map(|b| format!("{}.{}", b.application, b.variable))
         .collect();
     let mut alarms: Vec<project::AlarmDef> = store
-        .read_alarms()
-        .unwrap_or_default()
+        .read_alarms()?
         .alarms
         .into_iter()
         .filter(|a| bound.contains(a.variable.as_str()) || bound_qualified.contains(&a.variable))
         .collect();
     alarms.sort_by(|a, b| a.id.cmp(&b.id));
 
-    // Same freshness contract as the alarms read above: after a hand-edit
-    // to [governance], this export and the next /api/run must agree. An
-    // invalid on-disk table falls back to the cached copy — /api/run is
-    // the surface that reports it loudly.
-    let governance = store
-        .read_governance()
-        .unwrap_or_else(|_| store.governance().clone());
+    // Invalid configuration must not look like an empty or stale policy.
+    // Describe and the next run use the same on-disk governance.
+    let governance = fresh_governance(store)?;
     let mut write_rules: Vec<project::WriteRule> = governance
         .rules
         .iter()
@@ -3052,6 +3047,19 @@ mod path_resolution_tests {
 mod device_describe_tests {
     use super::*;
     use project::ProjectStore;
+
+    #[test]
+    fn describe_rejects_broken_configuration_instead_of_stale_or_empty_data() {
+        for file in ["project.toml", "iomap.toml", "alarms.toml"] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = ProjectStore::create(dir.path().join("p"), "p").unwrap();
+            store
+                .create_device("plc1", project::Protocol::Modbus)
+                .unwrap();
+            std::fs::write(dir.path().join("p").join(file), "broken = [").unwrap();
+            assert!(build_device_description(&store, "plc1").is_err(), "{file}");
+        }
+    }
 
     #[test]
     fn device_describe_is_deterministic_and_redacts() {

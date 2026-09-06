@@ -1,0 +1,16 @@
+description = "Governed writes reach the program within the declared range"
+
+[[steps]]
+set = { var = "setpoint", value = 150.0 }
+[[steps]]
+expect = { var = "observed", op = "eq", value = 100.0, within_ms = 1000 }
+
+[[steps]]
+set = { var = "setpoint", value = -20.0 }
+[[steps]]
+expect = { var = "observed", op = "eq", value = 0.0, within_ms = 1000 }
+
+[[steps]]
+set = { var = "setpoint", value = 42.0 }
+[[steps]]
+expect = { var = "observed", op = "eq", value = 42.0, within_ms = 1000 }
