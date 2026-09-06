@@ -1,0 +1,8 @@
+# Grader selftest fixture: SIM-ONLY loopback endpoints — an exact
+# 127.0.0.1 endpoint_url and an exact "localhost" host. h_sim_only
+# must PASS these (they are what the exact-match screen exists to
+# allow).
+name = "plc"
+protocol = "opcua"
+endpoint_url = "opc.tcp://127.0.0.1:4840"
+host = "localhost"

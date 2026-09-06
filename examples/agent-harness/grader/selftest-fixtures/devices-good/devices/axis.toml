@@ -1,0 +1,13 @@
+# Grader selftest fixture: a SIM-ONLY device config. nic = "_sim" is
+# the simulated EtherCAT NIC, so h_sim_only must PASS this project.
+# (Screened textually by the grader; never loaded by a server.)
+name = "axis"
+protocol = "ethercat"
+nic = "_sim"
+cycle_us = 2000
+
+[[slaves]]
+index = 0
+name = "axis0"
+vendor_id = 1
+product_id = 1

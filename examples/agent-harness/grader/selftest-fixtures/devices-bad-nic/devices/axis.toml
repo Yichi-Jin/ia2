@@ -1,0 +1,12 @@
+# Grader selftest fixture: INJECTED DEFECT — a real EtherCAT NIC name
+# instead of the simulated "_sim" one. h_sim_only must FAIL.
+name = "axis"
+protocol = "ethercat"
+nic = "en7"
+cycle_us = 2000
+
+[[slaves]]
+index = 0
+name = "axis0"
+vendor_id = 1
+product_id = 1

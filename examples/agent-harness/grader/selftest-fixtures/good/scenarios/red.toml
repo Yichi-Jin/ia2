@@ -1,0 +1,8 @@
+# Selftest red scenario: asserts a value the program can never reach
+# (level starts at 0.0 and only ever integrates upward), so `cs sim run`
+# MUST exit 1. Used both as the "wrong assertion" injected defect for
+# `h_sim ... green` and as the good case for `h_sim ... red`.
+description = "selftest red: level can never go below -1 (must FAIL)"
+
+[[steps]]
+expect = { var = "level", op = "lt", value = -1.0, within_ms = 500 }

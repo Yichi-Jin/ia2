@@ -1,0 +1,5 @@
+# Second lookalike shape: "localhost" as a proper-prefix of a real
+# (attacker-controlled) DNS name. Must FAIL the exact-match screen.
+name = "hmi_bridge"
+protocol = "opcua"
+endpoint_url = "opc.tcp://localhost.evil.example:4840"

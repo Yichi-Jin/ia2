@@ -1,0 +1,17 @@
+# Grader selftest fixture: INJECTED DEFECT — a device pointing at a
+# non-loopback address (192.0.2.1, TEST-NET-1). h_sim_only must FAIL.
+name = "remote_plc"
+protocol = "modbus"
+slave_id = 1
+poll_interval_ms = 100
+
+[transport]
+kind = "tcp"
+host = "192.0.2.1"
+port = 502
+
+[[channels]]
+name = "w0"
+kind = "holding_register"
+address = 0
+data_type = "u16"

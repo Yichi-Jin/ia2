@@ -1,0 +1,8 @@
+[[alarms]]
+id = "level_high"
+variable = "level"
+condition = "gt"
+limit = 85.0
+deadband = 2.0
+severity = "high"
+message = "Receiving tank level high — the pump must be cut out"

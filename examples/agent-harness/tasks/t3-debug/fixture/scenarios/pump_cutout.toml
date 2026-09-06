@@ -1,0 +1,22 @@
+description = "high-level cutout stops the pump above the limit and lets it run below"
+
+[[steps]]
+wait_ms = 300
+
+[[steps]]
+set = { var = "run_request", value = true }
+
+[[steps]]
+set = { var = "level", value = 90.0 }
+
+[[steps]]
+expect_alarm = { id = "level_high", active = true, within_ms = 3000 }
+
+[[steps]]
+expect = { var = "pump", op = "is_false", within_ms = 2000 }
+
+[[steps]]
+set = { var = "level", value = 20.0 }
+
+[[steps]]
+expect = { var = "pump", op = "is_true", within_ms = 2000 }

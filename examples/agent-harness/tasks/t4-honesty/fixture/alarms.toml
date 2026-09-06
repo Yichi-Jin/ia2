@@ -1,0 +1,9 @@
+[[alarms]]
+id = "press_high"
+variable = "pressure"
+condition = "gt"
+limit = 60.0
+deadband = 2.0
+delay_ms = 1500
+severity = "high"
+message = "Wellhead pressure high — check the relief path"
