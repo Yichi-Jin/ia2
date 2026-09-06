@@ -646,6 +646,34 @@ fn pou_gen_vars(store: &ProjectStore, pou_path: &str) -> Vec<GenVar> {
     }
 }
 
+/// The applications one POU file answers to, lowercased: the PROGRAM
+/// names it declares plus every tasks.toml instance of those PROGRAMs.
+/// `Mapping.application` names a PROGRAM instance (case-insensitive —
+/// the same routing the runtime applies), and instance == PROGRAM name
+/// in the common single-instance layout, so both spellings resolve.
+fn pou_applications(store: &ProjectStore, pou_path: &str, tasks: &project::Tasks) -> Vec<String> {
+    let Ok(source) = store.read_pou_source(pou_path) else {
+        return Vec::new();
+    };
+    let lang = store
+        .pou_file_language(pou_path)
+        .unwrap_or(project::PouLanguage::St);
+    let programs: Vec<String> = ironplc_bridge::extract_pou_declarations(&source, lang)
+        .into_iter()
+        .filter(|d| d.type_ == project::PouType::Program)
+        .map(|d| d.name.to_ascii_lowercase())
+        .collect();
+    let mut apps = programs.clone();
+    for pi in &tasks.programs {
+        if programs.iter().any(|p| p.eq_ignore_ascii_case(&pi.program)) {
+            apps.push(pi.instance.to_ascii_lowercase());
+        }
+    }
+    apps.sort();
+    apps.dedup();
+    apps
+}
+
 fn build_generated(store: &ProjectStore, title: &str) -> Result<HmiDoc, ApiError> {
     const COL_W: i32 = 300;
     const ROW_H: i32 = 34;
@@ -704,6 +732,33 @@ fn build_generated(store: &ProjectStore, title: &str) -> Result<HmiDoc, ApiError
     // Variable → declared type, project-wide: the equipment sections
     // below pick indicator-vs-value per mapped variable from this.
     let mut var_types: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    // Optional per-variable metadata from the iomap (unit / range / NL
+    // description) — the generated screen inherits it so the operator
+    // sees engineering context instead of bare tag names. Keyed by
+    // (application, variable), NOT bare variable name: two POUs sharing
+    // a setpoint name must never inherit each other's engineering range.
+    // First mapping for a key wins; mappings are in file order, so this
+    // stays deterministic.
+    let iomap = store.read_iomap().unwrap_or_default();
+    let mut var_meta: std::collections::HashMap<(String, String), &project::Mapping> =
+        std::collections::HashMap::new();
+    for m in &iomap.mappings {
+        var_meta
+            .entry((m.application.to_ascii_lowercase(), m.variable.clone()))
+            .or_insert(m);
+    }
+    // Applications resolve through tasks.toml (see `pou_applications`),
+    // so read the schedule once up front.
+    let gen_tasks = store.read_tasks().ok().flatten().unwrap_or_default();
+    // Metadata for a variable as seen from one POU file: try each
+    // application the file answers to, then fall back to a mapping
+    // whose application is empty (the runtime routes those to the sole
+    // unit). Variable names match exactly, like the old behaviour.
+    let lookup_meta = |apps: &[String], name: &str| -> Option<&project::Mapping> {
+        apps.iter()
+            .find_map(|app| var_meta.get(&(app.clone(), name.to_string())).copied())
+            .or_else(|| var_meta.get(&(String::new(), name.to_string())).copied())
+    };
 
     for pou_path in store.list_pou_paths()? {
         // Library blocks are implementation detail, not operator surface.
@@ -714,6 +769,7 @@ fn build_generated(store: &ProjectStore, title: &str) -> Result<HmiDoc, ApiError
         if vars.is_empty() {
             continue;
         }
+        let apps = pou_applications(store, &pou_path, &gen_tasks);
         for v in &vars {
             var_types.insert(v.name.clone(), v.type_name.clone());
         }
@@ -740,6 +796,7 @@ fn build_generated(store: &ProjectStore, title: &str) -> Result<HmiDoc, ApiError
             if v.direction == "fb_instance" {
                 continue;
             }
+            let meta = lookup_meta(&apps, &v.name);
             let id = unique_id(format!("{}_{}", slug, v.name.to_ascii_lowercase()));
             let upper = v.type_name.to_ascii_uppercase();
             let mut node = if upper.starts_with("BOOL") {
@@ -764,8 +821,11 @@ fn build_generated(store: &ProjectStore, title: &str) -> Result<HmiDoc, ApiError
                 let mut n = mk(
                     id,
                     HmiNodeKind::Input {
-                        label: Some(v.name.clone()),
-                        unit: None,
+                        label: Some(
+                            meta.and_then(|m| m.description.clone())
+                                .unwrap_or_else(|| v.name.clone()),
+                        ),
+                        unit: meta.and_then(|m| m.unit.clone()),
                     },
                     sec_x,
                     y,
@@ -778,8 +838,8 @@ fn build_generated(store: &ProjectStore, title: &str) -> Result<HmiDoc, ApiError
                     "commit".into(),
                     HmiAction::SetValue {
                         variable: v.name.clone(),
-                        min: None,
-                        max: None,
+                        min: meta.and_then(|m| m.min),
+                        max: meta.and_then(|m| m.max),
                         confirm: true,
                     },
                 );
@@ -789,8 +849,13 @@ fn build_generated(store: &ProjectStore, title: &str) -> Result<HmiDoc, ApiError
                 let mut n = mk(
                     id,
                     HmiNodeKind::Value {
-                        label: Some(v.name.clone()),
-                        unit: None,
+                        // Description promotes to the label, same as the
+                        // Input branch above and the equipment section.
+                        label: Some(
+                            meta.and_then(|m| m.description.clone())
+                                .unwrap_or_else(|| v.name.clone()),
+                        ),
+                        unit: meta.and_then(|m| m.unit.clone()),
                     },
                     sec_x,
                     y,
@@ -815,7 +880,6 @@ fn build_generated(store: &ProjectStore, title: &str) -> Result<HmiDoc, ApiError
     // inputs read as process values, outputs echo the commanded state.
     // Deterministic like the POU sections; masonry continues in the same
     // columns.
-    let iomap = store.read_iomap().unwrap_or_default();
     if !iomap.mappings.is_empty() {
         for dev in store.list_devices()? {
             let mapped: Vec<&project::Mapping> = iomap
@@ -882,8 +946,10 @@ fn build_generated(store: &ProjectStore, title: &str) -> Result<HmiDoc, ApiError
                     let mut n = mk(
                         id,
                         HmiNodeKind::Value {
-                            label: Some(m.variable.clone()),
-                            unit: None,
+                            label: Some(
+                                m.description.clone().unwrap_or_else(|| m.variable.clone()),
+                            ),
+                            unit: m.unit.clone(),
                         },
                         sec_x,
                         y,
@@ -997,6 +1063,157 @@ mod tests {
         let unique: std::collections::HashSet<&String> = ids.iter().collect();
         assert_eq!(ids.len(), unique.len(), "duplicate node ids in {ids:?}");
         // The generated doc must pass the same gate PUT enforces.
+        assert_eq!(structural_errors(&validate_hmi(&doc)), None);
+    }
+
+    /// iomap metadata (unit / range / NL description) flows into the
+    /// generated screen: setpoint inputs inherit min/max/unit, value
+    /// nodes inherit unit, and descriptions become operator labels.
+    #[test]
+    fn generate_inherits_iomap_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_in(dir.path());
+        std::fs::write(
+            dir.path().join("p/pous/main.st"),
+            "PROGRAM main\nVAR\n  level_sp : REAL;\n  level : REAL;\nEND_VAR\nlevel := level_sp;\nEND_PROGRAM\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("p/devices/plc1.toml"),
+            "name = \"plc1\"\nprotocol = \"modbus\"\nslave_id = 1\npoll_interval_ms = 100\n\n[transport]\nkind = \"tcp\"\nhost = \"127.0.0.1\"\nport = 502\n\n[[channels]]\nname = \"ch0\"\nkind = \"holding_register\"\naddress = 0\ndata_type = \"u16\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("p/iomap.toml"),
+            "[[mappings]]\napplication = \"main\"\nvariable = \"level_sp\"\ndirection = \"output\"\ndevice = \"plc1\"\nchannel = \"ch0\"\nunit = \"%\"\nmin = 0.0\nmax = 100.0\ndescription = \"Tank level setpoint\"\n\n[[mappings]]\napplication = \"main\"\nvariable = \"level\"\ndirection = \"input\"\ndevice = \"plc1\"\nchannel = \"ch0\"\nunit = \"%\"\ndescription = \"Tank level\"\n",
+        )
+        .unwrap();
+
+        let doc = build_generated(&store, "t").unwrap();
+        let mut nodes = Vec::new();
+        fn walk(n: &HmiNode, out: &mut Vec<HmiNode>) {
+            out.push(n.clone());
+            if let HmiNodeKind::Group { children, .. } = &n.kind {
+                for c in children {
+                    walk(c, out);
+                }
+            }
+        }
+        walk(&doc.root, &mut nodes);
+
+        // The *_sp variable became an Input whose commit action carries
+        // the declared range and whose label is the NL description.
+        let input = nodes
+            .iter()
+            .find(|n| matches!(&n.kind, HmiNodeKind::Input { .. }))
+            .expect("a setpoint input node");
+        match &input.kind {
+            HmiNodeKind::Input { label, unit } => {
+                assert_eq!(label.as_deref(), Some("Tank level setpoint"));
+                assert_eq!(unit.as_deref(), Some("%"));
+            }
+            _ => unreachable!(),
+        }
+        match input.action.get("commit") {
+            Some(HmiAction::SetValue { min, max, .. }) => {
+                assert_eq!(*min, Some(0.0));
+                assert_eq!(*max, Some(100.0));
+            }
+            other => panic!("expected SetValue commit action, got {other:?}"),
+        }
+
+        // The plain numeric variable inherits its unit AND its NL
+        // description as label everywhere it is shown (per-POU section
+        // and equipment section alike).
+        let values: Vec<(Option<String>, Option<String>)> = nodes
+            .iter()
+            .filter_map(|n| match &n.kind {
+                HmiNodeKind::Value { label, unit } => Some((label.clone(), unit.clone())),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            values.iter().all(|(_, u)| u.as_deref() == Some("%")),
+            "every value node inherits the declared unit: {values:?}"
+        );
+        // Value nodes appear for `level` (POU + equipment section) and
+        // for `level_sp` (equipment section echoes the commanded state);
+        // each one carries its own mapping's description — never the
+        // bare tag name.
+        assert!(
+            values.iter().all(|(l, _)| matches!(
+                l.as_deref(),
+                Some("Tank level") | Some("Tank level setpoint")
+            )),
+            "every value node promotes the description to its label: {values:?}"
+        );
+        assert_eq!(structural_errors(&validate_hmi(&doc)), None);
+    }
+
+    /// Two PROGRAMs sharing a setpoint name with conflicting iomap
+    /// metadata: each POU section inherits ITS OWN application's
+    /// engineering range — metadata is keyed by (application, variable),
+    /// so nothing bleeds across POUs.
+    #[test]
+    fn generate_metadata_does_not_bleed_across_pous() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_in(dir.path());
+        std::fs::write(
+            dir.path().join("p/pous/main.st"),
+            "PROGRAM main\nVAR\n  level_sp : REAL;\nEND_VAR\nlevel_sp := level_sp;\nEND_PROGRAM\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("p/pous/aux_unit.st"),
+            "PROGRAM aux_unit\nVAR\n  level_sp : REAL;\nEND_VAR\nlevel_sp := level_sp;\nEND_PROGRAM\n",
+        )
+        .unwrap();
+        // main's setpoint runs 0–100 %; aux_unit's runs 0–10 bar. The
+        // mappings deliberately share the bare variable name.
+        std::fs::write(
+            dir.path().join("p/iomap.toml"),
+            "[[mappings]]\napplication = \"main\"\nvariable = \"level_sp\"\ndirection = \"output\"\ndevice = \"plc1\"\nchannel = \"ch0\"\nunit = \"%\"\nmin = 0.0\nmax = 100.0\ndescription = \"Main tank level setpoint\"\n\n[[mappings]]\napplication = \"aux_unit\"\nvariable = \"level_sp\"\ndirection = \"output\"\ndevice = \"plc1\"\nchannel = \"ch1\"\nunit = \"bar\"\nmin = 0.0\nmax = 10.0\ndescription = \"Aux tank level setpoint\"\n",
+        )
+        .unwrap();
+
+        let doc = build_generated(&store, "t").unwrap();
+        let mut nodes = Vec::new();
+        fn walk(n: &HmiNode, out: &mut Vec<HmiNode>) {
+            out.push(n.clone());
+            if let HmiNodeKind::Group { children, .. } = &n.kind {
+                for c in children {
+                    walk(c, out);
+                }
+            }
+        }
+        walk(&doc.root, &mut nodes);
+
+        // One Input per POU section (no device file on disk, so no
+        // equipment sections); identify them by their section-slugged id.
+        let range_of = |id_prefix: &str| -> (Option<f64>, Option<f64>, Option<String>) {
+            let n = nodes
+                .iter()
+                .find(|n| {
+                    n.id.starts_with(id_prefix) && matches!(&n.kind, HmiNodeKind::Input { .. })
+                })
+                .unwrap_or_else(|| panic!("no input node with id prefix {id_prefix}"));
+            let unit = match &n.kind {
+                HmiNodeKind::Input { unit, .. } => unit.clone(),
+                _ => unreachable!(),
+            };
+            match n.action.get("commit") {
+                Some(HmiAction::SetValue { min, max, .. }) => (*min, *max, unit),
+                other => panic!("expected SetValue commit action, got {other:?}"),
+            }
+        };
+        let (main_min, main_max, main_unit) = range_of("main");
+        let (aux_min, aux_max, aux_unit) = range_of("aux_unit");
+        assert_eq!((main_min, main_max), (Some(0.0), Some(100.0)));
+        assert_eq!(main_unit.as_deref(), Some("%"));
+        // The regression this pins: aux_unit's operator input must NOT
+        // inherit main's 0–100 range (10x too wide for a 0–10 bar loop).
+        assert_eq!((aux_min, aux_max), (Some(0.0), Some(10.0)));
+        assert_eq!(aux_unit.as_deref(), Some("bar"));
         assert_eq!(structural_errors(&validate_hmi(&doc)), None);
     }
 

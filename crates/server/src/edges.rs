@@ -357,27 +357,88 @@ pub async fn fetch_edge_json(
 //  Online debug control — proxy pause/step/write/force to the edge
 // ============================================================
 
+/// Error from proxying an online-debug op to the edge runtime.
+/// `Status` carries the edge's own non-2xx answer so the route can
+/// replay status + body VERBATIM (ADR-0002 truthfulness: a governance
+/// 403 on the edge must still be a 403 after the ssh hop — collapsing
+/// it into a 500 would misreport a policy denial as an infrastructure
+/// failure). `Transport` is everything that prevented an HTTP
+/// conversation with the edge (ssh, curl, an unparseable response).
+#[derive(Debug, PartialEq)]
+pub enum EdgeRuntimeError {
+    Status { code: u16, body: String },
+    Transport(String),
+}
+
 /// POST a JSON body to an edge runtime control endpoint over ssh+curl
 /// (`pause` / `resume` / `step` / `write` / `force` / `unforce`). The
 /// caller must whitelist `path` — it's interpolated into the remote
-/// command. Single quotes in the body are escaped for the shell.
-pub async fn post_edge_runtime(
+/// command. Single quotes in the body are escaped for the shell. The
+/// remote curl appends the HTTP status on a trailing line (`-w`) so
+/// the edge's own 4xx/5xx answers come back typed instead of being
+/// collapsed into a transport error.
+pub async fn proxy_edge_runtime_op(
     edge: &Edge,
     path: &str,
     body: &serde_json::Value,
-) -> Result<serde_json::Value, String> {
+    origin: Option<&str>,
+) -> Result<serde_json::Value, EdgeRuntimeError> {
     let body_str = body.to_string().replace('\'', r"'\''");
+    let origin_header = origin_header_arg(origin);
     let resp = edge_runtime_curl(edge, |port| {
         format!(
-            "curl --silent --max-time 4 -X POST -H 'Content-Type: application/json' \
-             -d '{body_str}' http://127.0.0.1:{port}/{path}"
+            "curl --silent --max-time 4 -w '\\n%{{http_code}}' -X POST \
+             -H 'Content-Type: application/json' \
+             {origin_header}-d '{body_str}' http://127.0.0.1:{port}/{path}"
         )
     })
-    .await?;
-    // The edge returns JSON on success; on a 4xx/5xx curl still exits 0
-    // and the body is the plain-text error — surface that.
-    serde_json::from_str::<serde_json::Value>(&resp)
-        .map_err(|_| format!("edge runtime: {}", first_line(&resp)))
+    .await
+    .map_err(EdgeRuntimeError::Transport)?;
+    parse_edge_runtime_response(&resp)
+}
+
+/// Build the `-H 'x-ia2-origin: …'` fragment for the remote curl. The
+/// header value is interpolated into a remote shell command, so it
+/// must be shell-safe — but a non-empty label is SANITIZED (via the
+/// shared `state::sanitize_origin`: `[A-Za-z0-9._-]`, 64-char cap),
+/// never silently dropped. Dropping it would make the server-side
+/// overlay (which saw the declared origin) and the edge's audit ring
+/// (which would record "anonymous") disagree about the same write.
+fn origin_header_arg(origin: Option<&str>) -> String {
+    origin
+        .and_then(crate::state::sanitize_origin)
+        .map(|o| format!("-H 'x-ia2-origin: {o}' "))
+        .unwrap_or_default()
+}
+
+/// Interpret the `<body>\n<status>` shape produced by the remote
+/// curl's `-w '\n%{http_code}'`. Split out of `proxy_edge_runtime_op`
+/// so the status passthrough is unit-testable without an ssh hop.
+fn parse_edge_runtime_response(resp: &str) -> Result<serde_json::Value, EdgeRuntimeError> {
+    let Some((body, code)) = resp
+        .trim_end()
+        .rsplit_once('\n')
+        .and_then(|(body, code)| Some((body, code.trim().parse::<u16>().ok()?)))
+    else {
+        return Err(EdgeRuntimeError::Transport(format!(
+            "edge runtime answered without a status marker: {}",
+            first_line(resp)
+        )));
+    };
+    if (200..300).contains(&code) {
+        // The edge returns JSON on every 2xx.
+        serde_json::from_str::<serde_json::Value>(body).map_err(|e| {
+            EdgeRuntimeError::Transport(format!(
+                "unexpected edge runtime body: {} ({e})",
+                first_line(body)
+            ))
+        })
+    } else {
+        Err(EdgeRuntimeError::Status {
+            code,
+            body: body.trim().to_string(),
+        })
+    }
 }
 
 // ============================================================
@@ -656,7 +717,7 @@ fn strip_pax_keyword_warnings(stderr: &str) -> String {
 /// double-quote escaping still lets `$(…)` / backticks run — this is safe
 /// for interpolating arbitrary values into a remote shell script. An
 /// embedded single quote is closed, escaped, and reopened (`'\''`), the
-/// same trick `post_edge_runtime` uses for the curl body.
+/// same trick `proxy_edge_runtime_op` uses for the curl body.
 fn sh_squote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
@@ -1125,6 +1186,83 @@ mod tests {
         assert_eq!(probe.scan_count, Some(9));
         assert_eq!(probe.fieldbus_healthy, None, "unknown, not false");
         assert!(probe.unhealthy_devices.is_empty());
+    }
+
+    /// The proxy must carry the edge's own status through — a
+    /// governance 403 stays a 403 with the edge's error text verbatim
+    /// (ADR-0002: all four write paths report policy denials the same
+    /// way), and a 409 stays a 409 (api.md: "All return 409 when
+    /// nothing is running" includes the proxy path).
+    #[test]
+    fn edge_runtime_response_keeps_status_and_body() {
+        assert_eq!(
+            parse_edge_runtime_response("{\"ok\":true,\"value\":10}\n200").unwrap(),
+            serde_json::json!({ "ok": true, "value": 10 })
+        );
+        assert_eq!(
+            parse_edge_runtime_response("write to 'x' rejected by project governance\n403"),
+            Err(EdgeRuntimeError::Status {
+                code: 403,
+                body: "write to 'x' rejected by project governance".into(),
+            })
+        );
+        assert_eq!(
+            parse_edge_runtime_response("scan loop has stopped\n409"),
+            Err(EdgeRuntimeError::Status {
+                code: 409,
+                body: "scan loop has stopped".into(),
+            })
+        );
+        // Multi-line error bodies survive intact — only the trailing
+        // status marker is consumed.
+        assert_eq!(
+            parse_edge_runtime_response("line one\nline two\n500"),
+            Err(EdgeRuntimeError::Status {
+                code: 500,
+                body: "line one\nline two".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn edge_runtime_response_without_status_marker_is_a_transport_fault() {
+        let err = parse_edge_runtime_response("<html>502 Bad Gateway</html>").unwrap_err();
+        assert!(matches!(err, EdgeRuntimeError::Transport(m) if m.contains("status marker")));
+        // 2xx with a non-JSON body is also a fault of the hop, not a
+        // fabricated edge answer.
+        let err = parse_edge_runtime_response("not json\n200").unwrap_err();
+        assert!(matches!(err, EdgeRuntimeError::Transport(m) if m.contains("unexpected")));
+    }
+
+    /// A declared origin is sanitized for the remote shell, never
+    /// silently dropped — otherwise the edge audit records "anonymous"
+    /// for a write the server-side overlay attributed to a label.
+    #[test]
+    fn origin_header_is_sanitized_not_dropped() {
+        assert_eq!(origin_header_arg(Some("gui")), "-H 'x-ia2-origin: gui' ");
+        assert_eq!(
+            origin_header_arg(Some("a_b.c-d")),
+            "-H 'x-ia2-origin: a_b.c-d' "
+        );
+        // Space and shell metacharacters are removed, label kept.
+        assert_eq!(
+            origin_header_arg(Some("my bridge")),
+            "-H 'x-ia2-origin: mybridge' "
+        );
+        assert_eq!(
+            origin_header_arg(Some("a'b$(reboot)`x`")),
+            "-H 'x-ia2-origin: abrebootx' "
+        );
+        // Over-long labels are capped at 64 chars.
+        let long = "x".repeat(70);
+        assert_eq!(
+            origin_header_arg(Some(&long)),
+            format!("-H 'x-ia2-origin: {}' ", "x".repeat(64))
+        );
+        // Absent or empty-after-sanitize → no header at all.
+        assert_eq!(origin_header_arg(None), "");
+        assert_eq!(origin_header_arg(Some("")), "");
+        assert_eq!(origin_header_arg(Some("!!!")), "");
     }
 
     #[test]

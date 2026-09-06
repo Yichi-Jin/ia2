@@ -15,6 +15,9 @@ pub enum ApiError {
     /// validation (e.g. an HMI ops batch whose result has structural
     /// errors).
     Unprocessable(String),
+    /// 403 — the request was understood but project policy forbids it
+    /// (write governance denied the write).
+    Forbidden(String),
     Internal(String),
 }
 
@@ -59,6 +62,9 @@ impl From<ironplc_bridge::RuntimeWriteError> for ApiError {
             E::UnknownVariable(n) => Self::NotFound(format!("variable '{n}' not declared")),
             E::Disconnected => Self::Conflict("scan loop has stopped".into()),
             E::Vm(msg) => Self::Internal(msg),
+            E::GovernanceDenied(n) => {
+                Self::Forbidden(format!("write to '{n}' rejected by project governance"))
+            }
         }
     }
 }
@@ -71,8 +77,31 @@ impl IntoResponse for ApiError {
             Self::Conflict(s) => (StatusCode::CONFLICT, s),
             Self::BadRequest(s) => (StatusCode::BAD_REQUEST, s),
             Self::Unprocessable(s) => (StatusCode::UNPROCESSABLE_ENTITY, s),
+            Self::Forbidden(s) => (StatusCode::FORBIDDEN, s),
             Self::Internal(s) => (StatusCode::INTERNAL_SERVER_ERROR, s),
         };
         (status, body).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The negative path the governance feature exists for: a policy
+    /// denial is a 403 with an explanatory body — not a 404, not a
+    /// 500 — matching the edge runtime's own mapping so all four
+    /// write paths report denials identically (ADR-0002).
+    #[test]
+    fn governance_denied_maps_to_forbidden_403() {
+        let api: ApiError = ironplc_bridge::RuntimeWriteError::GovernanceDenied(
+            "x (write_mode = allowlist, no rule allows it)".into(),
+        )
+        .into();
+        assert!(
+            matches!(&api, ApiError::Forbidden(msg) if msg.contains("governance")),
+            "expected Forbidden with a governance message, got {api:?}"
+        );
+        assert_eq!(api.into_response().status(), StatusCode::FORBIDDEN);
     }
 }

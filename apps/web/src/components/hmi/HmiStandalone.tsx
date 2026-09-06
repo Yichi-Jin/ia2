@@ -28,6 +28,7 @@ import {
   type EdgeStatus,
   type PanelTone,
 } from "@/components/hmi/panel-health"
+import { panelFetch } from "@/components/hmi/panel-fetch"
 import { useThemeToggle } from "@/lib/dark-mode"
 import { cn } from "@/lib/utils"
 import { encodeForWrite } from "@/lib/write-encoding"
@@ -37,7 +38,7 @@ import type { HistoryResponse } from "@/types/generated/HistoryResponse"
 import type { HmiListEntry } from "@/types/generated/HmiListEntry"
 
 async function jget<T>(url: string): Promise<T> {
-  const res = await fetch(url)
+  const res = await panelFetch(url)
   if (!res.ok) {
     throw new Error(`${res.status}: ${(await res.text()) || url}`)
   }
@@ -147,7 +148,10 @@ export function HmiStandalone() {
           value: encodeForWrite(value, typeName),
         }
         if (pulseMs != null) body["pulse_ms"] = pulseMs
-        const res = await fetch("/write", {
+        // panelFetch stamps X-IA2-Origin: hmi — the edge audit ring
+        // attributes this write to the operator panel, not an
+        // anonymous script (ADR-0002).
+        const res = await panelFetch("/write", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(body),
@@ -169,7 +173,10 @@ export function HmiStandalone() {
         ),
       alarms: () => jget<AlarmState[]>("/alarms"),
       ackAlarm: async (id) => {
-        const res = await fetch(`/alarms/${encodeURIComponent(id)}/ack`, {
+        // Same attribution header as /write, for parity. Acks are not
+        // in the edge audit ring today (it covers writes/forces); the
+        // header keeps the panel honest wherever origins ARE recorded.
+        const res = await panelFetch(`/alarms/${encodeURIComponent(id)}/ack`, {
           method: "POST",
         })
         if (!res.ok) {

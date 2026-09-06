@@ -1,6 +1,6 @@
 ---
 name: industrial-automation-skill
-description: Use when the user is doing PLC programming or industrial-automation engineering work via the IA2 stack — IEC 61131-3 source (ST / LD / FBD / SFC), device wiring over Modbus TCP/RTU, EtherCAT, OPC UA or CANopen, runtime debugging (force / pause / step), alarms and history, scenario simulation (`cs sim`), or deploying programs to edge controllers. The CLI binary is `cs`. Trigger words include "ia2", "cs CLI", "ironplc", "iec 61131", "structured text", ".st file", "ladder logic", "function block", "modbus", "rtu", "ethercat", "opc ua", "opcua", "canopen", "socketcan", "sdo", "pdo", "node id", "scan loop", "VAR RETAIN", "tasks.toml", "iomap", "alarms.toml", "PLC", "edge runtime", "PROGRAM", "FUNCTION_BLOCK", "TON / TOF / R_TRIG". Do NOT trigger this skill for general embedded firmware, generic web backends, or unrelated industrial protocols (BACnet, PROFINET — out of scope today; northbound MQTT is covered only as IA2's own publisher).
+description: Use IA2 to author, validate, simulate, debug, and deploy IEC 61131-3 PLC projects through the cs CLI and HTTP API, including ST, LD, FBD, SFC, iomap, Modbus, EtherCAT, OPC UA, CANopen, alarms, HMI, and edge runtime work. Do not use for generic embedded firmware or industrial protocols outside IA2.
 ---
 
 # Industrial Automation (IA2) — Agent Skill
@@ -17,11 +17,12 @@ Contracts you can rely on (and must preserve when reporting):
 
 ## How to use this skill
 
-1. **First contact in a session** — run through `checklists/first-contact.md`. Three things to settle before any work:
+1. **Choose the execution lane before touching a runtime.** If hardware is unavailable or the user asks for offline preparation, read `checklists/offline-readiness.md` first. Keep all work local, do not probe or deploy to an edge, and report hardware-dependent claims as pending bench evidence.
+2. **First contact in a session** — run through `checklists/first-contact.md`. Three things to settle before any runtime work:
    - **Is the toolchain installed?** `cs` + `ia2-server` are Rust binaries this skill drives. If the skill was installed standalone (via `npx skills`) and `cs` isn't on `PATH`, build them once: `git clone --recursive https://github.com/supcon-international/ia2 && cd ia2 && ./scripts/install-skill.sh` (needs the Rust toolchain — rustup.rs).
    - **Where is the server?** `cs` defaults to `http://127.0.0.1:3001`; if nothing answers `cs api GET /health`, start one: `ia2-server --bind 127.0.0.1:3001 &` (or discover a non-default port — see the checklist).
    - **Which projects are open?** `cs ls projects`; pass `--project NAME` if more than one.
-2. **For any multi-step work, wrap it in a session.** This is not optional. See `references/03-agent-sessions.md`:
+3. **For any multi-step work, wrap it in a session.** This is not optional. See `references/03-agent-sessions.md`:
    ```
    cs agent run --label "what I'm doing" --server "$SRV" -- bash -c '
      cs --project foo set pous/bar.st --from - <<EOF ... EOF
@@ -29,9 +30,9 @@ Contracts you can rely on (and must preserve when reporting):
    '
    ```
    Without the wrapper, the IDE's takeover banner flickers between every mutating command. With it, the banner stays steady with your `--label` text.
-3. **Prove logic before hardware.** The canonical loop is `cs check` → `cs project check` → **`cs sim run <scenario>`** → deploy. Write a scenario for anything you generate that has behaviour worth asserting (fills, interlocks, alarm raising) — `references/09-sim-alarms.md`. Author `alarms.toml` alongside the logic: a program that can misbehave silently is half-delivered.
-4. **Match the user's intent to a workflow recipe** in `references/04-workflows.md` — new project, add a POU, devices + iomap + tasks, validate + run, sim, debug, alarms/history, deploy. Operator screens: `references/08-hmi.md` (`cs hmi generate` baseline → `cs hmi op` incremental edits, rendered live). Pattern-match before improvising.
-5. **Before claiming "done", run `checklists/handoff.md`** — compile clean, sim green (when a scenario exists), forces released, standing alarms explained, runtime state reported.
+4. **Prove logic before hardware.** The canonical loop is `cs check` → `cs project check` → **`cs sim run <scenario>`** → deploy. Write a scenario for anything you generate that has behaviour worth asserting (fills, interlocks, alarm raising) — `references/09-sim-alarms.md`. Author `alarms.toml` alongside the logic: a program that can misbehave silently is half-delivered.
+5. **Match the user's intent to a workflow recipe** in `references/04-workflows.md` — new project, add a POU, devices + iomap + tasks, validate + run, sim, debug, alarms/history, deploy. Operator screens: `references/08-hmi.md` (`cs hmi generate` baseline → `cs hmi op` incremental edits, rendered live). Pattern-match before improvising.
+6. **Before claiming "done", run `checklists/handoff.md`** — compile clean, sim green (when a scenario exists), forces released, standing alarms explained, runtime state reported.
 
 ## The one-paragraph version
 

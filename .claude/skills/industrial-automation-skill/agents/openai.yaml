@@ -1,0 +1,4 @@
+interface:
+  display_name: "IA2 Industrial Automation"
+  short_description: "Engineer and simulate IA2 PLC projects safely"
+  default_prompt: "Use $industrial-automation-skill to prepare and validate an IA2 PLC project offline before hardware testing."

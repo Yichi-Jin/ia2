@@ -1,6 +1,6 @@
 # First contact checklist
 
-Run this the first time you touch IA2 in a session, before any real work. Three unknowns to resolve: where's the `cs` binary, where's the server, and what's open.
+Run this before using the IA2 runtime in a session. Repository-only maintenance does not require a server. For explicitly offline preparation, first read `offline-readiness.md`, stay on loopback, and do not probe or discover hardware. Three runtime unknowns remain: where's the `cs` binary, where's the server, and what's open.
 
 ## 1. Locate the `cs` binary
 

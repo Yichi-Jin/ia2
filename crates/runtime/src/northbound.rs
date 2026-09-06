@@ -29,6 +29,9 @@ pub struct NorthboundCtx {
     pub project_name: String,
     pub latest: Arc<Mutex<Option<VarSnapshot>>>,
     pub handle: ProgramHandle,
+    /// Write-audit ring shared with the HTTP handlers — northbound
+    /// writes are recorded with origin `mqtt` (ADR-0002 attribution).
+    pub audit: crate::AuditLog,
 }
 
 /// Spawn the northbound task. Returns immediately; the task owns the
@@ -188,9 +191,27 @@ async fn handle_write(ctx: &NorthboundCtx, payload: &[u8]) {
             },
         }
     };
-    match ctx.handle.write_variable(&req.name, bits).await {
-        Ok(_) => tracing::info!(name = %req.name, value = %req.value, "northbound write applied"),
-        Err(e) => tracing::warn!(name = %req.name, %e, "northbound write failed"),
+    let result = ctx.handle.write_variable(&req.name, bits).await;
+    // The broker gets no result topic (northbound is a data path), so
+    // the audit entry is the ONLY record of what the platform asked
+    // versus what governance applied — record both sides.
+    let (applied, outcome) = crate::audit_outcome(bits, &result);
+    crate::record_audit(
+        &ctx.audit,
+        "mqtt",
+        "write",
+        &req.name,
+        Some(bits),
+        applied,
+        &outcome,
+    );
+    match result {
+        Ok(_) => {
+            tracing::info!(name = %req.name, value = %req.value, outcome = %outcome, "northbound write applied");
+        }
+        Err(e) => {
+            tracing::warn!(name = %req.name, %e, "northbound write failed");
+        }
     }
 }
 

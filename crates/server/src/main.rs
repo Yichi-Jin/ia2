@@ -235,6 +235,9 @@ async fn main() -> anyhow::Result<()> {
                 .put(routes::update_device)
                 .delete(routes::delete_device),
         )
+        // Deterministic per-device agent reference file, derived from
+        // project truth (ADR-0002 Decision 2).
+        .route("/api/devices/{name}/describe", get(routes::describe_device))
         // Assemble a modular EtherCAT coupler's channels from its ESI +
         // the modules it reports (0xF050).
         .route(
@@ -267,9 +270,18 @@ async fn main() -> anyhow::Result<()> {
         )
         .route("/api/edges/{name}/system", get(routes::system_edge_route))
         .route("/api/edges/{name}/status", get(routes::status_edge_route))
+        // Write-audit ring proxy — the agent-facing "who wrote what"
+        // record on a localhost-bound edge, reachable like every
+        // sibling edge read (`cs get edges/<n>/audit`).
+        .route(
+            "/api/edges/{name}/audit",
+            get(runtime_routes::edge_audit_route),
+        )
+        // Lives in runtime_routes so the edge's own status/body pass
+        // through verbatim (a governance 403 stays 403 — ADR-0002).
         .route(
             "/api/edges/{name}/runtime/{op}",
-            post(routes::edge_runtime_route),
+            post(runtime_routes::edge_runtime_route),
         )
         .route("/api/edges/{name}/deploy", post(routes::deploy_edge_route))
         .route("/api/edges/{name}/attach", post(routes::attach_edge_route))
@@ -476,6 +488,30 @@ async fn agent_watchdog(state: AppState) {
             // public `active` flag should drop. A session being
             // open pins active=true regardless of heartbeats.
             if s.session.is_some() {
+                // An external-writer flash during a session is a
+                // FLASH: after the same TTL as any transient, the
+                // banner reverts to the session's own label (the
+                // flash clock is separate from `last_heartbeat`,
+                // which the session's keep-alive pings refresh
+                // forever).
+                if s.external_flash_at
+                    .is_some_and(|t| t.elapsed() >= TRANSIENT_TTL)
+                {
+                    s.external_flash_at = None;
+                    s.command = None;
+                    let sess = s.session.as_ref().expect("checked above");
+                    let ev = events::AppEvent::AgentActivity(events::AgentActivity {
+                        active: true,
+                        command: None,
+                        session: Some(sess.id.clone()),
+                        session_label: Some(sess.label.clone()),
+                        since_ms: s
+                            .last_heartbeat
+                            .map(|h| h.elapsed().as_millis() as u64)
+                            .unwrap_or(0),
+                    });
+                    let _ = state.event_tx.send(ev);
+                }
                 continue;
             }
             // No session — fall back to transient-heartbeat aging.
@@ -485,6 +521,7 @@ async fn agent_watchdog(state: AppState) {
             match s.last_heartbeat.map(|h| h.elapsed()) {
                 Some(e) if e >= TRANSIENT_TTL => {
                     s.active = false;
+                    s.external_flash_at = None;
                     Some(events::AppEvent::AgentActivity(events::AgentActivity {
                         active: false,
                         command: s.command.clone(),

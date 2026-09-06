@@ -300,6 +300,9 @@ struct AppState {
     /// Alarm engine over the deployed alarms.toml — backs GET /alarms,
     /// POST /alarms/{id}/ack, GET /alarms-journal.
     alarms: Arc<Mutex<ironplc_bridge::monitor::AlarmEngine>>,
+    /// Bounded ring of every write attempt (HTTP + MQTT northbound)
+    /// with its origin — backs GET /audit (ADR-0002 attribution).
+    audit: AuditLog,
 }
 
 #[tokio::main]
@@ -395,8 +398,13 @@ async fn main() -> Result<()> {
     };
 
     // ---- Spawn the bridge ----
-    let handle: ProgramHandle =
-        ironplc_bridge::spawn_units(units, device_specs, iomap.mappings, state_path);
+    let handle: ProgramHandle = ironplc_bridge::spawn_units(
+        units,
+        device_specs,
+        iomap.mappings,
+        state_path,
+        store.governance().clone(),
+    );
 
     // Historian: persisted JSONL segments under the state dir so an
     // edge restart (or redeploy — state/ sits beside `current`) keeps
@@ -464,6 +472,7 @@ async fn main() -> Result<()> {
         store: store.clone(),
         historian,
         alarms,
+        audit: AuditLog::default(),
     };
 
     // ---- Northbound (MQTT -> supOS/Tier0) ----
@@ -475,6 +484,7 @@ async fn main() -> Result<()> {
                     project_name: state.project_name.clone(),
                     latest: state.latest.clone(),
                     handle: handle.clone(),
+                    audit: state.audit.clone(),
                 });
             } else {
                 tracing::info!("northbound disabled (no enabled [mqtt] in northbound.toml)");
@@ -503,6 +513,7 @@ async fn main() -> Result<()> {
         .route("/force", post(rt_force))
         .route("/unforce", post(rt_unforce))
         .route("/inject-scan-stall", post(rt_inject_scan_stall))
+        .route("/audit", get(rt_audit))
         .route("/history", get(history))
         .route("/alarms", get(alarms_state))
         .route("/alarms/{id}/ack", post(alarms_ack))
@@ -1043,6 +1054,101 @@ struct VarNameReq {
     name: String,
 }
 
+// ---- Write audit (ADR-0002 attribution on the runtime write path) ----
+//
+// Every write that reaches this process — HTTP /write·/force·/unforce,
+// MQTT northbound — is recorded here with its origin (`X-IA2-Origin`
+// header, `mqtt`, or `anonymous`). Bounded ring; `GET /audit` serves it.
+// The edge binds localhost-only, so the audit is read over the same SSH
+// tunnel the writes arrive through.
+
+/// One recorded write attempt. Both sides of the attempt are stored —
+/// what the caller ASKED for and what actually LANDED — with a
+/// `result` distinguishing ok / clamped / the error text, so denied
+/// (governance 403), failed, and clamped writes are as visible as
+/// clean ones. An audit that only showed the applied value would let
+/// "mqtt asked 150, governance wrote 100" read as "mqtt asked 100" —
+/// lying by omission.
+#[derive(Debug, Clone, Serialize)]
+struct AuditEntry {
+    /// Seconds since UNIX epoch (wall clock, like the historian).
+    ts_unix_secs: u64,
+    origin: String,
+    op: String,
+    name: String,
+    /// What the caller asked to write, as bit-packed i32 (REAL =
+    /// IEEE-754 bits). Absent for unforce, which carries no value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    requested: Option<i32>,
+    /// What was actually written after governance. Present only when
+    /// the write was applied; `applied != requested` ⇔ `result` is
+    /// "clamped".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    applied: Option<i32>,
+    /// "ok", "clamped", or the error text verbatim (a governance
+    /// denial records its reason here).
+    result: String,
+}
+
+type AuditLog = Arc<Mutex<VecDeque<AuditEntry>>>;
+
+const AUDIT_CAP: usize = 256;
+
+fn record_audit(
+    log: &AuditLog,
+    origin: &str,
+    op: &str,
+    name: &str,
+    requested: Option<i32>,
+    applied: Option<i32>,
+    result: &str,
+) {
+    let ts_unix_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut g = log.lock().expect("audit mutex");
+    if g.len() >= AUDIT_CAP {
+        g.pop_front();
+    }
+    g.push_back(AuditEntry {
+        ts_unix_secs,
+        origin: origin.to_string(),
+        op: op.to_string(),
+        name: name.to_string(),
+        requested,
+        applied,
+        result: result.to_string(),
+    });
+}
+
+/// Audit outcome for one write/force attempt: `(applied, result)`
+/// derived from the requested value and what the runtime answered.
+/// "clamped" is claimed exactly when governance altered the value —
+/// the log must never say a write landed as asked when it did not,
+/// nor the reverse.
+pub(crate) fn audit_outcome(
+    requested: i32,
+    result: &Result<i32, RuntimeWriteError>,
+) -> (Option<i32>, String) {
+    match result {
+        Ok(v) if *v == requested => (Some(*v), "ok".to_string()),
+        Ok(v) => (Some(*v), "clamped".to_string()),
+        Err(e) => (None, e.to_string()),
+    }
+}
+
+/// Origin of a mutating request for the audit ring: the `X-IA2-Origin`
+/// header (`gui`, `cs`, …) or `anonymous` when absent. The header value
+/// is only ever stored/printed, never interpolated into a command.
+fn origin_of(headers: &axum::http::HeaderMap) -> &str {
+    headers
+        .get("x-ia2-origin")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("anonymous")
+}
+
 fn write_err(e: RuntimeWriteError) -> (StatusCode, String) {
     match e {
         RuntimeWriteError::UnknownVariable(n) => {
@@ -1052,18 +1158,33 @@ fn write_err(e: RuntimeWriteError) -> (StatusCode, String) {
             (StatusCode::CONFLICT, "scan loop has stopped".to_string())
         }
         RuntimeWriteError::Vm(e) => (StatusCode::INTERNAL_SERVER_ERROR, e),
+        RuntimeWriteError::GovernanceDenied(n) => (
+            StatusCode::FORBIDDEN,
+            format!("write to '{n}' rejected by project governance"),
+        ),
     }
 }
 
 async fn rt_write(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<VarWriteReq>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     // The momentary-pulse reset guarantee lives in the shared monitor
     // core — one implementation for IDE server and edge runtime.
-    let v = monitor::write_with_pulse(&state.handle, &req.name, req.value, req.pulse_ms)
-        .await
-        .map_err(write_err)?;
+    let origin = origin_of(&headers).to_string();
+    let result = monitor::write_with_pulse(&state.handle, &req.name, req.value, req.pulse_ms).await;
+    let (applied, outcome) = audit_outcome(req.value, &result);
+    record_audit(
+        &state.audit,
+        &origin,
+        "write",
+        &req.name,
+        Some(req.value),
+        applied,
+        &outcome,
+    );
+    let v = result.map_err(write_err)?;
     Ok(Json(
         serde_json::json!({ "ok": true, "name": req.name, "value": v }),
     ))
@@ -1071,13 +1192,25 @@ async fn rt_write(
 
 async fn rt_force(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<VarWriteReq>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let v = state
-        .handle
-        .force_variable(&req.name, req.value)
-        .await
-        .map_err(write_err)?;
+    let origin = origin_of(&headers).to_string();
+    let result = state.handle.force_variable(&req.name, req.value).await;
+    // Forces bypass governance (ADR-0002), so `applied == requested`
+    // on success — audit_outcome would still expose a regression that
+    // ever clamped a force, as a "clamped" entry.
+    let (applied, outcome) = audit_outcome(req.value, &result);
+    record_audit(
+        &state.audit,
+        &origin,
+        "force",
+        &req.name,
+        Some(req.value),
+        applied,
+        &outcome,
+    );
+    let v = result.map_err(write_err)?;
     Ok(Json(
         serde_json::json!({ "ok": true, "name": req.name, "value": v }),
     ))
@@ -1085,13 +1218,32 @@ async fn rt_force(
 
 async fn rt_unforce(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<VarNameReq>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    state
-        .handle
-        .unforce_variable(&req.name)
-        .await
-        .map_err(write_err)?;
+    let origin = origin_of(&headers).to_string();
+    let result = state.handle.unforce_variable(&req.name).await;
+    match &result {
+        Ok(()) => record_audit(
+            &state.audit,
+            &origin,
+            "unforce",
+            &req.name,
+            None,
+            None,
+            "ok",
+        ),
+        Err(e) => record_audit(
+            &state.audit,
+            &origin,
+            "unforce",
+            &req.name,
+            None,
+            None,
+            &e.to_string(),
+        ),
+    }
+    result.map_err(write_err)?;
     Ok(Json(serde_json::json!({ "ok": true, "name": req.name })))
 }
 
@@ -1124,6 +1276,20 @@ async fn rt_inject_scan_stall(
     ))
 }
 
+/// The write-audit ring, oldest first. Every HTTP /write·/force·/unforce
+/// and every MQTT northbound write lands here with its origin and
+/// outcome — denied and failed writes included.
+async fn rt_audit(State(state): State<AppState>) -> Json<Vec<AuditEntry>> {
+    let entries: Vec<AuditEntry> = state
+        .audit
+        .lock()
+        .expect("audit mutex")
+        .iter()
+        .cloned()
+        .collect();
+    Json(entries)
+}
+
 async fn stop_handler(State(state): State<AppState>) -> impl IntoResponse {
     state.shutdown.notify_waiters();
     Json(serde_json::json!({"ok": true}))
@@ -1131,7 +1297,112 @@ async fn stop_handler(State(state): State<AppState>) -> impl IntoResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::sibling_web_dir;
+    use super::{
+        audit_outcome, origin_of, record_audit, sibling_web_dir, write_err, AuditLog,
+        RuntimeWriteError, StatusCode, AUDIT_CAP,
+    };
+
+    #[test]
+    fn audit_ring_is_bounded_and_keeps_the_newest() {
+        let log = AuditLog::default();
+        for i in 0..(AUDIT_CAP + 10) {
+            record_audit(
+                &log,
+                "anonymous",
+                "write",
+                &format!("v{i}"),
+                Some(i as i32),
+                Some(i as i32),
+                "ok",
+            );
+        }
+        let g = log.lock().unwrap();
+        assert_eq!(g.len(), AUDIT_CAP);
+        // Oldest entries were evicted: the first survivor is v10.
+        assert_eq!(g.front().unwrap().name, "v10");
+        assert_eq!(g.back().unwrap().name, format!("v{}", AUDIT_CAP + 9));
+    }
+
+    /// A clamped write records BOTH sides of the story — the audit
+    /// must be able to distinguish "asked 150, governance wrote 100"
+    /// from "asked 100" (docs/api.md `/audit` row).
+    #[test]
+    fn clamped_write_records_requested_and_applied() {
+        let (applied, outcome) = audit_outcome(150, &Ok(100));
+        assert_eq!((applied, outcome.as_str()), (Some(100), "clamped"));
+
+        let log = AuditLog::default();
+        record_audit(&log, "mqtt", "write", "sp", Some(150), applied, &outcome);
+        let g = log.lock().unwrap();
+        let e = g.back().unwrap();
+        assert_eq!(e.requested, Some(150));
+        assert_eq!(e.applied, Some(100));
+        assert_eq!(e.result, "clamped");
+    }
+
+    /// An untouched write is plain "ok" — the log must not cry
+    /// "clamped" when nothing was altered.
+    #[test]
+    fn unclamped_write_is_plain_ok() {
+        let (applied, outcome) = audit_outcome(42, &Ok(42));
+        assert_eq!((applied, outcome.as_str()), (Some(42), "ok"));
+    }
+
+    /// docs/api.md's "denied writes are recorded too" — a governance
+    /// denial lands in the ring with the requested value, no applied
+    /// value, and the denial reason verbatim.
+    #[test]
+    fn denied_write_is_recorded_with_requested_value_and_reason() {
+        let result: Result<i32, RuntimeWriteError> = Err(RuntimeWriteError::GovernanceDenied(
+            "sp (write_mode = allowlist, no rule allows it)".into(),
+        ));
+        let (applied, outcome) = audit_outcome(150, &result);
+        assert_eq!(applied, None);
+
+        let log = AuditLog::default();
+        record_audit(&log, "curl", "write", "sp", Some(150), applied, &outcome);
+        let g = log.lock().unwrap();
+        let e = g.back().unwrap();
+        assert_eq!(e.requested, Some(150));
+        assert_eq!(e.applied, None);
+        assert!(
+            e.result.contains("allowlist"),
+            "denial reason must be recorded verbatim, got: {}",
+            e.result
+        );
+    }
+
+    /// The status the whole governance feature promises: a policy
+    /// denial is 403, matching the IDE server's mapping so all four
+    /// write paths agree (ADR-0002).
+    #[test]
+    fn governance_denied_maps_to_403() {
+        let (status, body) = write_err(RuntimeWriteError::GovernanceDenied("x".into()));
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(body.contains("governance"));
+        // And the neighbours stay where they were.
+        assert_eq!(
+            write_err(RuntimeWriteError::UnknownVariable("x".into())).0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            write_err(RuntimeWriteError::Disconnected).0,
+            StatusCode::CONFLICT
+        );
+    }
+
+    /// The audit origin taxonomy is an OPEN set: any non-empty header
+    /// value is recorded verbatim; only a missing/empty header is
+    /// "anonymous" (skill 03 / api.md teach exactly this).
+    #[test]
+    fn origin_of_records_declared_labels_verbatim() {
+        let mut headers = axum::http::HeaderMap::new();
+        assert_eq!(origin_of(&headers), "anonymous");
+        headers.insert("x-ia2-origin", "my-bridge".parse().unwrap());
+        assert_eq!(origin_of(&headers), "my-bridge");
+        headers.insert("x-ia2-origin", "".parse().unwrap());
+        assert_eq!(origin_of(&headers), "anonymous");
+    }
 
     #[test]
     fn deploy_layout_sibling_web_is_picked_up() {

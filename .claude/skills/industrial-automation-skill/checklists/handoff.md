@@ -2,6 +2,8 @@
 
 Run before you tell the user "done". Catches the things that look fine in your terminal but leave the IDE in a confusing or unsafe state.
 
+Worked the offline lane (`offline-readiness.md`)? The **Runtime state** section below then applies only to a loopback server you actually ran — never stretch it toward hardware you couldn't touch. Close out with the offline checklist's bench handoff instead: every hardware-dependent claim goes under **BENCH PENDING** with the exact observation that will close it, and OFFLINE PASS / BENCH PASS / FAIL / NOT RUN stay distinct.
+
 ## Correctness
 
 - [ ] **`cs project check ~/Documents/IA2/<name>` passes.** A clean compile of the whole project, not just the one POU you edited. Edits to shared variables or iomap can break a different POU.

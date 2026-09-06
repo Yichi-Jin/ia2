@@ -126,6 +126,24 @@ class AgentActivityStore {
 export const agentActivityStore = new AgentActivityStore()
 
 /**
+ * Banner activity text, derived strictly from the event payload. The
+ * server labels every writer itself — `cs <command>` for heartbeat
+ * announcements, `<op> — <origin> (self-declared)` / `<op>
+ * (unattributed)` / `<op> — cs (no session)` for auto-attributed
+ * writers — so the web renders labels verbatim and never invents a
+ * `cs` prefix (ADR-0002: truthfulness on every surface; the old
+ * hardcoded prefix claimed `cs` wrote things it never did).
+ *
+ * Most recent signal wins: an external writer's flash (`command`)
+ * overrides the session label until the server's watchdog reverts it.
+ */
+export function activityLabel(
+  s: Pick<AgentActivityState, "command" | "sessionLabel" | "recent">,
+): string {
+  return s.command ?? s.sessionLabel ?? s.recent[0]?.command ?? "working"
+}
+
+/**
  * React hook. Returns the effective takeover state — `active` is
  * `true` only when the server says so AND the user's override window
  * has expired. The raw `agentActive` is also exposed for the banner
