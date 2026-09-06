@@ -202,6 +202,7 @@ fi
 
 # --- run the task's expectations ----------------------------------------
 echo "grade: task $TASK_ID, rundir $RUNDIR" >&2
+N_SETUP=$(jq -s 'length' "$HARNESS_CHECKS_FILE")
 # Subshell so an `exit` inside expect.sh cannot kill the grader; helpers
 # persist their rows through $HARNESS_CHECKS_FILE. set +e so every check
 # runs — the verdict aggregates rows, it does not stop at first failure.
@@ -228,10 +229,10 @@ if [ "$EXPECT_RC" -ne 0 ] && [ "$N_FAIL" -eq 0 ]; then
     N_BLOCKED=$((N_BLOCKED + 1))
 fi
 
-if [ "$N_TOTAL" -eq 0 ]; then
+if [ "$N_TOTAL" -eq "$N_SETUP" ]; then
     grader_record "expect_script" blocked "expect.sh recorded no checks — nothing to grade"
-    N_TOTAL=1
-    N_BLOCKED=1
+    N_TOTAL=$((N_TOTAL + 1))
+    N_BLOCKED=$((N_BLOCKED + 1))
 fi
 
 if [ "$N_FAIL" -gt 0 ]; then

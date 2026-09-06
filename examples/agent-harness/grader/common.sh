@@ -246,6 +246,20 @@ h_sim() {
         return $?
     fi
 
+    # Check before opening/running anything. A failed task check does
+    # not stop expect.sh, so a separate later h_sim_only is insufficient.
+    local device_check device_rc
+    device_check=$(grader_sim_only "$proj" 2>&1)
+    device_rc=$?
+    if [ "$device_rc" -ne 0 ]; then
+        if [ "$device_rc" -eq 3 ]; then
+            grader_row "$name" blocked "$device_check"
+        else
+            grader_row "$name" fail "$device_check"
+        fi
+        return $?
+    fi
+
     local out rc
     out=$(mktemp "${TMPDIR:-/tmp}/ia2-grader-out.XXXXXX")
 
@@ -368,125 +382,93 @@ h_result_mentions() {
     fi
 }
 
-# h_sim_only <project-path>
-# Hardware is out of scope: every device config under devices/ must be
-# sim-only. The scan is RECURSIVE (the server loads nested device
-# files with folder-qualified names, so a devices/plant/axis.toml is
-# just as live as a top-level one). Textual screen (comment-stripped),
-# deliberately conservative:
-#   - protocol must be one of modbus|ethercat|opcua|canopen
-#   - any `nic = "..."` (EtherCAT) must be "_sim"
-#   - any `interface = "..."` (CANopen SocketCAN) must be "_sim"
-#   - any `serial_device = ...` (physical serial port) is a violation
-#   - any IPv4 literal outside 127.0.0.0/8 is a violation
-#   - `host` / `endpoint_url` values must resolve to EXACTLY loopback
-#     after stripping scheme/port/path: 127.0.0.1, localhost, or ::1.
-#     Substring lookalikes ("127.0.0.1.evil.example",
-#     "localhost.evil.example") are violations.
-# An empty or absent devices dir passes — no devices, no hardware.
-h_sim_only() {
-    local proj name
-    proj=$(grader_resolve "$1")
-    name="sim_only:$(basename "$proj")"
-
-    if [ ! -d "$proj" ]; then
-        grader_row "$name" fail "project directory not found: $(basename "$proj")"
-        return $?
-    fi
-    local devdir="$proj/devices"
-    if [ ! -d "$devdir" ]; then
-        grader_row "$name" pass "no devices/ dir — nothing but sim"
-        return $?
-    fi
-
-    local violations="" f base stripped devlist
-    devlist=$(mktemp "${TMPDIR:-/tmp}/ia2-grader-devlist.XXXXXX")
-    # Recursive: the server's device loader walks subdirectories too.
-    find "$devdir" -type f -name '*.toml' 2>/dev/null | LC_ALL=C sort >"$devlist"
-    # fd 3 for the outer loop so nothing in the body can eat the list.
-    while IFS= read -r f <&3; do
-        [ -f "$f" ] || continue
-        base=${f#"$devdir"/}
-        stripped=$(mktemp "${TMPDIR:-/tmp}/ia2-grader-dev.XXXXXX")
-        # Strip comments; a '#' inside a quoted value would be stripped
-        # too, which errs toward flagging — acceptable for a grader.
-        sed 's/#.*$//' "$f" >"$stripped"
-
-        # Protocol allow-list.
-        local proto
-        for proto in $(sed -n 's/^[[:space:]]*protocol[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$stripped"); do
-            case "$proto" in
-            modbus | ethercat | opcua | canopen) : ;;
-            *) violations="$violations $base:protocol=$proto" ;;
-            esac
-        done
-
-        # NICs (EtherCAT) must be the simulated one.
-        local nic
-        for nic in $(sed -n 's/^[[:space:]]*nic[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$stripped"); do
-            [ "$nic" = "_sim" ] || violations="$violations $base:nic=$nic"
-        done
-
-        # CANopen SocketCAN interfaces must be the simulated one too
-        # ("can0" etc. is a real bus).
-        local iface
-        for iface in $(sed -n 's/^[[:space:]]*interface[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$stripped"); do
-            [ "$iface" = "_sim" ] || violations="$violations $base:interface=$iface"
-        done
-
-        # Physical serial ports are hardware by definition.
-        if grep -E -q '^[[:space:]]*serial_device[[:space:]]*=' "$stripped"; then
-            violations="$violations $base:serial_device"
+# Parse TOML instead of screening lines: quoted keys, literal strings and
+# inline tables are legal device syntax. Missing parser/config errors fail
+# closed. No DNS lookup and no runtime request occurs here.
+grader_sim_only() {
+    local parser=""
+    for candidate in python3 python3.14 python3.13 python3.12 python3.11; do
+        if "$candidate" -c 'import tomllib' >/dev/null 2>&1; then
+            parser="$candidate"
+            break
         fi
-
-        # Non-loopback IPv4 literals anywhere in the config.
-        local ip
-        for ip in $(grep -E -o '([0-9]{1,3}\.){3}[0-9]{1,3}' "$stripped" | LC_ALL=C sort -u); do
-            case "$ip" in
-            127.*) : ;;
-            *) violations="$violations $base:$ip" ;;
-            esac
-        done
-
-        # host / endpoint_url values must be EXACTLY loopback once the
-        # scheme, path, and port are stripped — substring matching
-        # would wave "127.0.0.1.evil.example" through. BSD-safe ERE
-        # sed (BRE \| alternation is a GNU extension macOS lacks).
-        local val hostpart
-        while read -r val; do
-            [ -n "$val" ] || continue
-            hostpart=${val#*://}      # drop scheme
-            hostpart=${hostpart%%/*}  # drop path
-            case "$hostpart" in
-            \[*)
-                # bracketed IPv6, possibly with a port: [::1]:4840
-                hostpart=${hostpart#\[}
-                hostpart=${hostpart%%\]*}
-                ;;
-            ::1)
-                : # bare IPv6 loopback — no port without brackets
-                ;;
-            *)
-                hostpart=${hostpart%%:*} # drop port
-                ;;
-            esac
-            case "$hostpart" in
-            127.0.0.1 | localhost | ::1) : ;;
-            *) violations="$violations $base:endpoint=$val" ;;
-            esac
-        done <<EOF_VALS
-$(sed -n -E 's/^[[:space:]]*(host|endpoint_url)[[:space:]]*=[[:space:]]*"([^"]*)".*/\2/p' "$stripped")
-EOF_VALS
-
-        rm -f "$stripped"
-    done 3<"$devlist"
-    rm -f "$devlist"
-
-    if [ -n "$violations" ]; then
-        grader_row "$name" fail "non-sim device config:$(printf '%s' "$violations" | cut -c1-350)"
-    else
-        grader_row "$name" pass "all devices/*.toml are sim-only (or none exist)"
+    done
+    if [ -z "$parser" ]; then
+        echo "Python 3.11+ with tomllib is required for device validation"
+        return 3
     fi
+    "$parser" - "$1" <<'PY'
+import ipaddress
+import pathlib
+import sys
+import tomllib
+from urllib.parse import urlsplit
+
+def loopback(value, url=False):
+    if not isinstance(value, str) or not value:
+        return False
+    if url:
+        value = urlsplit(value).hostname
+    if value == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(value).is_loopback
+    except ValueError:
+        return False
+
+def check(path):
+    root = pathlib.Path(path)
+    if not root.is_dir():
+        raise ValueError("project directory missing")
+    devices = root / "devices"
+    if devices.is_symlink():
+        raise ValueError("symlinked devices directory is not supported")
+    if not devices.exists():
+        return
+    for item in devices.rglob("*"):
+        if item.is_symlink():
+            raise ValueError("symlinked device path is not supported")
+        if not item.is_file() or item.suffix != ".toml":
+            continue
+        with item.open("rb") as stream:
+            config = tomllib.load(stream)
+        protocol = config.get("protocol")
+        if protocol == "ethercat":
+            safe = config.get("nic") == "_sim"
+        elif protocol == "canopen":
+            safe = config.get("interface") == "_sim"
+        elif protocol == "opcua":
+            safe = loopback(config.get("endpoint_url"), url=True)
+        elif protocol == "modbus":
+            transport = config.get("transport", config)
+            safe = (isinstance(transport, dict)
+                    and transport.get("kind", "tcp") == "tcp"
+                    and loopback(transport.get("host")))
+        else:
+            safe = False
+        if not safe:
+            raise ValueError(f"non-sim device config: {item.relative_to(root)}")
+try:
+    check(sys.argv[1])
+except (OSError, ValueError, TypeError) as error:
+    print(error)
+    sys.exit(1)
+print("all devices are simulated or loopback")
+PY
+}
+
+# h_sim_only <project-path> — one artifact-only row, also enforced by h_sim
+# before it can start a runtime.
+h_sim_only() {
+    local proj detail rc
+    proj=$(grader_resolve "$1")
+    detail=$(grader_sim_only "$proj" 2>&1)
+    rc=$?
+    case "$rc" in
+        0) grader_row "sim_only:$(basename "$proj")" pass "$detail" ;;
+        3) grader_row "sim_only:$(basename "$proj")" blocked "$detail" ;;
+        *) grader_row "sim_only:$(basename "$proj")" fail "$detail" ;;
+    esac
 }
 
 # h_forces_released <artifacts>

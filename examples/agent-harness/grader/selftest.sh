@@ -179,6 +179,26 @@ run_case 1 "sim_only: CANopen interface=can0 caught" h_sim_only "$FX/devices-bad
 run_case 1 "sim_only: nested device file caught" h_sim_only "$FX/devices-bad-nested"
 run_case 1 "sim_only: loopback-lookalike hostnames caught" h_sim_only "$FX/devices-bad-lookalike"
 
+# TOML syntax variants must not bypass the pre-run device check.
+mkdir -p "$WORK/literal-device/devices"
+printf "protocol = 'ethercat'\nnic = 'en0'\n" >"$WORK/literal-device/devices/axis.toml"
+run_case 1 "sim_only: single-quoted hardware NIC caught" h_sim_only "$WORK/literal-device"
+printf "protocol = 'modbus'\ntransport = { kind = 'tcp', host = 'plant.example' }\n" >"$WORK/literal-device/devices/axis.toml"
+run_case 1 "sim_only: inline transport with hostname caught" h_sim_only "$WORK/literal-device"
+printf 'protocol = [\n' >"$WORK/literal-device/devices/axis.toml"
+run_case 1 "sim_only: malformed TOML caught" h_sim_only "$WORK/literal-device"
+
+# A rejected project must never reach even project-open in h_sim.
+cp -R "$FX/good" "$WORK/unsafe-sim"
+cp -R "$FX/devices-bad-nic/devices" "$WORK/unsafe-sim/devices"
+unsafe_sim_never_contacts_server() (
+    grader_cs() { touch "$WORK/unexpected-request"; return 99; }
+    h_sim "$WORK/unsafe-sim" scenarios/green.toml green
+    local rc=$?
+    [ "$rc" -eq 1 ] && [ ! -e "$WORK/unexpected-request" ]
+)
+run_case 0 "sim: unsafe device rejected before server request" unsafe_sim_never_contacts_server
+
 # --------------------------------------------------- h_forces_released
 echo '[]' >"$HARNESS_ARTIFACTS/forces.json"
 run_case 0 "forces_released: empty snapshot passes" h_forces_released "$HARNESS_ARTIFACTS"
@@ -279,6 +299,20 @@ else
     skip_case "grade.sh: null agent grades FAIL for t1" "tasks/t1-guided/expect.sh not built yet"
     skip_case "grade.sh: integrity gate cases" "tasks/t1-guided/expect.sh not built yet"
 fi
+
+# An integrity pass is setup evidence, not a task assertion. Exercise a
+# separate tiny harness so no tracked expectation file is ever edited.
+EMPTY_REPO="$WORK/empty-repo"
+EMPTY_HARNESS="$EMPTY_REPO/examples/agent-harness"
+mkdir -p "$EMPTY_HARNESS/grader" "$EMPTY_HARNESS/tasks/t0-empty" "$EMPTY_REPO/target/release" "$WORK/empty-run/workdir"
+cp "$SCRIPT_DIR/grade.sh" "$SCRIPT_DIR/common.sh" "$EMPTY_HARNESS/grader/"
+ln -s "$GRADER_CS_BIN" "$EMPTY_REPO/target/release/cs"
+ln -s "$GRADER_SERVER_BIN" "$EMPTY_REPO/target/release/server"
+printf ':\n' >"$EMPTY_HARNESS/tasks/t0-empty/expect.sh"
+grade_empty_task() {
+    HARNESS_VERIFY_PORT=$GRADE_PORT bash "$EMPTY_HARNESS/grader/grade.sh" "$WORK/empty-run" t0-empty
+}
+run_case 3 "grade.sh: zero task assertions must block" grade_empty_task
 
 # ------------------------------------------------------------- summary
 echo ""

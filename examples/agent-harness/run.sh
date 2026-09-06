@@ -275,6 +275,7 @@ fi
 # ------------------------------------------------------------ 5. start server
 START_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 HOME="$RUNDIR/home" "$SERVER_BIN" --bind "127.0.0.1:$PORT" \
+  --demo-modbus-addr "" \
   > "$RUNDIR/artifacts/server.log" 2>&1 &
 SERVER_PID=$!
 disown "$SERVER_PID" 2>/dev/null || true  # no job-control noise on teardown

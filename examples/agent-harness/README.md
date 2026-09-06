@@ -11,6 +11,10 @@ the grader enforces that.
 
 ## Quickstart
 
+Requires Python 3.11+ (`tomllib`) on PATH in addition to bash, jq and
+Perl. The grader parses device TOML and refuses non-sim devices before
+starting a scenario; a missing parser blocks grading.
+
 ```bash
 # 1. build the binaries the harness runs against
 cargo build --release -p server -p ia2-cli
