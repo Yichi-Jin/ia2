@@ -66,8 +66,14 @@ project's config, so it is not committed here).
 
 - MQTT northbound write rejection is **unverified** on hardware (no
   broker configured on this bench).
-- The IDE takeover-overlay attribution path needs a GUI observer and
-  was not exercised on the bench; the edge-side origin recording it
-  feeds from is what the audit entries above demonstrate.
+- The IDE takeover-overlay path was verified the same day on a local
+  isolated IDE instance (sim project, human observer watching the
+  overlay, four cases fired from outside the GUI): an origin-less
+  write flashed `write <var> (unattributed)`; a self-declared `mqtt`
+  write flashed `write <var> — mqtt (self-declared)`; a `gui`-labelled
+  write flashed nothing; and a force/unforce pair flashed both calls
+  with their self-declared label — every mutating call surfaced,
+  including the release. Human-witnessed (TRANSCRIPT); the overlay
+  labels a self-declared origin honestly rather than trusting it.
 - Load-time validation of a broken `[governance]` table (unknown keys,
   `min > max`) is covered by unit tests, not re-proven on the bench.

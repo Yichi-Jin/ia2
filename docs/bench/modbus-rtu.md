@@ -72,7 +72,31 @@ terminal stuck at 0 V — recorded in the shipped config) — a reminder
 that a happy register readback proves the bus, not the terminal.
 Field verification means meters.
 
-## 4. Known limits
+## 4. Failsafe behaviour on runtime stop — measured (2026-09-08)
+
+`data/failsafe-stop-journal-20260908.txt` plus a human-witnessed bench
+observation, two rounds, consistent:
+
+- With the analog output driven to 5.0 V (valve at mid-travel,
+  feedback 4.93 V), stopping the runtime **immediately** started the
+  valve closing — the runtime's own failsafe zeroed the real outputs
+  before process exit; the coupler's comms watchdog (which would act
+  only after a delay) was not the mechanism. End-state feedback after
+  restart: 156 counts ≈ 0.049 V, inside the calibrated closed
+  endpoint (§3).
+- The same failsafe pass erroneously writes zeros to the **read-only
+  input registers** too (DI word, AI 1–4), producing
+  `Illegal data address` protocol errors — logged, and demonstrably
+  non-blocking: the journal shows the flow continuing to
+  `failsafe applied devices=2`. Root cause: channel configs carry no
+  read/write direction, so the failsafe treats every holding register
+  as writable. Tracked as a known defect (direction semantics); the
+  measured behaviour above is why it is graded a correctness defect,
+  not an open safety hole **on this device** — ordering or error
+  handling on other couplers could differ, which the fix must not
+  rely on.
+
+## 5. Known limits
 
 - 9600 8-E-1 with a ~50 ms coupler poll is the only RTU configuration
   measured; no throughput or higher-baud characterization exists.
