@@ -32,10 +32,19 @@ same runtime (`data/scan-cadence-mixed-bus-20260709.csv`):
   the coupler in the loop, traced to blocking Modbus writes on the scan
   thread and fixed upstream (`cd7e49c`, PR #20).
 
-Honesty notes: the 500 scans/s file post-dates the fix but has the
-coupler disconnected; a retained post-fix *mixed-bus* cadence log does
-not exist, so "mixed bus is back at 500/s" is stated nowhere in this
-document. The pre-fix loss and the EtherCAT-only cadence are both RAW.
+The post-fix mixed-bus measurement was retaken on the bench on
+2026-09-08 (`data/scan-cadence-mixed-bus-postfix-20260908.csv`, 125 s /
+600 samples, real RTU coupler polled by the same runtime, main build
+`0700e40`): **mean 500.0 scans/s, worst 493.6 scans/s, both devices
+healthy on every sample** — the regression is closed on real hardware,
+RAW on both sides of the fix.
+
+Bonus longevity datum (`data/long-uptime-counters-20260908.csv`): a
+counter snapshot of the previous runtime instance showed
+**499.73 scans/s lifetime average over 7.84 days of continuous
+operation** (scan_count / uptime from the runtime's own monotonic
+counters). This is a mean only — it proves sustained cadence, not a
+jitter distribution.
 
 ## 2. Two-axis electronic gear accuracy — RAW
 
@@ -84,7 +93,7 @@ installed runtime (genuinely pre-fix, but not a fresh build of the
 parent commit), and the runbook's optional tcpdump one-frame-race check
 was not run.
 
-## 4. Bus-loss self-heal (supervised re-walk) — TRANSCRIPT
+## 4. Bus-loss self-heal (supervised re-walk) — RAW (cable pull) / TRANSCRIPT (power cycle)
 
 Why it exists: any bus interruption longer than the SM watchdog used to
 wedge the runtime — the frame exchange "recovered" while every slave
@@ -114,6 +123,20 @@ sha-verified, 2026-08-31; quoted in the PR's bench comment):
   the re-walk with **`actual_pos` Δ = 0 counts** through the event.
 - Enable-time regression: 622/622/622 ms against a 602–733 ms baseline.
 
+The cable-pull case was re-run on 2026-09-08 against the current main
+build (`0700e40`, edge runtime sha `78d89dda…`) with the journal
+RETAINED this time (`data/cable-pull-journal-20260908.log`, hostname
+redacted; `recompute.py` re-derives the timings from it): ~10 s pull →
+10 × `Timeout(Pdu)` → unhealthy, inputs frozen; replug detected as
+`[Op,Op,Op] → [SafeOp×3]` wkc 9→5 with per-slave AL codes; first
+re-walk failed on the settling bus, 1000 ms backoff; the ethercrab
+socket pump died on a late frame and **the supervise loop rebuilt the
+transport** (the PR #42 hardening path, observed live for the first
+time); PRE-OP census re-identified all three slaves; **replug-to-OP
+2.08 s**, baseline `[Op,Op,Op] wkc=9` restored. The drive-side E81B
+latch again required one reset pulse — bus recovery is hands-off, the
+drive fault ack is not.
+
 ## 5. Mixed-vendor chain and encoder cross-calibration — PROSE
 
 Recorded live on the bench, artifacts not retained; treat as context,
@@ -135,10 +158,12 @@ not as specification:
   watchdog within ~90 s on a macOS development host with no fault
   injected** (PROSE — observed during soak-tool development, no
   retained log). 2 ms is an edge-hardware number, not a laptop number.
-- The ≥1 h multi-axis soak reading `consecutive_overruns` has **not**
-  been run; no soak duration is claimed anywhere in this document.
-- The self-heal timings in §4 are TRANSCRIPT-grade: the journals were
-  read live and quoted, not retained as files.
+- The ≥1 h soak with a retained sample-by-sample log has **not** been
+  completed; the 7.84-day counter snapshot in §1 proves a lifetime
+  mean, not a distribution, so no jitter claim is made at that
+  timescale.
+- §4's power-cycle and held-enable acceptances remain TRANSCRIPT-grade;
+  the cable-pull case is now journal-backed (RAW).
 - An earlier README claim that the in-cycle gear path cut inter-axis
   sync error by 29 % did not survive re-analysis of its raw data (the
   analysis method was not committed, and the improvement is smaller

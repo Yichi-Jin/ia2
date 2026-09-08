@@ -27,6 +27,9 @@ python3 docs/bench/data/recompute.py
 - [`modbus-rtu.md`](modbus-rtu.md) — field-verified register map on a
   real RTU coupler, concurrent EtherCAT+RTU operation, analog-loop
   calibration through the coupler.
+- [`write-governance-on-hardware.md`](write-governance-on-hardware.md)
+  — the per-tag write governance (allowlist / clamp / deny) and the
+  write-audit ring exercised against the live edge runtime.
 - [`watchdog-latch-runbook.md`](watchdog-latch-runbook.md) — the
   executable bench procedure behind the watchdog A/B result.
 

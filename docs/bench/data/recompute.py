@@ -50,6 +50,48 @@ def scan_cadence() -> None:
     print(f"       coupler_ok = 1 on {len(mixed) - bad}/{len(mixed)} samples")
 
 
+def scan_cadence_postfix() -> None:
+    print("scan-cadence-mixed-bus-postfix-20260908.csv (2 ms task, EtherCAT + RTU coupler, POST-fix)")
+    data = rows("scan-cadence-mixed-bus-postfix-20260908.csv")
+    rates = []
+    for a, b in zip(data, data[1:]):
+        dt = (int(b["ts_us"]) - int(a["ts_us"])) / 1e6
+        if dt > 0.05:
+            rates.append((int(b["scan_count"]) - int(a["scan_count"])) / dt)
+    check("mean scan rate [/s]", statistics.mean(rates), 500.0, 0.5)
+    check("min scan rate [/s]", min(rates), 493.6, 0.5)
+    unhealthy = sum(1 for r in data if r["devices_healthy"] != "1")
+    check("unhealthy samples", unhealthy, 0, 0)
+
+    print("long-uptime-counters-20260908.csv (continuous-operation counter snapshot)")
+    lu = rows("long-uptime-counters-20260908.csv")
+    last = lu[-1]
+    days = int(last["uptime_secs"]) / 86400
+    avg = int(last["scan_count"]) / int(last["uptime_secs"])
+    check("lifetime mean scan rate [/s]", avg, 499.7, 0.1)
+    check("continuous uptime [days]", days, 7.84, 0.05)
+
+
+def cable_pull() -> None:
+    print("cable-pull-journal-20260908.log (bus-loss self-heal, journal excerpt)")
+    import re
+    t_changed = t_recovered = None
+    pat = re.compile(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+)Z")
+    for line in open(HERE / "cable-pull-journal-20260908.log"):
+        if "bus shape CHANGED" in line and t_changed is None:
+            t_changed = pat.search(line).group(1)
+        if "recovered; cyclic exchange running again" in line:
+            t_recovered = pat.search(line).group(1)
+    from datetime import datetime
+    dt = (
+        datetime.fromisoformat(t_recovered) - datetime.fromisoformat(t_changed)
+    ).total_seconds()
+    check("replug-to-OP [s]", dt, 2.08, 0.05)
+    text = open(HERE / "cable-pull-journal-20260908.log").read()
+    check("re-walk backoff engaged", int("re-walk backoff attempt=1" in text), 1, 0)
+    check("transport rebuild path exercised", int("supervise loop will rebuild the transport" in text), 1, 0)
+
+
 # ---------------------------------------------------------------- dual gear
 def phase_ratio(data: list[dict], phase: str) -> float:
     """Steady-state actual/actual ratio, mid-segment (1/4..3/4 of the
@@ -168,6 +210,8 @@ def valve() -> None:
 
 def main() -> int:
     scan_cadence()
+    scan_cadence_postfix()
+    cable_pull()
     dual_gear()
     valve()
     if FAILURES:
