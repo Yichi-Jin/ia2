@@ -72,6 +72,23 @@ def scan_cadence_postfix() -> None:
     check("continuous uptime [days]", days, 7.84, 0.05)
 
 
+def soak_4h() -> None:
+    print("soak-4h-20260908.csv (4-hour 1 Hz soak, EtherCAT 2 ms, main build)")
+    data = rows("soak-4h-20260908.csv")
+    check("samples", len(data), 14400, 0)
+    check("watchdog trips", sum(int(r["watchdog_tripped"]) for r in data), 0, 0)
+    check("unhealthy samples", sum(1 - int(r["devices_healthy"]) for r in data), 0, 0)
+    span = (int(data[-1]["ts_us"]) - int(data[0]["ts_us"])) / 1e6
+    check("span [h]", span / 3600, 4.05, 0.02)
+    rates = []
+    for a, b in zip(data, data[1:]):
+        dt = (int(b["ts_us"]) - int(a["ts_us"])) / 1e6
+        if dt > 0.5:
+            rates.append((int(b["scan_count"]) - int(a["scan_count"])) / dt)
+    check("mean scan rate [/s]", statistics.mean(rates), 500.0, 0.1)
+    check("worst 1 s sample [/s]", min(rates), 498.8, 0.2)
+
+
 def cable_pull() -> None:
     print("cable-pull-journal-20260908.log (bus-loss self-heal, journal excerpt)")
     import re
@@ -211,6 +228,7 @@ def valve() -> None:
 def main() -> int:
     scan_cadence()
     scan_cadence_postfix()
+    soak_4h()
     cable_pull()
     dual_gear()
     valve()

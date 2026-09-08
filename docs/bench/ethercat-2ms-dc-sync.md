@@ -158,10 +158,13 @@ not as specification:
   watchdog within ~90 s on a macOS development host with no fault
   injected** (PROSE — observed during soak-tool development, no
   retained log). 2 ms is an edge-hardware number, not a laptop number.
-- The ≥1 h soak with a retained sample-by-sample log has **not** been
-  completed; the 7.84-day counter snapshot in §1 proves a lifetime
-  mean, not a distribution, so no jitter claim is made at that
-  timescale.
+- The soak gate is now closed with a retained log
+  (`data/soak-4h-20260908.csv`): **4.05 h at 1 Hz sampling on the main
+  build — mean 500.00 scans/s, worst one-second sample 498.8 scans/s,
+  zero watchdog trips, zero unhealthy samples across all 14,400
+  rows**. The 7.84-day counter snapshot in §1 still proves only a
+  lifetime mean; sub-second jitter remains uncharacterized beyond
+  what the 1 Hz deltas bound.
 - §4's power-cycle and held-enable acceptances remain TRANSCRIPT-grade;
   the cable-pull case is now journal-backed (RAW).
 - An earlier README claim that the in-cycle gear path cut inter-axis
