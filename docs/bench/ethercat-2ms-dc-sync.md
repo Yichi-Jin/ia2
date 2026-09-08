@@ -93,7 +93,7 @@ installed runtime (genuinely pre-fix, but not a fresh build of the
 parent commit), and the runbook's optional tcpdump one-frame-race check
 was not run.
 
-## 4. Bus-loss self-heal (supervised re-walk) — RAW (cable pull) / TRANSCRIPT (power cycle)
+## 4. Bus-loss self-heal (supervised re-walk) — RAW (both flavors)
 
 Why it exists: any bus interruption longer than the SM watchdog used to
 wedge the runtime — the frame exchange "recovered" while every slave
@@ -125,7 +125,7 @@ sha-verified, 2026-08-31; quoted in the PR's bench comment):
 
 The cable-pull case was re-run on 2026-09-08 against the current main
 build (`0700e40`, edge runtime sha `78d89dda…`) with the journal
-RETAINED this time (`data/cable-pull-journal-20260908.log`, hostname
+RETAINED this time (`data/cable-pull-journal-20260908.txt`, hostname
 redacted; `recompute.py` re-derives the timings from it): ~10 s pull →
 10 × `Timeout(Pdu)` → unhealthy, inputs frozen; replug detected as
 `[Op,Op,Op] → [SafeOp×3]` wkc 9→5 with per-slave AL codes; first
@@ -135,7 +135,26 @@ transport** (the PR #42 hardening path, observed live for the first
 time); PRE-OP census re-identified all three slaves; **replug-to-OP
 2.08 s**, baseline `[Op,Op,Op] wkc=9` restored. The drive-side E81B
 latch again required one reset pulse — bus recovery is hands-off, the
-drive fault ack is not.
+drive fault ack is not. Precision note: the 2.08 s is measured from
+the runtime *detecting* the bus-shape change to cyclic exchange
+recovered — the physical replug instant is not independently
+instrumented — and the drive's own fault display cleared only ~91 s
+later via the reset pulse: bus recovery and drive-fault acknowledgement
+are two separate events.
+
+The power-cycle flavor was re-run the same day with the journal
+retained (`data/powercycle-journal-20260908.txt`; `recompute.py`
+re-derives every number): drives powered off ~48 s → demotion detected
+as `[Op,Op,Op] → [Op,None,None]` wkc 9→3, the socket pump died and
+**the supervise loop rebuilt the transport** (explicitly logged this
+time); **11 re-walk attempts during the outage, every one failing
+cleanly with `Timeout` on the exact 1/2/4/5…5 s backoff schedule —
+zero false successes against a dead bus**; on power return the next
+walk re-identified all three factory-fresh slaves and reached OP in
+**0.96 s**. Contrast with the cable pull: after a power cycle the
+drive's fault memory is wiped, so no E81B latch and no reset pulse
+were needed — the two failure flavors differ exactly in the
+drive-side aftermath, and both are now journal-backed.
 
 ## 5. Mixed-vendor chain and encoder cross-calibration — PROSE
 
@@ -165,8 +184,9 @@ not as specification:
   rows**. The 7.84-day counter snapshot in §1 still proves only a
   lifetime mean; sub-second jitter remains uncharacterized beyond
   what the 1 Hz deltas bound.
-- §4's power-cycle and held-enable acceptances remain TRANSCRIPT-grade;
-  the cable-pull case is now journal-backed (RAW).
+- §4's held-enable acceptance (re-enable across a re-walk with
+  `actual_pos` Δ = 0) remains TRANSCRIPT-grade — the 2026-09-08 re-runs
+  were done with the axis deliberately unenabled.
 - An earlier README claim that the in-cycle gear path cut inter-axis
   sync error by 29 % did not survive re-analysis of its raw data (the
   analysis method was not committed, and the improvement is smaller

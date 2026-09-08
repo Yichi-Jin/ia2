@@ -44,8 +44,9 @@ analog feedback read through the chain.
 - Cost, honestly stated: this pre-fix build paid ~20 % scan cadence
   (mean 397 scans/s vs 500 EtherCAT-only) because Modbus writes
   blocked the scan thread. The blocking write was fixed upstream
-  (`cd7e49c`, PR #20); a retained post-fix mixed-bus log does not
-  exist, so no post-fix mixed-bus cadence is claimed here (see the
+  (`cd7e49c`, PR #20), and the post-fix mixed-bus measurement was
+  retaken on 2026-09-08: mean 500.0 scans/s with the coupler in-loop
+  (`data/scan-cadence-mixed-bus-postfix-20260908.csv`; details in the
   EtherCAT document, §1).
 
 ## 3. Analog loop calibration through the coupler — RAW

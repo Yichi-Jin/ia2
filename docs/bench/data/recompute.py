@@ -90,11 +90,11 @@ def soak_4h() -> None:
 
 
 def cable_pull() -> None:
-    print("cable-pull-journal-20260908.log (bus-loss self-heal, journal excerpt)")
+    print("cable-pull-journal-20260908.txt (bus-loss self-heal, journal excerpt)")
     import re
     t_changed = t_recovered = None
     pat = re.compile(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+)Z")
-    for line in open(HERE / "cable-pull-journal-20260908.log"):
+    for line in open(HERE / "cable-pull-journal-20260908.txt"):
         if "bus shape CHANGED" in line and t_changed is None:
             t_changed = pat.search(line).group(1)
         if "recovered; cyclic exchange running again" in line:
@@ -104,9 +104,38 @@ def cable_pull() -> None:
         datetime.fromisoformat(t_recovered) - datetime.fromisoformat(t_changed)
     ).total_seconds()
     check("replug-to-OP [s]", dt, 2.08, 0.05)
-    text = open(HERE / "cable-pull-journal-20260908.log").read()
+    text = open(HERE / "cable-pull-journal-20260908.txt").read()
     check("re-walk backoff engaged", int("re-walk backoff attempt=1" in text), 1, 0)
     check("transport rebuild path exercised", int("supervise loop will rebuild the transport" in text), 1, 0)
+
+
+def power_cycle() -> None:
+    print("powercycle-journal-20260908.txt (drive power-cycle self-heal, journal excerpt)")
+    import re
+    from datetime import datetime
+    ts_pat = re.compile(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+)Z")
+    fails, backoffs = [], []
+    t_changed = t_recovered = t_last_backoff = None
+    text = open(HERE / "powercycle-journal-20260908.txt").read()
+    for line in text.splitlines():
+        if "shape CHANGED" in line and t_changed is None:
+            t_changed = ts_pat.search(line).group(1)
+        if "re-walk step failed" in line:
+            fails.append(line)
+        if "re-walk backoff" in line:
+            m = re.search(r"delay_ms=(\d+)", line)
+            backoffs.append(int(m.group(1)))
+            t_last_backoff = ts_pat.search(line).group(1)
+        if "recovered; cyclic exchange running again" in line:
+            t_recovered = ts_pat.search(line).group(1)
+    check("clean walk failures during outage", len(fails), 11, 0)
+    check("backoff schedule head 1/2/4 s", int(backoffs[:3] == [1000, 2000, 4000]), 1, 0)
+    check("backoff schedule capped at 5 s", int(all(b == 5000 for b in backoffs[3:])), 1, 0)
+    check("false successes on the dead bus", text.count("recovered; cyclic exchange running again") - 1, 0, 0)
+    dt = lambda a, b: (datetime.fromisoformat(b) - datetime.fromisoformat(a)).total_seconds()
+    walk = dt(t_last_backoff, t_recovered) - 5.0
+    check("power-return walk to OP [s]", walk, 0.96, 0.05)
+    check("total outage detection-to-recovered [s]", dt(t_changed, t_recovered), 48.3, 0.3)
 
 
 # ---------------------------------------------------------------- dual gear
@@ -230,6 +259,7 @@ def main() -> int:
     scan_cadence_postfix()
     soak_4h()
     cable_pull()
+    power_cycle()
     dual_gear()
     valve()
     if FAILURES:
