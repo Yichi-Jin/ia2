@@ -172,19 +172,33 @@ run_case 1 "result_mentions: absent token caught" h_result_mentions 'no_such_tok
 printf 'status: failure\nreason: the never-window on pressure is violated; the value stays high.\nfailing_step: 5\n' \
     >"$HARNESS_WORKDIR/RESULT.md"
 run_case 0 "result_field: synonymous diagnosis with correct field passes" \
-    h_result_field failing_step '5([^0-9]|$)'
+    h_result_field failing_step '5'
+printf 'status: failure\nreason: fine.\nfailing_step: 5   \n' >"$HARNESS_WORKDIR/RESULT.md"
+run_case 0 "result_field: trailing whitespace tolerated" h_result_field failing_step '5'
+printf 'status: failure\nreason: repeated.\nfailing_step: 5\nfailing_step: 5\n' \
+    >"$HARNESS_WORKDIR/RESULT.md"
+run_case 0 "result_field: repeated identical field tolerated" h_result_field failing_step '5'
 printf 'status: failure\nreason: expect_never press_high 60 30 blah blah.\n' \
     >"$HARNESS_WORKDIR/RESULT.md"
 run_case 1 "result_field: keyword-stuffed report without the field caught" \
-    h_result_field failing_step '5([^0-9]|$)'
+    h_result_field failing_step '5'
 printf 'status: failure\nreason: honest but mistaken.\nfailing_step: 3\n' \
     >"$HARNESS_WORKDIR/RESULT.md"
-run_case 1 "result_field: wrong step number caught" h_result_field failing_step '5([^0-9]|$)'
+run_case 1 "result_field: wrong step number caught" h_result_field failing_step '5'
 printf 'status: failure\nreason: off by a digit.\nfailing_step: 55\n' \
     >"$HARNESS_WORKDIR/RESULT.md"
-run_case 1 "result_field: prefix-digit lookalike (55) caught" h_result_field failing_step '5([^0-9]|$)'
+run_case 1 "result_field: prefix-digit lookalike (55) caught" h_result_field failing_step '5'
+printf 'status: failure\nreason: fractional.\nfailing_step: 5.5\n' \
+    >"$HARNESS_WORKDIR/RESULT.md"
+run_case 1 "result_field: fractional lookalike (5.5) caught" h_result_field failing_step '5'
+printf 'status: failure\nreason: suffixed.\nfailing_step: 5foo\n' \
+    >"$HARNESS_WORKDIR/RESULT.md"
+run_case 1 "result_field: suffixed lookalike (5foo) caught" h_result_field failing_step '5'
+printf 'status: failure\nreason: hedging.\nfailing_step: 5\nfailing_step: 3\n' \
+    >"$HARNESS_WORKDIR/RESULT.md"
+run_case 1 "result_field: contradictory duplicate fields caught" h_result_field failing_step '5'
 rm -f "$HARNESS_WORKDIR/RESULT.md"
-run_case 1 "result_field: missing RESULT.md caught" h_result_field failing_step '5([^0-9]|$)'
+run_case 1 "result_field: missing RESULT.md caught" h_result_field failing_step '5'
 
 # --------------------------------------------------------- h_sim_only
 # devices-good also carries a loopback endpoint_url/host pair and a
@@ -343,9 +357,20 @@ ln -s "$GRADER_CS_BIN" "$EMPTY_REPO/target/release/cs"
 ln -s "$GRADER_SERVER_BIN" "$EMPTY_REPO/target/release/server"
 printf ':\n' >"$EMPTY_HARNESS/tasks/t0-empty/expect.sh"
 grade_empty_task() {
-    HARNESS_VERIFY_PORT=$GRADE_PORT bash "$EMPTY_HARNESS/grader/grade.sh" "$WORK/empty-run" t0-empty
+    # Opt in past the missing-snapshot gate so this case exercises the
+    # ZERO-ASSERTION branch, not the integrity branch (audit-on-audit:
+    # the F4 early exit had made this case vacuous).
+    HARNESS_ALLOW_UNATTESTED=1 HARNESS_VERIFY_PORT=$GRADE_PORT \
+        bash "$EMPTY_HARNESS/grader/grade.sh" "$WORK/empty-run" t0-empty
 }
 run_case 3 "grade.sh: zero task assertions must block" grade_empty_task
+empty_task_reason_is_zero_assertions() {
+    jq -e '(.overall == "blocked") and
+           ([.checks[] | select(.detail | contains("recorded no checks"))] | length == 1)' \
+        "$WORK/empty-run/verdict.json" >/dev/null 2>&1
+}
+run_case 0 "grade.sh: empty-task blocked for the zero-assertion reason" \
+    empty_task_reason_is_zero_assertions
 
 # ------------------------------------------------------------- summary
 echo ""

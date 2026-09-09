@@ -68,4 +68,4 @@ h_result_status failure
 # ran (or genuinely analysed) the scenario. Run records graded under
 # the v1 contract keep their verdicts; this version has its own
 # baseline.
-h_result_field failing_step '5([^0-9]|$)'
+h_result_field failing_step '5'
