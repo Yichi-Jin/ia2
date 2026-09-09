@@ -168,7 +168,7 @@ archive_run() {
   stamp=$(date -u +%Y%m%dT%H%M%SZ)
   archive_dir="$HARNESS_DIR/runs/$stamp-$AGENT-$TASK-$$"
   mkdir -p "$archive_dir"
-  for f in transcript.txt meta.json verdict.json; do
+  for f in transcript.txt meta.json verdict.json integrity.json; do
     [ -f "$RUNDIR/$f" ] && cp "$RUNDIR/$f" "$archive_dir/"
   done
   [ -d "$RUNDIR/artifacts" ] && cp -R "$RUNDIR/artifacts" "$archive_dir/artifacts"
