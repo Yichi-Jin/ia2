@@ -34,7 +34,16 @@ TIMEOUT_SECS="${HARNESS_TIMEOUT_SECS:-1200}"
 # stream-json + verbose: events land on the transcript incrementally,
 # so a timeout kill still leaves the full trace (plain -p buffers its
 # one text block and a killed run would leave an empty transcript).
-exec perl -e '
+#
+# The stream is teed to a scratch copy so the RESOLVED MODEL can be
+# extracted afterwards (audit F7: the CLI version alone does not pin
+# which model answered — stream-json carries it on every assistant
+# event). run.sh lifts the trailing HARNESS_RESOLVED_MODEL line into
+# meta.json.
+SCRATCH=$(mktemp "${TMPDIR:-/tmp}/claude-adapter.XXXXXX")
+trap 'rm -f "$SCRATCH"' EXIT
+
+perl -e '
   my $secs = shift @ARGV;
   my $pid  = fork;
   die "fork failed: $!\n" unless defined $pid;
@@ -58,4 +67,16 @@ exec perl -e '
   exit($st >> 8);
 ' "$TIMEOUT_SECS" \
   claude -p "$(cat "$HARNESS_PROMPT")" --dangerously-skip-permissions \
-  --output-format stream-json --verbose
+  --output-format stream-json --verbose 2>&1 | tee "$SCRATCH"
+STATUS=${PIPESTATUS[0]}
+
+# First assistant event names the model that actually answered. Extract
+# with grep/sed only (no jq dependency on the adapter path); absent —
+# e.g. the CLI died before its first event — means no line is emitted
+# and meta.json honestly records null.
+MODEL=$(grep -o '"model":"[^"]*"' "$SCRATCH" | head -n 1 | sed 's/.*:"\(.*\)"/\1/')
+if [ -n "$MODEL" ]; then
+  echo "HARNESS_RESOLVED_MODEL: $MODEL"
+fi
+
+exit "$STATUS"

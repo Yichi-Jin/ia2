@@ -85,6 +85,10 @@ produced it.
 `HARNESS_PROMPT`, `HARNESS_SERVER_URL`, `HARNESS_TIMEOUT_SECS` set,
 print `HARNESS_TOOL_VERSION: <version>` as stdout line 1, then drive
 the tool non-interactively; combined output becomes the transcript.
+An adapter that can determine which MODEL actually answered emits a
+trailing `HARNESS_RESOLVED_MODEL: <id>` line (extracted from the
+tool's own structured output, never guessed); run.sh lifts it into
+`meta.json` as `versions.resolved_model`, null when absent.
 Exit `3` means *blocked* (tool not installed) — the runner reports it
 as infrastructure, not as a task failure. Shipping adapters:
 `claude-code.sh` (Claude Code) and `codex.sh` (Codex CLI; its exact
@@ -116,7 +120,11 @@ meaningful.
 - The isolation is temp-dir mechanics only — the harness cannot see or
   control what is installed on the user's machine.
 - `claude -p` inherits the user's account-level configuration; the
-  harness records the tool version but does not control that config.
+  harness records the tool version and — for adapters whose CLI
+  exposes it in structured output — the resolved model per run
+  (claude's stream-json carries it; codex-cli 0.153.4's `--json`
+  stream does not, so codex runs record null). It still does not
+  CONTROL which model answers.
 - The PATH `cs` shim is a rail, not a jail — a determined agent could
   still construct its own URLs; the shim only removes the accidental
   route to a real `:3001` server.
