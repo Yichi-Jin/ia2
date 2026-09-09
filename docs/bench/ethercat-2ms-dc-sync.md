@@ -41,18 +41,23 @@ RAW on both sides of the fix.
 
 Bonus longevity datum (`data/long-uptime-counters-20260908.csv`): a
 counter snapshot of the previous runtime instance showed
-**499.73 scans/s lifetime average over 7.84 days of continuous
+**499.73 scans/s lifetime average over 7.85 days of continuous
 operation** (scan_count / uptime from the runtime's own monotonic
 counters). This is a mean only — it proves sustained cadence, not a
 jitter distribution.
 
 ## 2. Two-axis electronic gear accuracy — RAW
 
-`data/dual-gear-20260708.csv`, 2026-07-08 (445 samples at 0.2 s over an
+`data/dual-gear-20260708.csv`, 2026-07-08 (445 retained rows at nominal 0.2 s over an
 87 s scripted run). Follower axis geared to the master's *actual*
 encoder feedback, 2 ms / CSP / SYNC0. Master jogged at ≈4.3 rpm.
 Ratios are steady-state actual/actual over the middle half of each
 leg (the source script's window, skipping soft-engagement ramps):
+
+The capture contains five exact duplicate rows (440 distinct samples),
+explicitly listed in [`data-validation.md`](data-validation.md). The
+historical row weighting/window indices are retained for reproducibility;
+the duplicates are not presented as independent observations.
 
 | Measurement | Value |
 |---|---|
@@ -181,7 +186,7 @@ not as specification:
   (`data/soak-4h-20260908.csv`): **4.05 h at 1 Hz sampling on the main
   build — mean 500.00 scans/s, worst one-second sample 498.8 scans/s,
   zero watchdog trips, zero unhealthy samples across all 14,400
-  rows**. The 7.84-day counter snapshot in §1 still proves only a
+  rows**. The 7.85-day counter snapshot in §1 still proves only a
   lifetime mean; sub-second jitter remains uncharacterized beyond
   what the 1 Hz deltas bound.
 - §4's held-enable acceptance (re-enable across a re-walk with

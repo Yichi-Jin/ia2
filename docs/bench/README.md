@@ -8,7 +8,7 @@ Every number in these documents carries an evidence grade:
 
 | Grade | Meaning |
 |---|---|
-| **RAW** | A machine-produced artifact (CSV/log) is committed under `data/`, and `data/recompute.py` re-derives the published number from it. If the script exits non-zero, a published number no longer reproduces — treat that as a release blocker. |
+| **RAW** | A machine-produced artifact (CSV/log) is committed under `data/`, and `data/recompute.py` re-derives the published number from it. If the script exits non-zero, the evidence is invalid/incomplete or an encoded number no longer reproduces — treat that as a release blocker. |
 | **TRANSCRIPT** | Values were read live off the bench and quoted verbatim in a linked PR comment or committed report; the underlying journal/CSV was not retained. Strong when the protocol is committed and falsifiable, but you cannot re-derive the digits. |
 | **PROSE** | An assertion with neither artifact nor quoted samples behind it. These are labelled where they appear and are not load-bearing. |
 | **CONFIG** | The number IS a committed configuration file in this repo (e.g. a register map) — the evidence is the shipped artifact plus the recorded method that verified it. |
@@ -17,7 +17,13 @@ Re-run the verification (stdlib Python only, no IA2 code imported):
 
 ```bash
 python3 docs/bench/data/recompute.py
+python3 -m unittest discover -s docs/bench/data -p 'test_*.py' -v
 ```
+
+Capture schemas, known legacy duplicates, rounding-only tolerances and
+negative tests are documented in [`data-validation.md`](data-validation.md).
+Passing this gate is not hardware acceptance or validation of every prose
+claim. Raw capture files are never silently cleaned up to obtain a pass.
 
 ## Documents
 

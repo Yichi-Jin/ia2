@@ -64,7 +64,7 @@ runtime's own polling loop (§2 covers that).
 | Linearity (42-point up/down sweep) | `fb = 0.9963·cmd − 0.0134`, **R² = 0.99991**, max residual 65 mV |
 | Hysteresis | **29 mV mean / 82 mV max** (worst at 7.5 and 9.0 V) |
 | Step response 0→10 V | no overshoot (peak 9.958 V) |
-| Feedback quantization | ≈ 0.2 V steps → ~2 % FS effective resolution (valve-side, not the 12-bit AI) |
+| Feedback quantization | nonzero jump median **0.192 V** (≈ 0.2 V → ~2 % FS, valve-side, not the 12-bit AI); feedback held across **7 of 18** adjacent command transitions |
 | Endpoints | 0.045–0.058 V closed, 9.936–9.938 V open |
 
 One AO channel on this unit is dead (write and readback succeed,
