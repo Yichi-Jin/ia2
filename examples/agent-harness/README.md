@@ -115,7 +115,7 @@ bash examples/agent-harness/agents/selftest.sh
 ## Run records and publishing (`runs/`)
 
 Every completed run copies its shareable subset — scrubbed
-`transcript.txt`, `meta.json`, `verdict.json`, `artifacts/` (never
+`transcript.txt`, `meta.json`, `verdict.json`, `integrity.json`, `artifacts/` (never
 `workdir/` or `home/`) — into `runs/<utc-stamp>-<agent>-<task>-<pid>/`.
 The whole `runs/` directory is gitignored: records accumulate locally
 as your private evidence base, and publishing any transcript anywhere
