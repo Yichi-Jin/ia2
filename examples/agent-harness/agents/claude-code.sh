@@ -67,7 +67,7 @@ perl -e '
   exit($st >> 8);
 ' "$TIMEOUT_SECS" \
   claude -p "$(cat "$HARNESS_PROMPT")" --dangerously-skip-permissions \
-  --output-format stream-json --verbose 2>&1 | tee "$SCRATCH"
+  --output-format stream-json --verbose </dev/null 2>&1 | tee "$SCRATCH"
 STATUS=${PIPESTATUS[0]}
 
 # First assistant event names the model that actually answered. Extract

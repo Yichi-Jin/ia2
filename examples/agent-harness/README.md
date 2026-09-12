@@ -97,10 +97,20 @@ and the grader records "the model failed the task" about a run that
 never happened. Shipping adapters:
 `claude-code.sh` (Claude Code) and `codex.sh` (Codex CLI, invocation
 verified against `codex-cli 0.153.4` on 2026-09-08 — it runs under
-Codex's own `workspace-write` sandbox with network access re-enabled,
+Codex's own `workspace-write` sandbox with full network access re-enabled
+(not restricted to loopback),
 not the sandbox bypass, because that policy already covers the workdir
 and `$TMPDIR` where the rundir lives). To add an agent, copy one of
-them.
+them. Both adapters close stdin so an inherited pipeline cannot append
+unrequested task content. Codex records JSONL and classifies quota blocks
+only from error events, not model text or command output. Claude's model
+marker comes from the first actual assistant event, not configuration metadata.
+
+Run adapter regressions without an account or model call:
+
+```bash
+bash examples/agent-harness/agents/selftest.sh
+```
 
 ## Run records and publishing (`runs/`)
 
