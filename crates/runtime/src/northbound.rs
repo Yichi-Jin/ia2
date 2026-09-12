@@ -327,8 +327,26 @@ mod governance_roundtrip_tests {
         };
         let mut broker = rumqttd::Broker::new(cfg);
         std::thread::spawn(move || {
-            let _ = broker.start();
+            broker.start().expect("embedded MQTT broker failed");
         });
+        // AsyncClient does not connect until its event loop is polled. The
+        // observer stops on a connection error, so do not race broker startup.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if std::net::TcpStream::connect_timeout(
+                &format!("127.0.0.1:{port}").parse().unwrap(),
+                std::time::Duration::from_millis(100),
+            )
+            .is_ok()
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "MQTT broker did not start"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         port
     }
 
