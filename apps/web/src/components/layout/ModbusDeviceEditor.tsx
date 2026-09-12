@@ -200,7 +200,11 @@ export function ModbusDeviceEditor({ device, onSave, link }: DeviceEditorProps) 
                     </td>
                     <td className="px-2 py-1.5">
                       <EnumSelect<ModbusAccess>
-                        value={ch.access ?? "write"}
+                        value={
+                          ch.kind === "discrete_input" || ch.kind === "input_register"
+                            ? "read"
+                            : ch.access ?? "write"
+                        }
                         onValueChange={(v) => setChannel(i, { access: v })}
                         disabled={
                           ch.kind === "discrete_input" ||
