@@ -71,10 +71,13 @@ perl -e '
 STATUS=${PIPESTATUS[0]}
 
 # First assistant event names the model that actually answered. Extract
-# with grep/sed only (no jq dependency on the adapter path); absent —
+# from structured JSON (jq is already a harness prerequisite); absent —
 # e.g. the CLI died before its first event — means no line is emitted
 # and meta.json honestly records null.
-MODEL=$(grep -o '"model":"[^"]*"' "$SCRATCH" | head -n 1 | sed 's/.*:"\(.*\)"/\1/')
+MODEL=$(jq -Rrs '
+  [split("\n")[] | fromjson? | select(.type == "assistant")
+   | .message.model | select(type == "string" and length > 0)][0] // empty
+' "$SCRATCH")
 if [ -n "$MODEL" ]; then
   echo "HARNESS_RESOLVED_MODEL: $MODEL"
 fi
