@@ -89,11 +89,18 @@ An adapter that can determine which MODEL actually answered emits a
 trailing `HARNESS_RESOLVED_MODEL: <id>` line (extracted from the
 tool's own structured output, never guessed); run.sh lifts it into
 `meta.json` as `versions.resolved_model`, null when absent.
-Exit `3` means *blocked* (tool not installed) — the runner reports it
-as infrastructure, not as a task failure. Shipping adapters:
-`claude-code.sh` (Claude Code) and `codex.sh` (Codex CLI; its exact
-non-interactive flags carry a TODO to re-verify against current docs
-before first use). To add an agent, copy one of them.
+Exit `3` means *blocked* — the tool was not installed, or was installed
+but refused to run at all (an exhausted account quota is the common
+case); the runner reports it as infrastructure, not as a task failure.
+An adapter that lets that condition through returns an empty workdir
+and the grader records "the model failed the task" about a run that
+never happened. Shipping adapters:
+`claude-code.sh` (Claude Code) and `codex.sh` (Codex CLI, invocation
+verified against `codex-cli 0.153.4` on 2026-09-08 — it runs under
+Codex's own `workspace-write` sandbox with network access re-enabled,
+not the sandbox bypass, because that policy already covers the workdir
+and `$TMPDIR` where the rundir lives). To add an agent, copy one of
+them.
 
 ## Run records and publishing (`runs/`)
 
@@ -119,7 +126,12 @@ meaningful.
 
 - The isolation is temp-dir mechanics only — the harness cannot see or
   control what is installed on the user's machine.
-- `claude -p` inherits the user's account-level configuration; the
+- Only `codex.sh` classifies a quota-exhausted CLI as *blocked*;
+  `claude-code.sh` has the same hole and is unfixed here, because no
+  run has yet exercised it and the exact banner Claude Code prints on
+  refusal has not been observed — guessing at it would be the kind of
+  unverified claim this harness exists to prevent.
+- `claude -p` and `codex exec` inherit the user's account-level configuration; the
   harness records the tool version and — for adapters whose CLI
   exposes it in structured output — the resolved model per run
   (claude's stream-json carries it; codex-cli 0.153.4's `--json`
