@@ -72,7 +72,7 @@ perl -e '
   exit(128 + ($st & 127)) if $st & 127;
   exit($st >> 8);
 ' "$TIMEOUT_SECS" \
-  codex exec --skip-git-repo-check \
+  codex exec --json --skip-git-repo-check \
   -s workspace-write -c sandbox_workspace_write.network_access=true \
   "$(cat "$HARNESS_PROMPT")" </dev/null 2>&1 | tee "$SCRATCH"
 STATUS=${PIPESTATUS[0]}
@@ -82,9 +82,16 @@ STATUS=${PIPESTATUS[0]}
 # has no credits left; without this check the grader sees a workdir with
 # no RESULT.md and records "the model failed the task", which is a lie
 # about a run that never happened. Keyed on a non-zero exit AND the
-# banner, so a task the model genuinely failed still grades on merit.
+# structured error event, never a keyword in model text or command output.
 if [ "$STATUS" -ne 0 ] \
-   && grep -qiE "hit your usage limit|usage limit reached|rate limit|quota exceeded|429 too many requests" "$SCRATCH"; then
+   && jq -Rse '
+     [split("\n")[] | fromjson?
+      | select(.type == "error" or .type == "turn.failed")
+      | (.message // .error.message // "")
+      | select(type == "string")
+      | test("hit your usage limit|usage limit reached|rate limit|quota exceeded|429 too many requests"; "i")]
+     | any
+   ' "$SCRATCH" >/dev/null 2>&1; then
   echo "codex refused to run: account usage/rate limit reached — blocked, not a task failure" >&2
   exit 3
 fi
